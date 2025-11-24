@@ -1,0 +1,31 @@
+# Rust build output
+/target
+**/target
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+/.tools-venv/
+.env
+.pytest_cache/
+.mypy_cache/
+/.docs-venv/
+/.test-venv/
+/docs/_build/
+/docs/_generated/
+/docs/python/api/
+/site/
+/website/node_modules/
+/website/dist/
+/website/.astro/
+/website/public/api/
+temp_python
+/*.md
+/*.ps1
+!/README.md
+/.github/*
+!/.github/workflows/
+!/.github/workflows/**
+
