@@ -139,3 +139,131 @@ impl Pool {
         })
     }
 
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub fn stats(&self) -> CopyStats {
+        self.stats
+    }
+    pub fn limits(&self) -> StorageLimits {
+        self.limits
+    }
+    pub fn format(&self) -> &Format {
+        &self.format
+    }
+    pub fn descriptor(&self) -> Arc<Format> {
+        self.format.clone()
+    }
+    pub fn max_frames(&self) -> usize {
+        self.max_frames
+    }
+    pub fn available(&self) -> usize {
+        self.blocks
+            .iter()
+            .filter(|owner| Arc::strong_count(owner) == 1)
+            .count()
+    }
+
+    pub fn offer(&mut self, bytes: &[u8], header: Header) -> Result<OwnedBlock, StorageError> {
+        self.offer_impl(Some(bytes), header)
+    }
+
+    pub fn offer_silence(&mut self, header: Header) -> Result<OwnedBlock, StorageError> {
+        self.offer_impl(None, header)
+    }
+
+    fn offer_impl(
+        &mut self,
+        bytes: Option<&[u8]>,
+        header: Header,
+    ) -> Result<OwnedBlock, StorageError> {
+        if header.frames > self.max_frames {
+            return Err(StorageError::PacketTooLarge {
+                rejected_frames: header.frames,
+            });
+        }
+        if header.frames == 0 || header.generation != self.generation {
+            return Err(StorageError::InvalidPacket);
+        }
+        let byte_count = self
+            .format
+            .byte_count(header.frames)
+            .map_err(|_| StorageError::InvalidPacket)?;
+        if bytes.is_some_and(|bytes| bytes.len() != byte_count) {
+            return Err(StorageError::InvalidPacket);
+        }
+        for (index, owner) in self.blocks.iter_mut().enumerate() {
+            self.stats.max_scan = self.stats.max_scan.max(index + 1);
+            if let Some(block) = Arc::get_mut(owner) {
+                if block.header.generation != self.generation {
+                    block.format = self.format.clone();
+                }
+                if let Some(bytes) = bytes {
+                    self.stats.copy(&mut block.bytes[..byte_count], bytes);
+                } else {
+                    block.bytes[..byte_count].fill(0);
+                    self.stats.bytes = self.stats.bytes.saturating_add(byte_count as u64);
+                    self.stats.destinations = self.stats.destinations.saturating_add(1);
+                }
+                block.header = header;
+                return Ok(OwnedBlock {
+                    owner: owner.clone(),
+                });
+            }
+        }
+        Err(StorageError::Exhausted)
+    }
+
+    pub fn prepare_generation(
+        &mut self,
+        format: Arc<Format>,
+        slots: usize,
+    ) -> Result<u64, StorageError> {
+        if slots == 0 || slots > self.available() {
+            return Err(StorageError::GenerationBudget);
+        }
+        if format
+            .byte_count(self.max_frames)
+            .map_err(|_| StorageError::InvalidPacket)?
+            > self.limits.bytes_per_slot()
+        {
+            return Err(StorageError::GenerationBudget);
+        }
+        let generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(StorageError::GenerationExhausted)?;
+        let descriptor = self
+            .descriptors
+            .iter()
+            .position(|entry| {
+                entry
+                    .as_ref()
+                    .is_some_and(|existing| Arc::ptr_eq(existing, &format))
+            })
+            .or_else(|| {
+                self.descriptors.iter().position(|entry| {
+                    entry
+                        .as_ref()
+                        .is_none_or(|existing| Arc::strong_count(existing) == 1)
+                })
+            })
+            .ok_or(StorageError::GenerationBudget)?;
+        self.descriptors[descriptor] = Some(format.clone());
+        let mut prepared = 0;
+        for owner in &mut self.blocks {
+            if let Some(block) = Arc::get_mut(owner) {
+                block.format = format.clone();
+                block.header.generation = generation;
+                block.header.frames = 0;
+                prepared += 1;
+                if prepared == slots {
+                    break;
+                }
+            }
+        }
+        self.generation = generation;
+        self.format = format;
+        Ok(generation)
+    }
+}
