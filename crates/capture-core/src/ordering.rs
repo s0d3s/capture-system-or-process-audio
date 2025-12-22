@@ -709,3 +709,585 @@ impl Producer {
                 if let Some((right, second_ticket, second_order)) = next {
                     let queued_separator = self.shared.audio.iter().any(|audio| {
                         let order = audio.logical.load(SeqCst);
+                        audio.ticket.load(SeqCst) != 0
+                            && first_order < order
+                            && order < second_order
+                    });
+                    let pending = self.shared.reader_audio.load(SeqCst);
+                    let separates =
+                        queued_separator || (first_order < pending && pending < second_order);
+                    if !separates {
+                        pair = Some((left, first_ticket, right, second_ticket));
+                        break;
+                    }
+                }
+            }
+            let (left, first_ticket, right, second_ticket) =
+                pair.ok_or(Failure::ControlExhausted)?;
+            if !self.shared.controls[left].claim(first_ticket) {
+                continue;
+            }
+            let first = self.shared.controls[left]
+                .owner
+                .take()
+                .expect("claimed control");
+            if !self.shared.controls[right].claim(second_ticket) {
+                self.publish_control_owner(left, first);
+                continue;
+            }
+            let second = self.shared.controls[right]
+                .owner
+                .take()
+                .expect("claimed control");
+            let mut merged = (*second).clone();
+            if let Err(error) = merged.losses.merge(&first.losses) {
+                self.publish_control_owner(left, first);
+                self.publish_control_owner(right, second);
+                return Err(error);
+            }
+            merged.kind = ControlKind::Recovered;
+            merged.records = merged
+                .records
+                .checked_add(first.records)
+                .ok_or(Failure::ControlExhausted)?;
+            drop(first);
+            drop(second);
+            *Arc::get_mut(&mut self.controls[right]).expect("claimed canonical control") = merged;
+            self.publish_control_owner(right, self.controls[right].clone());
+        }
+        Err(Failure::ControlExhausted)
+    }
+
+    fn loss(
+        &mut self,
+        sequence: u64,
+        segment: u64,
+        format: Arc<Format>,
+        generation: u64,
+        loss: Loss,
+        cause: LossCause,
+    ) -> Result<(), Failure> {
+        let entry = DomainLoss {
+            rate_hz: loss.rate_hz,
+            known_frames: loss.frames.unwrap_or(0),
+            unknown: loss.frames.is_none(),
+            cause,
+        };
+        if let Err(error) = self.losses.add_entry(entry) {
+            self.unrecorded_loss = Some(entry);
+            return Err(error);
+        }
+        let mut losses = Losses::default();
+        losses.add_entry(entry)?;
+        self.control(Control {
+            sequence,
+            generation,
+            segment,
+            format,
+            kind: ControlKind::Gap,
+            losses,
+            records: 1,
+        })
+    }
+
+    pub fn gap(&mut self, sequence: u64, segment: u64, loss: Loss) -> Result<(), Failure> {
+        if self.shared.ended.load(SeqCst)
+            || self.last_sequence.is_some_and(|last| sequence <= last)
+            || loss.rate_hz == 0
+            || self.shared.failure.load(SeqCst) != 0
+        {
+            return Err(Failure::InvalidPacket);
+        }
+        let shared = self.shared.clone();
+        shared.epoch.fetch_add(1, SeqCst);
+        let _publication = Publication(&shared.epoch);
+        self.last_sequence = Some(sequence);
+        self.segment = segment;
+        let result = self.loss(
+            sequence,
+            segment,
+            self.pool.descriptor(),
+            self.pool.generation(),
+            loss,
+            LossCause::Source,
+        );
+        if let Err(error) = result {
+            self.fail(error);
+        }
+        result
+    }
+
+    pub fn prepare_format(
+        &mut self,
+        sequence: u64,
+        segment: u64,
+        format: Arc<Format>,
+        slots: usize,
+    ) -> Result<u64, Failure> {
+        if self.shared.ended.load(SeqCst)
+            || self.last_sequence.is_some_and(|last| sequence <= last)
+            || self.shared.failure.load(SeqCst) != 0
+        {
+            return Err(Failure::InvalidPacket);
+        }
+        let shared = self.shared.clone();
+        shared.epoch.fetch_add(1, SeqCst);
+        let _publication = Publication(&shared.epoch);
+        let generation = self
+            .pool
+            .prepare_generation(format.clone(), slots)
+            .map_err(|_| Failure::PoolExhaustion)?;
+        self.last_sequence = Some(sequence);
+        self.segment = segment;
+        if let Err(error) = self.control(Control {
+            sequence,
+            generation,
+            segment,
+            format,
+            kind: ControlKind::Format,
+            losses: Losses::default(),
+            records: 1,
+        }) {
+            self.fail(error);
+            return Err(error);
+        }
+        Ok(generation)
+    }
+
+    pub fn offer(&mut self, bytes: &[u8], header: Header, policy: Overflow) -> Offer {
+        self.offer_impl(Some(bytes), header, policy, || {})
+    }
+
+    pub fn offer_silence(&mut self, header: Header, policy: Overflow) -> Offer {
+        self.offer_impl(None, header, policy, || {})
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub fn offer_with_publish_hook(
+        &mut self,
+        bytes: &[u8],
+        header: Header,
+        policy: Overflow,
+        hook: impl FnOnce(),
+    ) -> Offer {
+        self.offer_impl(Some(bytes), header, policy, hook)
+    }
+
+    fn offer_impl(
+        &mut self,
+        bytes: Option<&[u8]>,
+        header: Header,
+        policy: Overflow,
+        hook: impl FnOnce(),
+    ) -> Offer {
+        let shared = self.shared.clone();
+        shared.epoch.fetch_add(1, SeqCst);
+        let _publication = Publication(&shared.epoch);
+        if let Some(failure) = failure_from_code(self.shared.failure.load(SeqCst)) {
+            return Offer::Failed(failure);
+        }
+        if self.shared.ended.load(SeqCst) {
+            return Offer::Stopped;
+        }
+        shared
+            .counters
+            .input
+            .fetch_add(header.frames as u64, SeqCst);
+        self.attempts = 0;
+        let invalid = if header.frames > self.pool.max_frames() {
+            Some(Failure::PacketTooLarge)
+        } else if header.frames == 0
+            || header.generation != self.pool.generation()
+            || bytes.is_some_and(|bytes| {
+                self.pool.format().byte_count(header.frames) != Ok(bytes.len())
+            })
+            || self
+                .last_sequence
+                .is_some_and(|last| header.sequence <= last)
+            || header.sequence == u64::MAX
+        {
+            Some(Failure::InvalidPacket)
+        } else if self.ticket > u64::MAX - 33 {
+            Some(Failure::TicketExhausted)
+        } else {
+            None
+        };
+        if let Some(failure) = invalid {
+            shared
+                .counters
+                .rejected
+                .fetch_add(header.frames as u64, SeqCst);
+            return self.fail(failure);
+        }
+        self.last_sequence = Some(header.sequence);
+        self.segment = header.segment;
+        for _ in 0..=self.pool.limits().slots() {
+            self.attempts += 1;
+            let (queued, oldest) = shared.oldest_audio(u64::MAX);
+            let pool_empty = self.pool.available() == 0;
+            if queued >= self.capacity || pool_empty {
+                if policy == Overflow::DropOldest
+                    && let Some((index, ticket, _)) = oldest
+                {
+                    let slot = &shared.audio[index];
+                    if !slot.claim(ticket) {
+                        continue;
+                    }
+                    let owner = slot.owner.take().expect("claimed audio owner");
+                    let frames = owner.header.frames as u64;
+                    shared.counters.queued.fetch_sub(frames, SeqCst);
+                    shared.counters.queue_lost.fetch_add(frames, SeqCst);
+                    let lost_header = owner.header;
+                    let lost_format = owner.format.clone();
+                    drop(owner);
+                    if let Err(error) = self.loss(
+                        lost_header.sequence,
+                        lost_header.segment,
+                        lost_format.clone(),
+                        lost_header.generation,
+                        Loss {
+                            frames: Some(frames),
+                            rate_hz: lost_format.rate(),
+                        },
+                        LossCause::QueueOldest,
+                    ) {
+                        shared
+                            .counters
+                            .rejected
+                            .fetch_add(header.frames as u64, SeqCst);
+                        return self.fail(error);
+                    }
+                } else {
+                    if policy == Overflow::Fail {
+                        shared
+                            .counters
+                            .rejected
+                            .fetch_add(header.frames as u64, SeqCst);
+                        return self.fail(if queued >= self.capacity {
+                            Failure::QueueOverflow
+                        } else {
+                            Failure::PoolExhaustion
+                        });
+                    }
+                    let (counter, outcome) = if queued >= self.capacity {
+                        (&shared.counters.queue_lost, Offer::QueueDropped)
+                    } else {
+                        (&shared.counters.pool_lost, Offer::PoolDropped)
+                    };
+                    counter.fetch_add(header.frames as u64, SeqCst);
+                    let cause = if queued >= self.capacity {
+                        LossCause::QueueNewest
+                    } else {
+                        LossCause::PoolExhaustion
+                    };
+                    if let Err(error) = self.loss(
+                        header.sequence,
+                        header.segment,
+                        self.pool.descriptor(),
+                        header.generation,
+                        Loss {
+                            frames: Some(header.frames as u64),
+                            rate_hz: self.pool.format().rate(),
+                        },
+                        cause,
+                    ) {
+                        return self.fail(error);
+                    }
+                    return outcome;
+                }
+            }
+            let stored = match bytes {
+                Some(bytes) => self.pool.offer(bytes, header),
+                None => self.pool.offer_silence(header),
+            };
+            let owner = match stored {
+                Ok(block) => block.owner,
+                Err(StorageError::Exhausted) => {
+                    shared
+                        .counters
+                        .pool_lost
+                        .fetch_add(header.frames as u64, SeqCst);
+                    return Offer::PoolDropped;
+                }
+                Err(_) => {
+                    shared
+                        .counters
+                        .rejected
+                        .fetch_add(header.frames as u64, SeqCst);
+                    return self.fail(Failure::InvalidPacket);
+                }
+            };
+            let index = self
+                .pool
+                .blocks
+                .iter()
+                .position(|canonical| Arc::ptr_eq(canonical, &owner))
+                .expect("canonical pool owner");
+            let slot = &shared.audio[index];
+            hook();
+            slot.logical.store(header.sequence, SeqCst);
+            slot.frames.store(header.frames as u64, SeqCst);
+            slot.rate.store(self.pool.format().rate(), SeqCst);
+            assert!(slot.owner.swap(Some(owner)).is_none());
+            shared
+                .counters
+                .queued
+                .fetch_add(header.frames as u64, SeqCst);
+            slot.ticket.store(self.ticket, SeqCst);
+            if let Some(trace) = &shared.trace {
+                trace.record(crate::measurements::Stage::PublishBegin, header.sequence);
+            }
+            shared.published.store(self.ticket, SeqCst);
+            if let Some(trace) = &shared.trace {
+                trace.record(crate::measurements::Stage::PublishEnd, header.sequence);
+            }
+            self.ticket += 1;
+            return Offer::Queued;
+        }
+        shared
+            .counters
+            .rejected
+            .fetch_add(header.frames as u64, SeqCst);
+        self.fail(Failure::ControlExhausted)
+    }
+}
+
+impl Reader {
+    pub(crate) fn trace(&self) -> Option<&crate::measurements::Trace> {
+        self.shared.trace.as_deref()
+    }
+
+    pub(crate) fn max_frame_bytes(&self) -> usize {
+        self.shared.max_frame_bytes
+    }
+
+    pub(crate) fn defer_delivery(&mut self, frames: usize) {
+        self.shared.reader_epoch.fetch_add(1, SeqCst);
+        let _reading = Publication(&self.shared.reader_epoch);
+        self.shared
+            .counters
+            .delivered
+            .fetch_sub(frames as u64, SeqCst);
+        self.shared
+            .counters
+            .in_flight
+            .fetch_add(frames as u64, SeqCst);
+    }
+    pub(crate) fn finish_delivery(&mut self, frames: usize, discard: bool) {
+        self.shared.reader_epoch.fetch_add(1, SeqCst);
+        let _reading = Publication(&self.shared.reader_epoch);
+        self.shared
+            .counters
+            .in_flight
+            .fetch_sub(frames as u64, SeqCst);
+        let counter = if discard {
+            &self.shared.counters.discarded
+        } else {
+            &self.shared.counters.delivered
+        };
+        counter.fetch_add(frames as u64, SeqCst);
+    }
+    pub fn control_handle(&self) -> ControlHandle {
+        ControlHandle {
+            shared: self.shared.clone(),
+        }
+    }
+    pub fn ready(&self) -> bool {
+        !self.pending.is_empty()
+            || self.shared.oldest_audio(u64::MAX).0 != 0
+            || self.shared.oldest_control(u64::MAX).is_some()
+            || self.shared.failure.load(SeqCst) != 0
+            || self.shared.ended.load(SeqCst)
+    }
+
+    pub fn ended(&self) -> bool {
+        self.ended_impl(|| {})
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub fn ended_with_hook(&self, hook: impl FnOnce()) -> bool {
+        self.ended_impl(hook)
+    }
+
+    fn ended_impl(&self, hook: impl FnOnce()) -> bool {
+        let epoch = self.shared.epoch.load(SeqCst);
+        hook();
+        epoch.is_multiple_of(2)
+            && self.shared.ended.load(SeqCst)
+            && (self.shared.failure.load(SeqCst) == 0 || self.terminal_read)
+            && self.pending.is_empty()
+            && self.shared.oldest_audio(u64::MAX).0 == 0
+            && self.shared.oldest_control(u64::MAX).is_none()
+            && epoch == self.shared.epoch.load(SeqCst)
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        self.shared.snapshot()
+    }
+    pub fn terminal_details(&self) -> Option<&TerminalDetails> {
+        self.shared.terminal.get()
+    }
+    pub fn next_item(&mut self) -> Option<Item> {
+        self.next_item_impl(|| {}, || {})
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub fn next_item_with_claim_hook(&mut self, hook: impl FnOnce()) -> Option<Item> {
+        self.next_item_impl(hook, || {})
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub fn next_item_with_terminal_hook(&mut self, hook: impl FnOnce()) -> Option<Item> {
+        self.next_item_impl(|| {}, hook)
+    }
+
+    fn next_item_impl(
+        &mut self,
+        hook: impl FnOnce(),
+        terminal_hook: impl FnOnce(),
+    ) -> Option<Item> {
+        if self.shared.stop.load(SeqCst) == 2 {
+            self.control_handle().discard_queued();
+        }
+        let mut hook = Some(hook);
+        let shared = self.shared.clone();
+        shared.reader_epoch.fetch_add(1, SeqCst);
+        let _reading = Publication(&shared.reader_epoch);
+        let epoch = shared.epoch.load(SeqCst);
+        if !epoch.is_multiple_of(2) {
+            return None;
+        }
+        let horizon = shared.published.load(SeqCst);
+        for _ in 0..=shared.audio.len() + shared.controls.len() {
+            let pending = self
+                .pending
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, item)| item.sequence())
+                .map(|(index, item)| (index, item.sequence()));
+            let audio = shared.oldest_audio(horizon).1;
+            let control = shared.oldest_control(horizon);
+            let next_audio = audio
+                .is_some_and(|(_, _, order)| control.is_none_or(|(_, _, other)| order < other));
+            let candidate = if next_audio { audio } else { control };
+            if let Some((index, order)) = pending
+                && candidate.is_none_or(|(_, _, other)| order <= other)
+            {
+                if shared.epoch.load(SeqCst) != epoch {
+                    return None;
+                }
+                let item = self.pending.swap_remove(index);
+                if let Item::Audio(block) = &item {
+                    shared
+                        .counters
+                        .in_flight
+                        .fetch_sub(block.header().frames as u64, SeqCst);
+                    shared
+                        .counters
+                        .delivered
+                        .fetch_add(block.header().frames as u64, SeqCst);
+                    shared.reader_audio.store(u64::MAX, SeqCst);
+                }
+                return Some(item);
+            }
+            let Some((index, ticket, order)) = candidate else {
+                break;
+            };
+            assert!(
+                self.pending.len() < self.pending.capacity(),
+                "bounded reader pending storage"
+            );
+            if next_audio {
+                shared.reader_audio.store(order, SeqCst);
+                let slot = &shared.audio[index];
+                let claim_started = shared.trace.as_ref().map(|_| std::time::Instant::now());
+                if !slot.claim(ticket) {
+                    shared.reader_audio.store(u64::MAX, SeqCst);
+                    continue;
+                }
+                if let Some(hook) = hook.take() {
+                    hook();
+                }
+                let owner = slot.owner.take().expect("claimed audio owner");
+                if let Some(trace) = &shared.trace {
+                    trace.record_at(
+                        crate::measurements::Stage::DequeueBegin,
+                        owner.header.sequence,
+                        claim_started.unwrap(),
+                    );
+                    trace.record(crate::measurements::Stage::Dequeued, owner.header.sequence);
+                }
+                shared.in_flight_rate.store(owner.format.rate(), SeqCst);
+                shared
+                    .counters
+                    .queued
+                    .fetch_sub(owner.header.frames as u64, SeqCst);
+                shared
+                    .counters
+                    .in_flight
+                    .fetch_add(owner.header.frames as u64, SeqCst);
+                self.pending.push(Item::Audio(OwnedBlock { owner }));
+            } else {
+                let slot = &shared.controls[index];
+                if !slot.claim(ticket) {
+                    continue;
+                }
+                if let Some(hook) = hook.take() {
+                    hook();
+                }
+                let owner = slot.owner.take().expect("claimed control owner");
+                self.pending.push(Item::Control((*owner).clone()));
+            }
+            if shared.epoch.load(SeqCst) != epoch {
+                return None;
+            }
+        }
+        if shared.epoch.load(SeqCst) != epoch || !self.pending.is_empty() {
+            return None;
+        }
+        terminal_hook();
+        let ended = shared.ended.load(SeqCst);
+        let failure = failure_from_code(shared.failure.load(SeqCst));
+        if shared.epoch.load(SeqCst) != epoch {
+            return None;
+        }
+        if !self.terminal_read
+            && let Some(failure) = failure
+        {
+            self.terminal_read = true;
+            shared.consumer_done.store(true, SeqCst);
+            return Some(Item::Failed(failure));
+        }
+        if ended {
+            shared.consumer_done.store(true, SeqCst);
+        }
+        None
+    }
+}
+
+impl Drop for Producer {
+    fn drop(&mut self) {
+        self.shared.ended.store(true, SeqCst);
+        if self.shared.stop.load(SeqCst) == 2 {
+            self.control_handle().discard_queued();
+        }
+    }
+}
+impl Drop for Reader {
+    fn drop(&mut self) {
+        self.control_handle().stop(Stop::Abort);
+        for item in self.pending.drain(..) {
+            if let Item::Audio(block) = item {
+                self.shared
+                    .counters
+                    .in_flight
+                    .fetch_sub(block.header().frames as u64, SeqCst);
+                self.shared
+                    .counters
+                    .discarded
+                    .fetch_add(block.header().frames as u64, SeqCst);
+            }
+        }
+        self.shared.consumer_done.store(true, SeqCst);
+    }
+}
