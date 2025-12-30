@@ -431,3 +431,293 @@ impl Operation<'_> {
     }
 }
 
+impl Drop for State {
+    fn drop(&mut self) {
+        if let Some(remainder) = self.remainder.take() {
+            self.reader.finish_delivery(remainder.frames, true);
+        }
+    }
+}
+
+pub fn partial_code(reason: PartialReason) -> (u32, u32) {
+    match reason {
+        PartialReason::Complete => (1, 0),
+        PartialReason::WouldBlock => (2, 0),
+        PartialReason::Boundary => (3, 0),
+        PartialReason::Cancelled => (4, 0),
+        PartialReason::Timeout => (5, 0),
+        PartialReason::Eof => (6, 0),
+        PartialReason::Failure(failure) => (7, crate::ordering::failure_code(failure)),
+        PartialReason::Ready => (8, 0),
+    }
+}
+pub fn partial_from_code(code: u32, failure: u32) -> Result<PartialReason, ReadError> {
+    match (code, failure) {
+        (1, 0) => Ok(PartialReason::Complete),
+        (2, 0) => Ok(PartialReason::WouldBlock),
+        (3, 0) => Ok(PartialReason::Boundary),
+        (4, 0) => Ok(PartialReason::Cancelled),
+        (5, 0) => Ok(PartialReason::Timeout),
+        (6, 0) => Ok(PartialReason::Eof),
+        (7, failure) => crate::ordering::failure_from_code(failure)
+            .map(PartialReason::Failure)
+            .ok_or(ReadError::InvalidRequest),
+        (8, 0) => Ok(PartialReason::Ready),
+        _ => Err(ReadError::InvalidRequest),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        StorageLimits,
+        ordering::{Overflow, channel},
+        schema::{ByteOrder, Layout, Provenance, SampleType, Stamp},
+        storage::Pool,
+    };
+
+    #[test]
+    fn observed_handoff_preserves_into_allocation_and_event_order() {
+        use crate::{
+            measurements::{Stage, Trace},
+            ordering::{Offer, channel_observed},
+        };
+        let format = Arc::new(
+            Format::new(
+                SampleType::F32,
+                ByteOrder::Little,
+                48000,
+                2,
+                Layout::Unknown,
+            )
+            .unwrap(),
+        );
+        for observed in [false, true] {
+            let pool = Pool::new(
+                StorageLimits::new(8, 16, 8, 1024).unwrap(),
+                16,
+                format.clone(),
+            )
+            .unwrap();
+            let trace = Arc::new(Trace::new(1000).unwrap());
+            let (mut producer, reader) = if observed {
+                channel_observed(pool, 4, trace.clone()).unwrap()
+            } else {
+                channel(pool, 4).unwrap()
+            };
+            let stream = ReadStream::new(reader);
+            let cancel = Cancellation::default();
+            let mut destination = [0; 128];
+            let warm_header = Header {
+                sequence: 1,
+                segment: 1,
+                generation: 1,
+                frames: 16,
+                sample_position: None,
+                timestamp: None,
+            };
+            assert_eq!(
+                producer.offer_silence(warm_header, Overflow::Fail),
+                Offer::Queued
+            );
+            for offset in [0, 8] {
+                let result = stream
+                    .begin_into(
+                        &mut destination,
+                        format.clone(),
+                        8,
+                        false,
+                        None,
+                        cancel.clone(),
+                    )
+                    .unwrap()
+                    .poll(0)
+                    .unwrap();
+                assert_eq!(result.frames, 8);
+                assert_eq!(result.first_packet.unwrap().packet_offset, offset);
+            }
+            let measured = allocation_counter::measure(|| {
+                for sequence in 2..=100 {
+                    let header = Header {
+                        sequence,
+                        segment: 1,
+                        generation: 1,
+                        frames: 16,
+                        sample_position: None,
+                        timestamp: None,
+                    };
+                    assert_eq!(
+                        producer.offer_silence(header, Overflow::Fail),
+                        Offer::Queued
+                    );
+                    for offset in [0, 8] {
+                        let result = stream
+                            .begin_into(
+                                &mut destination,
+                                format.clone(),
+                                8,
+                                false,
+                                None,
+                                cancel.clone(),
+                            )
+                            .unwrap()
+                            .poll(0)
+                            .unwrap();
+                        assert_eq!(result.frames, 8);
+                        assert!(result.chunks.is_empty());
+                        assert_eq!(result.first_packet.unwrap().packet_offset, offset);
+                    }
+                }
+            });
+            assert_eq!(measured.count_total, 0);
+            assert!(!trace.overflowed());
+            let events = trace.snapshot();
+            if observed {
+                assert_eq!(events.len(), 600);
+                for (index, packet) in events.chunks_exact(6).enumerate() {
+                    assert!(
+                        packet
+                            .iter()
+                            .all(|event| event.sequence == index as u64 + 1)
+                    );
+                    assert_eq!(
+                        packet.iter().map(|event| event.stage).collect::<Vec<_>>(),
+                        [
+                            Stage::PublishBegin,
+                            Stage::PublishEnd,
+                            Stage::DequeueBegin,
+                            Stage::Dequeued,
+                            Stage::ReadSatisfied,
+                            Stage::ReadSatisfied
+                        ]
+                    );
+                    assert!(
+                        packet
+                            .windows(2)
+                            .all(|pair| pair[0].elapsed_ns <= pair[1].elapsed_ns)
+                    );
+                }
+            } else {
+                assert!(events.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn read_packet_anchors_preserve_raw_provenance() {
+        let format = Arc::new(
+            Format::new(
+                SampleType::F32,
+                ByteOrder::Little,
+                48000,
+                2,
+                Layout::Unknown,
+            )
+            .unwrap(),
+        );
+        for mode in [Mode::Variable, Mode::Count, Mode::Into] {
+            let pool = Pool::new(
+                StorageLimits::new(8, 16, 8, 1024).unwrap(),
+                16,
+                format.clone(),
+            )
+            .unwrap();
+            let (mut producer, reader) = channel(pool, 4).unwrap();
+            let stream = ReadStream::new(reader);
+            let header = Header {
+                sequence: 1,
+                segment: 1,
+                generation: 1,
+                frames: 8,
+                sample_position: None,
+                timestamp: Some(Stamp {
+                    ticks: 123,
+                    ticks_per_second: 10_000_000,
+                    clock_domain: 1,
+                    provenance: Provenance::Native,
+                    uncertainty_ns: None,
+                }),
+            };
+            producer.offer(&[1; 64], header, Overflow::Fail);
+            let mut destination = [0; 128];
+            for offset in [0, 3] {
+                let mut operation = if mode == Mode::Into {
+                    stream
+                        .begin_into(
+                            &mut destination,
+                            format.clone(),
+                            3,
+                            false,
+                            None,
+                            Cancellation::default(),
+                        )
+                        .unwrap()
+                } else {
+                    stream
+                        .begin(mode, 3, false, None, Cancellation::default())
+                        .unwrap()
+                };
+                let result = operation.poll(0).unwrap();
+                let expected = Some(PacketAnchor {
+                    header,
+                    packet_offset: offset,
+                    output_offset: 0,
+                    frames: 3,
+                });
+                assert_eq!(result.first_packet, expected);
+                assert_eq!(result.last_packet, expected);
+                if mode == Mode::Into {
+                    assert!(result.chunks.is_empty());
+                }
+            }
+            let next = Header {
+                sequence: 2,
+                timestamp: None,
+                ..header
+            };
+            producer.offer(&[2; 64], next, Overflow::Fail);
+            let cancel = Cancellation::default();
+            let mut operation = stream
+                .begin_into(
+                    &mut destination,
+                    format.clone(),
+                    16,
+                    true,
+                    None,
+                    cancel.clone(),
+                )
+                .unwrap();
+            assert!(operation.poll(0).is_none());
+            cancel.cancel();
+            let result = operation.poll(1).unwrap();
+            assert_eq!(result.reason, PartialReason::Cancelled);
+            assert_eq!(result.frames, 10);
+            assert_eq!(
+                result.first_packet,
+                Some(PacketAnchor {
+                    header,
+                    packet_offset: 6,
+                    output_offset: 0,
+                    frames: 2
+                })
+            );
+            assert_eq!(
+                result.last_packet,
+                Some(PacketAnchor {
+                    header: next,
+                    packet_offset: 0,
+                    output_offset: 2,
+                    frames: 8
+                })
+            );
+            drop(operation);
+            let mut empty = stream
+                .begin(Mode::Variable, 1, false, None, Cancellation::default())
+                .unwrap();
+            let result = empty.poll(0).unwrap();
+            assert_eq!(result.first_packet, None);
+            assert_eq!(result.last_packet, None);
+        }
+    }
+}
