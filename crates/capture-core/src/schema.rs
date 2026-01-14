@@ -471,3 +471,513 @@ pub enum PermissionKind {
 impl PermissionKind {
     pub const ALL: [Self; 3] = [Self::Microphone, Self::SystemAudio, Self::ScreenRecording];
 
+    #[inline]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Microphone => 0,
+            Self::SystemAudio => 1,
+            Self::ScreenRecording => 2,
+        }
+    }
+
+    #[inline]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Microphone => "microphone",
+            Self::SystemAudio => "system_audio",
+            Self::ScreenRecording => "screen_recording",
+        }
+    }
+}
+
+/// Recording permission status. Unprobed OS domains are never reported as `Granted`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PermissionState {
+    Granted,
+    NotDetermined,
+    Denied,
+    Restricted,
+    Unknown,
+}
+
+impl PermissionState {
+    #[inline]
+    pub const fn is_granted(self) -> bool {
+        matches!(self, Self::Granted)
+    }
+
+    #[inline]
+    pub const fn is_denied_or_restricted(self) -> bool {
+        matches!(self, Self::Denied | Self::Restricted)
+    }
+
+    #[inline]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Granted => "granted",
+            Self::NotDetermined => "not_determined",
+            Self::Denied => "denied",
+            Self::Restricted => "restricted",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Recording permission prompt policy during `open()`.
+/// Defaults to `AutoRequest`; `CheckOnly` disables prompting.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PermissionPolicy {
+    #[default]
+    AutoRequest,
+    CheckOnly,
+}
+
+impl PermissionPolicy {
+    #[inline]
+    pub const fn allows_prompt(self) -> bool {
+        matches!(self, Self::AutoRequest)
+    }
+
+    #[inline]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AutoRequest => "auto_request",
+            Self::CheckOnly => "check_only",
+        }
+    }
+}
+
+/// Per-domain recording permission status entry inside `PermissionReport`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PermissionEntry {
+    pub kind: PermissionKind,
+    pub state: PermissionState,
+    pub required: bool,
+    pub can_prompt: bool,
+    pub requires_relaunch: bool,
+}
+
+impl PermissionEntry {
+    #[inline]
+    pub const fn is_granted(self) -> bool {
+        self.state.is_granted()
+    }
+}
+
+/// Zero-heap-allocation permission report with entries ordered as
+/// `[Microphone, SystemAudio, ScreenRecording]`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PermissionReport {
+    pub os: PlatformOs,
+    pub entries: [PermissionEntry; 3],
+}
+
+impl PermissionReport {
+    pub const fn new(
+        os: PlatformOs,
+        microphone: PermissionEntry,
+        system_audio: PermissionEntry,
+        screen_recording: PermissionEntry,
+    ) -> Self {
+        Self {
+            os,
+            entries: [microphone, system_audio, screen_recording],
+        }
+    }
+
+    #[inline]
+    pub const fn entries(&self) -> &[PermissionEntry; 3] {
+        &self.entries
+    }
+
+    #[inline]
+    pub const fn microphone(&self) -> PermissionEntry {
+        self.entries[0]
+    }
+
+    #[inline]
+    pub const fn system_audio(&self) -> PermissionEntry {
+        self.entries[1]
+    }
+
+    #[inline]
+    pub const fn screen_recording(&self) -> PermissionEntry {
+        self.entries[2]
+    }
+
+    #[inline]
+    pub const fn entry(&self, kind: PermissionKind) -> PermissionEntry {
+        self.entries[kind.index()]
+    }
+
+    #[inline]
+    pub const fn state_for(&self, kind: PermissionKind) -> PermissionState {
+        self.entries[kind.index()].state
+    }
+
+    /// Returns `true` iff every entry marked `required == true` is explicitly `PermissionState::Granted`.
+    pub fn is_granted(&self) -> bool {
+        self.entries
+            .iter()
+            .filter(|e| e.required)
+            .all(|e| e.state == PermissionState::Granted)
+    }
+
+    /// Returns `true` if any `required == true` entry is `Denied` or `Restricted`.
+    pub fn has_denial(&self) -> bool {
+        self.entries
+            .iter()
+            .filter(|e| e.required)
+            .any(|e| e.state.is_denied_or_restricted())
+    }
+
+    /// Returns `true` if any `required == true` entry requires restarting the application for consent to take effect.
+    pub fn requires_relaunch(&self) -> bool {
+        self.entries
+            .iter()
+            .filter(|e| e.required)
+            .any(|e| e.requires_relaunch)
+    }
+
+    pub fn required_kinds(&self) -> Vec<PermissionKind> {
+        self.entries
+            .iter()
+            .filter(|e| e.required)
+            .map(|e| e.kind)
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Backends {
+    pub windows: Vec<BackendId>,
+    pub linux: Vec<BackendId>,
+    pub macos: Vec<BackendId>,
+}
+
+impl Default for Backends {
+    fn default() -> Self {
+        Self {
+            windows: vec![BackendId::Wasapi],
+            linux: vec![BackendId::PipeWire, BackendId::PulseAudio],
+            macos: vec![BackendId::CoreAudio, BackendId::ScreenCaptureKit],
+        }
+    }
+}
+
+impl Backends {
+    pub fn new(
+        windows: Option<Vec<BackendId>>,
+        linux: Option<Vec<BackendId>>,
+        macos: Option<Vec<BackendId>>,
+    ) -> Result<Self, PlanError> {
+        let defaults = Self::default();
+        let backends = Self {
+            windows: windows.unwrap_or(defaults.windows),
+            linux: linux.unwrap_or(defaults.linux),
+            macos: macos.unwrap_or(defaults.macos),
+        };
+        backends.validate()?;
+        Ok(backends)
+    }
+
+    pub fn default_primary_for_os(os: PlatformOs) -> BackendId {
+        match os {
+            PlatformOs::Windows => BackendId::Wasapi,
+            PlatformOs::Linux => BackendId::PipeWire,
+            PlatformOs::MacOs => BackendId::CoreAudio,
+        }
+    }
+
+    pub fn primary_for_os(&self, os: PlatformOs) -> BackendId {
+        self.for_os(os)
+            .first()
+            .copied()
+            .unwrap_or_else(|| Self::default_primary_for_os(os))
+    }
+
+    pub fn validate(&self) -> Result<(), PlanError> {
+        if self.windows.is_empty()
+            || self.linux.is_empty()
+            || self.macos.is_empty()
+            || self.windows.iter().any(|id| *id != BackendId::Wasapi)
+            || self
+                .linux
+                .iter()
+                .any(|id| !matches!(id, BackendId::PipeWire | BackendId::PulseAudio))
+            || self
+                .macos
+                .iter()
+                .any(|id| !matches!(id, BackendId::CoreAudio | BackendId::ScreenCaptureKit))
+        {
+            return Err(PlanError::InvalidBackend);
+        }
+        Ok(())
+    }
+
+    pub fn for_os(&self, os: PlatformOs) -> &[BackendId] {
+        match os {
+            PlatformOs::Windows => &self.windows,
+            PlatformOs::Linux => &self.linux,
+            PlatformOs::MacOs => &self.macos,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CaptureTarget {
+    pub(crate) kind: TargetKind,
+    pub(crate) id: Arc<str>,
+    pub(crate) pid: Option<u32>,
+    pub(crate) process_start_time: Option<u64>,
+    pub(crate) app_id: Option<Arc<str>>,
+    pub(crate) device_id: Option<Arc<str>>,
+    pub(crate) name: Option<Arc<str>>,
+    pub(crate) executable_path: Option<Arc<str>>,
+    pub(crate) active_audio: Option<bool>,
+    pub(crate) scope: ProcessScope,
+    pub(crate) on_root_exit: OnRootExit,
+    pub(crate) default_device_mode: DefaultDeviceMode,
+    pub(crate) backend: Option<BackendId>,
+    pub(crate) available_backends: Arc<[BackendId]>,
+    pub(crate) gain: f32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlanError {
+    InvalidTarget,
+    UnsupportedScope,
+    ReversedStrategyRange,
+    InvalidBackend,
+    BackendUnavailable,
+    PermissionDenied,
+    NoSuchProcess,
+    PidReused,
+    PreciseTimingUnqualified,
+    UnsupportedCapturePlan,
+    Capacity(CapacityError),
+}
+
+impl std::fmt::Display for PlanError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for PlanError {}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DiagnosticOptions {
+    pub include_identity: bool,
+}
+
+pub fn extract_backend_id_prefix(id: &str) -> (Option<BackendId>, &str) {
+    for (prefix, backend) in [
+        ("wasapi:", BackendId::Wasapi),
+        ("pipewire:", BackendId::PipeWire),
+        ("pulseaudio:", BackendId::PulseAudio),
+        ("coreaudio:", BackendId::CoreAudio),
+        ("screencapturekit:", BackendId::ScreenCaptureKit),
+    ] {
+        if let Some(rest) = id.strip_prefix(prefix) {
+            return (Some(backend), rest);
+        }
+    }
+    (None, id)
+}
+
+pub fn strip_backend_id_prefix(id: &str) -> &str {
+    extract_backend_id_prefix(id).1
+}
+
+impl CaptureTarget {
+    #[inline]
+    pub fn kind(&self) -> TargetKind {
+        self.kind
+    }
+
+    #[inline]
+    pub fn id(&self) -> &Arc<str> {
+        &self.id
+    }
+
+    #[inline]
+    pub fn logical_id(&self) -> &str {
+        strip_backend_id_prefix(&self.id)
+    }
+
+    #[inline]
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
+    #[inline]
+    pub fn process_start_time(&self) -> Option<u64> {
+        self.process_start_time
+    }
+
+    #[inline]
+    pub fn app_id(&self) -> Option<&Arc<str>> {
+        self.app_id.as_ref()
+    }
+
+    #[inline]
+    pub fn device_id(&self) -> Option<&Arc<str>> {
+        self.device_id.as_ref()
+    }
+
+    #[inline]
+    pub fn clean_device_id(&self) -> Option<&str> {
+        self.device_id.as_deref().map(|raw| {
+            let stripped = strip_backend_id_prefix(raw);
+            stripped
+                .strip_prefix("device:")
+                .or_else(|| stripped.strip_prefix("input_device:"))
+                .unwrap_or(stripped)
+        })
+    }
+
+    #[inline]
+    pub fn name(&self) -> Option<&Arc<str>> {
+        self.name.as_ref()
+    }
+
+    #[inline]
+    pub fn executable_path(&self) -> Option<&Arc<str>> {
+        self.executable_path.as_ref()
+    }
+
+    #[inline]
+    pub fn active_audio(&self) -> Option<bool> {
+        self.active_audio
+    }
+
+    #[inline]
+    pub fn scope(&self) -> ProcessScope {
+        self.scope
+    }
+
+    #[inline]
+    pub fn on_root_exit(&self) -> OnRootExit {
+        self.on_root_exit
+    }
+
+    #[inline]
+    pub fn default_device_mode(&self) -> DefaultDeviceMode {
+        self.default_device_mode
+    }
+
+    #[inline]
+    pub fn backend(&self) -> Option<BackendId> {
+        self.backend
+    }
+
+    #[inline]
+    pub fn available_backends(&self) -> &Arc<[BackendId]> {
+        &self.available_backends
+    }
+
+    #[inline]
+    pub fn gain(&self) -> f32 {
+        self.gain
+    }
+
+    pub fn diagnostic_summary(&self, options: DiagnosticOptions) -> String {
+        if options.include_identity {
+            format!(
+                "kind={:?} id={} backend={:?} scope={:?} on_root_exit={:?} default_device_mode={:?} gain={}",
+                self.kind,
+                self.id,
+                self.backend,
+                self.scope,
+                self.on_root_exit,
+                self.default_device_mode,
+                self.gain
+            )
+        } else {
+            format!(
+                "kind={:?} id=<redacted> backend={:?} scope={:?} on_root_exit={:?} default_device_mode={:?} gain={}",
+                self.kind,
+                self.backend,
+                self.scope,
+                self.on_root_exit,
+                self.default_device_mode,
+                self.gain
+            )
+        }
+    }
+
+    pub fn process(
+        identity: ProcessIdentity,
+        scope: ProcessScope,
+        on_root_exit: OnRootExit,
+    ) -> Result<Self, PlanError> {
+        if identity.pid == 0 {
+            return Err(PlanError::InvalidTarget);
+        }
+        if matches!(on_root_exit, OnRootExit::Wait { wait_timeout_ns: 0 }) {
+            return Err(PlanError::InvalidTarget);
+        }
+        Ok(Self {
+            kind: TargetKind::Process,
+            id: format!("process:{}:{}", identity.pid, identity.generation).into(),
+            pid: Some(identity.pid),
+            process_start_time: Some(identity.generation),
+            app_id: None,
+            device_id: None,
+            name: None,
+            executable_path: None,
+            active_audio: None,
+            scope,
+            on_root_exit,
+            default_device_mode: DefaultDeviceMode::Follow,
+            backend: None,
+            available_backends: Arc::from([]),
+            gain: 1.0,
+        })
+    }
+
+    pub fn application(
+        identity: ProcessIdentity,
+        app_id: Option<Arc<str>>,
+        name: Option<Arc<str>>,
+        executable_path: Option<Arc<str>>,
+        scope: ProcessScope,
+        on_root_exit: OnRootExit,
+    ) -> Result<Self, PlanError> {
+        let mut target = Self::process(identity, scope, on_root_exit)?;
+        target.kind = TargetKind::Application;
+        target.id = format!("application:{}:{}", identity.pid, identity.generation).into();
+        target.app_id = app_id;
+        target.name = name;
+        target.executable_path = executable_path;
+        Ok(target)
+    }
+
+    pub fn device(device_id: impl Into<Arc<str>>) -> Result<Self, PlanError> {
+        let raw_id: Arc<str> = device_id.into();
+        let clean = strip_backend_id_prefix(&raw_id);
+        let clean = clean.strip_prefix("device:").unwrap_or(clean);
+        if clean.is_empty() || clean.contains('\0') {
+            return Err(PlanError::InvalidTarget);
+        }
+        let clean_arc: Arc<str> = clean.into();
+        Ok(Self {
+            kind: TargetKind::Device,
+            id: format!("device:{clean_arc}").into(),
+            pid: None,
+            process_start_time: None,
+            app_id: None,
+            device_id: Some(clean_arc),
+            name: None,
+            executable_path: None,
+            active_audio: None,
+            scope: ProcessScope::Tree,
+            on_root_exit: OnRootExit::Stop,
+            default_device_mode: DefaultDeviceMode::Pin,
+            backend: None,
+            available_backends: Arc::from([]),
+            gain: 1.0,
+        })
+    }
+
