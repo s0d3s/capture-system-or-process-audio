@@ -981,3 +981,370 @@ impl CaptureTarget {
         })
     }
 
+    pub fn input_device(device_id: impl Into<Arc<str>>) -> Result<Self, PlanError> {
+        let raw_id: Arc<str> = device_id.into();
+        let clean = strip_backend_id_prefix(&raw_id);
+        let clean = clean.strip_prefix("input_device:").unwrap_or(clean);
+        if clean.is_empty() || clean.contains('\0') {
+            return Err(PlanError::InvalidTarget);
+        }
+        let clean_arc: Arc<str> = clean.into();
+        Ok(Self {
+            kind: TargetKind::InputDevice,
+            id: format!("input_device:{clean_arc}").into(),
+            pid: None,
+            process_start_time: None,
+            app_id: None,
+            device_id: Some(clean_arc),
+            name: None,
+            executable_path: None,
+            active_audio: None,
+            scope: ProcessScope::Tree,
+            on_root_exit: OnRootExit::Stop,
+            default_device_mode: DefaultDeviceMode::Pin,
+            backend: None,
+            available_backends: Arc::from([]),
+            gain: 1.0,
+        })
+    }
+
+    pub fn default_output(default_device_mode: DefaultDeviceMode) -> Self {
+        Self {
+            kind: TargetKind::DefaultOutput,
+            id: match default_device_mode {
+                DefaultDeviceMode::Follow => "default_output:follow".into(),
+                DefaultDeviceMode::Pin => "default_output:pin".into(),
+            },
+            pid: None,
+            process_start_time: None,
+            app_id: None,
+            device_id: None,
+            name: None,
+            executable_path: None,
+            active_audio: None,
+            scope: ProcessScope::Tree,
+            on_root_exit: OnRootExit::Stop,
+            default_device_mode,
+            backend: None,
+            available_backends: Arc::from([]),
+            gain: 1.0,
+        }
+    }
+
+    pub fn microphone(default_device_mode: DefaultDeviceMode) -> Self {
+        Self {
+            kind: TargetKind::DefaultInput,
+            id: match default_device_mode {
+                DefaultDeviceMode::Follow => "default_input:follow".into(),
+                DefaultDeviceMode::Pin => "default_input:pin".into(),
+            },
+            pid: None,
+            process_start_time: None,
+            app_id: None,
+            device_id: None,
+            name: None,
+            executable_path: None,
+            active_audio: None,
+            scope: ProcessScope::Tree,
+            on_root_exit: OnRootExit::Stop,
+            default_device_mode,
+            backend: None,
+            available_backends: Arc::from([]),
+            gain: 1.0,
+        }
+    }
+
+    pub fn default_input(default_device_mode: DefaultDeviceMode) -> Self {
+        Self::microphone(default_device_mode)
+    }
+
+    pub fn with_backend(self, backend: BackendId) -> Self {
+        self.with_optional_backend(Some(backend))
+    }
+
+    pub fn with_optional_backend(mut self, backend: Option<BackendId>) -> Self {
+        let base_id = strip_backend_id_prefix(&self.id).to_owned();
+        self.backend = backend;
+        self.id = match backend {
+            Some(b) => format!("{}:{base_id}", b.as_str()).into(),
+            None => base_id.into(),
+        };
+        if let Some(b) = backend
+            && self.available_backends.is_empty()
+        {
+            self.available_backends = Arc::from([b]);
+        }
+        self
+    }
+
+    pub fn with_available_backends(mut self, backends: impl Into<Arc<[BackendId]>>) -> Self {
+        self.available_backends = backends.into();
+        self
+    }
+
+    pub fn with_scope(mut self, scope: ProcessScope) -> Self {
+        self.scope = scope;
+        self
+    }
+
+    pub fn with_on_root_exit(mut self, on_root_exit: OnRootExit) -> Result<Self, PlanError> {
+        if matches!(on_root_exit, OnRootExit::Wait { wait_timeout_ns: 0 }) {
+            return Err(PlanError::InvalidTarget);
+        }
+        self.on_root_exit = on_root_exit;
+        Ok(self)
+    }
+
+    pub fn with_default_device_mode(mut self, mode: DefaultDeviceMode) -> Self {
+        self.default_device_mode = mode;
+        let base_id = match self.kind {
+            TargetKind::DefaultOutput => Some(match mode {
+                DefaultDeviceMode::Follow => "default_output:follow",
+                DefaultDeviceMode::Pin => "default_output:pin",
+            }),
+            TargetKind::DefaultInput => Some(match mode {
+                DefaultDeviceMode::Follow => "default_input:follow",
+                DefaultDeviceMode::Pin => "default_input:pin",
+            }),
+            _ => None,
+        };
+        if let Some(base) = base_id {
+            self.id = match self.backend {
+                Some(b) => format!("{}:{base}", b.as_str()).into(),
+                None => base.into(),
+            };
+        }
+        self
+    }
+
+    pub fn with_name(mut self, name: Option<Arc<str>>) -> Self {
+        self.name = name;
+        self
+    }
+
+    pub fn with_active_audio(mut self, active_audio: Option<bool>) -> Self {
+        self.active_audio = active_audio;
+        self
+    }
+
+    pub fn with_process_identity(mut self, identity: ProcessIdentity) -> Result<Self, PlanError> {
+        if identity.pid == 0 || !matches!(self.kind, TargetKind::Process | TargetKind::Application)
+        {
+            return Err(PlanError::InvalidTarget);
+        }
+        let kind_prefix = match self.kind {
+            TargetKind::Process => "process",
+            TargetKind::Application => "application",
+            _ => unreachable!(),
+        };
+        let base = format!("{kind_prefix}:{}:{}", identity.pid, identity.generation);
+        self.pid = Some(identity.pid);
+        self.process_start_time = Some(identity.generation);
+        self.id = match self.backend {
+            Some(b) => format!("{}:{base}", b.as_str()).into(),
+            None => base.into(),
+        };
+        Ok(self)
+    }
+
+    /// Resolve `DefaultOutput(Pin)` or `DefaultInput(Pin)` to a concrete `Device` / `InputDevice`
+    /// while preserving `gain`, `backend`, and `available_backends` invariants.
+    pub fn resolve_pinned_endpoint(
+        &self,
+        default_output_id: Option<&str>,
+        default_input_id: Option<&str>,
+    ) -> Self {
+        if self.default_device_mode != DefaultDeviceMode::Pin {
+            return self.clone();
+        }
+        let replacement = match self.kind {
+            TargetKind::DefaultOutput => default_output_id.and_then(|id| Self::device(id).ok()),
+            TargetKind::DefaultInput => default_input_id.and_then(|id| Self::input_device(id).ok()),
+            _ => None,
+        };
+        let Some(mut resolved) = replacement else {
+            return self.clone();
+        };
+        resolved.gain = self.gain;
+        resolved.available_backends = self.available_backends.clone();
+        resolved.with_optional_backend(self.backend)
+    }
+
+    pub fn with_metadata(
+        mut self,
+        app_id: Option<Arc<str>>,
+        name: Option<Arc<str>>,
+        executable_path: Option<Arc<str>>,
+        active_audio: Option<bool>,
+    ) -> Self {
+        self.app_id = app_id;
+        self.name = name;
+        self.executable_path = executable_path;
+        self.active_audio = active_audio;
+        self
+    }
+
+    pub fn with_gain(mut self, gain: f32) -> Result<Self, PlanError> {
+        if !gain.is_finite() || gain < 0.0 {
+            return Err(PlanError::InvalidTarget);
+        }
+        self.gain = gain;
+        Ok(self)
+    }
+
+    pub fn process_identity(&self) -> Option<ProcessIdentity> {
+        Some(ProcessIdentity {
+            pid: self.pid?,
+            generation: self.process_start_time?,
+        })
+    }
+
+    pub fn lower_to_process(&self) -> Result<Self, PlanError> {
+        match self.kind {
+            TargetKind::Process => {
+                self.validate()?;
+                Ok(self.clone())
+            }
+            TargetKind::Application => {
+                self.validate()?;
+                let identity = self.process_identity().ok_or(PlanError::InvalidTarget)?;
+                let base_id = format!("process:{}:{}", identity.pid, identity.generation);
+                let id = match self.backend {
+                    Some(b) => format!("{}:{base_id}", b.as_str()).into(),
+                    None => base_id.into(),
+                };
+                Ok(Self {
+                    kind: TargetKind::Process,
+                    id,
+                    ..self.clone()
+                })
+            }
+            _ => Err(PlanError::InvalidTarget),
+        }
+    }
+
+    pub fn match_identity_key(&self) -> Option<u64> {
+        let text = self
+            .app_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                self.executable_path
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+            })?;
+        Some(stable_match_key(text))
+    }
+
+    pub fn validate(&self) -> Result<(), PlanError> {
+        if !self.gain.is_finite() || self.gain < 0.0 || self.id.is_empty() {
+            return Err(PlanError::InvalidTarget);
+        }
+        let (id_backend, base_id) = extract_backend_id_prefix(&self.id);
+        if id_backend != self.backend || base_id.is_empty() {
+            return Err(PlanError::InvalidTarget);
+        }
+        if matches!(self.on_root_exit, OnRootExit::Wait { wait_timeout_ns: 0 }) {
+            return Err(PlanError::InvalidTarget);
+        }
+        match self.kind {
+            TargetKind::Process | TargetKind::Application => {
+                if self.pid.is_none_or(|pid| pid == 0)
+                    || self.process_start_time.is_none()
+                    || self.device_id.is_some()
+                {
+                    return Err(PlanError::InvalidTarget);
+                }
+            }
+            TargetKind::Device | TargetKind::InputDevice => {
+                if self.pid.is_some()
+                    || self.process_start_time.is_some()
+                    || self
+                        .device_id
+                        .as_ref()
+                        .is_none_or(|id| id.is_empty() || id.contains('\0'))
+                {
+                    return Err(PlanError::InvalidTarget);
+                }
+            }
+            TargetKind::DefaultOutput | TargetKind::DefaultInput => {
+                if self.pid.is_some()
+                    || self.process_start_time.is_some()
+                    || self.device_id.is_some()
+                {
+                    return Err(PlanError::InvalidTarget);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn stable_match_key(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    if hash == 0 { 1 } else { hash }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Provenance {
+    Native,
+    Derived,
+    HostArrival,
+    Synthetic,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Stamp {
+    pub ticks: u64,
+    pub ticks_per_second: u64,
+    pub clock_domain: u64,
+    pub provenance: Provenance,
+    pub uncertainty_ns: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Loss {
+    pub frames: Option<u64>,
+    pub rate_hz: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Header {
+    pub sequence: u64,
+    pub segment: u64,
+    pub generation: u64,
+    pub frames: usize,
+    pub sample_position: Option<u64>,
+    pub timestamp: Option<Stamp>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Readiness {
+    Ready,
+    Unknown,
+    PermissionRequired,
+    Unavailable,
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Reason {
+    AmbiguousApplication,
+    StaleProcess,
+    InvalidFormat,
+    UnsupportedFormat,
+    UnsupportedChannelMapping,
+    FormatChanged,
+    IncompleteFrame,
+    Capacity(CapacityError),
+    NoCandidate,
+    Unknown,
+    PermissionRequired,
+    Unavailable,
+    Unsupported,
+    SelectedOpenFailed,
+}
