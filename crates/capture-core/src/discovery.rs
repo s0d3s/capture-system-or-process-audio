@@ -1383,3 +1383,925 @@ impl DiscoveryService {
             .len()
     }
 
+    pub fn current_revision(&self) -> u64 {
+        self.inner.revision.load(SeqCst)
+    }
+
+    pub fn default_output_device_id(&self) -> Option<Arc<str>> {
+        self.inner
+            .backend_inventory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .devices
+            .iter()
+            .find(|d| d.direction == DeviceDirection::Output && d.is_default)
+            .map(|d| d.device_id.clone())
+    }
+
+    pub fn default_input_device_id(&self) -> Option<Arc<str>> {
+        self.inner
+            .backend_inventory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .devices
+            .iter()
+            .find(|d| {
+                d.direction == DeviceDirection::Input
+                    && !d.is_monitor_sink
+                    && !d.device_id.ends_with(".monitor")
+                    && d.is_default
+            })
+            .map(|d| d.device_id.clone())
+    }
+
+    pub fn update_backend_inventory(
+        &self,
+        inventory: BackendRawInventory,
+        query: &DiscoveryQuery,
+    ) -> Result<u64, PlanError> {
+        let rev_preview = self.inner.revision.load(SeqCst) + 1;
+        let catalog = build_catalog_from_backend_inventory(&inventory, query, rev_preview)?;
+        *self.inner.os.lock().unwrap_or_else(|e| e.into_inner()) = query.os;
+        *self
+            .inner
+            .backend_inventory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = inventory.clone();
+
+        {
+            let mut base = self
+                .inner
+                .diff_baseline
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !base.initialized {
+                base.initialized = true;
+                base.default_device_id = catalog.default_output_device_id;
+                base.default_input_id = catalog.default_input_device_id;
+                base.targets = catalog
+                    .targets
+                    .into_iter()
+                    .map(|t| (t.id.clone(), t))
+                    .collect();
+            }
+        }
+        self.init_query_subscriber_baselines(&inventory, rev_preview);
+        Ok(self.inner.revision.fetch_add(1, SeqCst) + 1)
+    }
+
+    pub fn applications(
+        &self,
+        active_only: bool,
+        include_non_audio: bool,
+    ) -> Result<Vec<CaptureTarget>, PlanError> {
+        Ok(self
+            .discover(DiscoveryFilter::applications(
+                active_only,
+                include_non_audio,
+            ))?
+            .targets)
+    }
+
+    pub fn processes(
+        &self,
+        active_only: bool,
+        include_non_audio: bool,
+    ) -> Result<Vec<CaptureTarget>, PlanError> {
+        Ok(self
+            .discover(DiscoveryFilter::processes(active_only, include_non_audio))?
+            .targets)
+    }
+
+    pub fn output_devices(&self) -> Result<Vec<CaptureTarget>, PlanError> {
+        Ok(self.discover(DiscoveryFilter::output_devices())?.targets)
+    }
+
+    pub fn input_devices(&self) -> Result<Vec<CaptureTarget>, PlanError> {
+        Ok(self
+            .discover_query(&DiscoveryQuery::input_devices_for_os(self.os()))?
+            .input_devices)
+    }
+
+    fn init_query_subscriber_baselines(&self, inventory: &BackendRawInventory, rev: u64) {
+        let subs: Vec<Arc<Mutex<SubscriberState>>> = self
+            .inner
+            .subscribers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        for sub in subs {
+            let mut guard = sub.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.closed || guard.baseline_initialized {
+                continue;
+            }
+            if let Some(ref q) = guard.query
+                && let Ok(cat) = build_catalog_from_backend_inventory(inventory, q, rev)
+            {
+                guard.baseline_targets =
+                    cat.targets.into_iter().map(|t| (t.id.clone(), t)).collect();
+                guard.baseline_initialized = true;
+            }
+        }
+    }
+
+    pub fn ingest_backend_inventory(
+        &self,
+        inventory: BackendRawInventory,
+        query: &DiscoveryQuery,
+    ) -> Result<u64, PlanError> {
+        let rev_preview = self.inner.revision.load(SeqCst) + 1;
+        let catalog = build_catalog_from_backend_inventory(&inventory, query, rev_preview)?;
+        *self.inner.os.lock().unwrap_or_else(|e| e.into_inner()) = query.os;
+        *self
+            .inner
+            .backend_inventory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = inventory.clone();
+
+        let mut last_rev = self.inner.revision.fetch_add(1, SeqCst) + 1;
+        let mut default_events = Vec::new();
+        let mut filter_events = Vec::new();
+        {
+            let mut base = self
+                .inner
+                .diff_baseline
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut next_map = BTreeMap::new();
+            if !base.initialized {
+                for target in catalog.targets {
+                    filter_events.push(DiscoveryEventKind::Added(target.clone()));
+                    next_map.insert(target.id.clone(), target);
+                }
+                base.initialized = true;
+                base.default_device_id = catalog.default_output_device_id;
+                base.default_input_id = catalog.default_input_device_id;
+                base.targets = next_map;
+            } else {
+                if let (Some(prev_def), Some(curr_def)) =
+                    (&base.default_device_id, &catalog.default_output_device_id)
+                    && prev_def != curr_def
+                {
+                    default_events.push(DiscoveryEventKind::DefaultDeviceChanged {
+                        device_id: curr_def.clone(),
+                    });
+                }
+                base.default_device_id = catalog.default_output_device_id;
+
+                if let (Some(prev_in), Some(curr_in)) =
+                    (&base.default_input_id, &catalog.default_input_device_id)
+                    && prev_in != curr_in
+                {
+                    default_events.push(DiscoveryEventKind::DefaultInputChanged {
+                        device_id: curr_in.clone(),
+                    });
+                }
+                base.default_input_id = catalog.default_input_device_id;
+
+                for target in catalog.targets {
+                    match base.targets.get(&target.id) {
+                        None => {
+                            filter_events.push(DiscoveryEventKind::Added(target.clone()));
+                        }
+                        Some(old)
+                            if old.active_audio != target.active_audio
+                                || old.name != target.name =>
+                        {
+                            filter_events.push(DiscoveryEventKind::StateChanged(target.clone()));
+                        }
+                        _ => {}
+                    }
+                    next_map.insert(target.id.clone(), target);
+                }
+                for old_id in base.targets.keys() {
+                    if !next_map.contains_key(old_id) {
+                        filter_events.push(DiscoveryEventKind::Removed(old_id.clone()));
+                    }
+                }
+                base.targets = next_map;
+            }
+        }
+
+        for ev in default_events {
+            last_rev = self.publish_event(ev);
+        }
+        for ev in filter_events {
+            last_rev = self.publish_filter_only_event(ev);
+        }
+
+        let subs: Vec<Arc<Mutex<SubscriberState>>> = self
+            .inner
+            .subscribers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        for sub in subs {
+            let sub_query = {
+                let guard = sub.lock().unwrap_or_else(|e| e.into_inner());
+                if guard.closed {
+                    None
+                } else {
+                    guard.query.clone()
+                }
+            };
+            let Some(sub_q) = sub_query else {
+                continue;
+            };
+            let Ok(sub_cat) = build_catalog_from_backend_inventory(&inventory, &sub_q, last_rev)
+            else {
+                continue;
+            };
+            let mut guard = sub.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.closed {
+                continue;
+            }
+            let mut next_sub_map = BTreeMap::new();
+            let mut sub_events = Vec::new();
+            if !guard.baseline_initialized {
+                for target in sub_cat.targets {
+                    sub_events.push(DiscoveryEventKind::Added(target.clone()));
+                    next_sub_map.insert(target.id.clone(), target);
+                }
+                guard.baseline_initialized = true;
+            } else {
+                for target in sub_cat.targets {
+                    match guard.baseline_targets.get(&target.id) {
+                        None => sub_events.push(DiscoveryEventKind::Added(target.clone())),
+                        Some(old)
+                            if old.active_audio != target.active_audio
+                                || old.name != target.name =>
+                        {
+                            sub_events.push(DiscoveryEventKind::StateChanged(target.clone()));
+                        }
+                        _ => {}
+                    }
+                    next_sub_map.insert(target.id.clone(), target);
+                }
+                for old_id in guard.baseline_targets.keys() {
+                    if !next_sub_map.contains_key(old_id) {
+                        sub_events.push(DiscoveryEventKind::Removed(old_id.clone()));
+                    }
+                }
+            }
+            guard.baseline_targets = next_sub_map;
+            for kind in sub_events {
+                last_rev = self.inner.revision.fetch_add(1, SeqCst) + 1;
+                push_event_to_subscriber_guard(&mut guard, last_rev, kind);
+            }
+        }
+
+        Ok(last_rev)
+    }
+
+    pub fn discover_query(&self, query: &DiscoveryQuery) -> Result<TargetCatalog, PlanError> {
+        let revision = self.inner.revision.load(SeqCst);
+        let inv = self
+            .inner
+            .backend_inventory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        build_catalog_from_backend_inventory(&inv, query, revision)
+    }
+
+    pub fn discover(&self, filter: DiscoveryFilter) -> Result<TargetSnapshot, PlanError> {
+        let revision = self.inner.revision.load(SeqCst);
+        let os = self.os();
+        let inv = self
+            .inner
+            .backend_inventory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let query = DiscoveryQuery::from_filter_for_os(os, &filter);
+        let catalog = build_catalog_from_backend_inventory(&inv, &query, revision)?;
+        Ok(TargetSnapshot {
+            cursor: catalog.cursor,
+            targets: catalog.targets,
+        })
+    }
+
+    pub fn find_app(
+        &self,
+        query: &str,
+        scope: ProcessScope,
+        on_root_exit: OnRootExit,
+    ) -> Result<CaptureTarget, FindAppError> {
+        self.find_app_with_backends(query, &Backends::default(), scope, on_root_exit)
+    }
+
+    pub fn find_app_with_backends(
+        &self,
+        query: &str,
+        backends: &Backends,
+        scope: ProcessScope,
+        on_root_exit: OnRootExit,
+    ) -> Result<CaptureTarget, FindAppError> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return Err(FindAppError::EmptyQuery);
+        }
+        let needle = trimmed.to_ascii_lowercase();
+        let os = self.os();
+        let mut all_apps_query = DiscoveryQuery::all_for_os(os).with_backends(backends.clone());
+        all_apps_query.active_only = false;
+        all_apps_query.include_non_audio = true;
+        all_apps_query.include_applications = true;
+        all_apps_query.include_processes = false;
+        all_apps_query.include_output_devices = false;
+        all_apps_query.include_input_devices = false;
+
+        let catalog = self
+            .discover_query(&all_apps_query)
+            .map_err(|_| FindAppError::NotFound)?;
+
+        let matches: Vec<CaptureTarget> = catalog
+            .applications
+            .into_iter()
+            .filter(|target| {
+                let app_match = target
+                    .app_id
+                    .as_deref()
+                    .is_some_and(|id| id.to_ascii_lowercase() == needle);
+                let name_match = target
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.to_ascii_lowercase() == needle);
+                let exe_match = target.executable_path.as_deref().is_some_and(|path| {
+                    let lower = normalize_path_lower(path);
+                    if lower == needle {
+                        return true;
+                    }
+                    let base = lower.rsplit('/').next().unwrap_or(&lower);
+                    if base == needle || base.strip_suffix(".exe") == Some(needle.as_str()) {
+                        return true;
+                    }
+                    if let Some(bundle) = extract_macos_app_bundle_info(&lower) {
+                        return bundle.bundle_name == needle
+                            || bundle.bundle_name.strip_suffix(".app") == Some(needle.as_str());
+                    }
+                    false
+                });
+                app_match || name_match || exe_match
+            })
+            .collect();
+
+        match matches.len() {
+            0 => Err(FindAppError::NotFound),
+            1 => {
+                let mut found = matches.into_iter().next().unwrap();
+                found.scope = scope;
+                found.on_root_exit = on_root_exit;
+                Ok(found)
+            }
+            count => Err(FindAppError::AmbiguousMatch(count)),
+        }
+    }
+
+    pub fn subscribe(
+        &self,
+        filter: DiscoveryFilter,
+        max_discovery_queue: usize,
+    ) -> Result<DiscoverySubscription, PlanError> {
+        if !(32..=4096).contains(&max_discovery_queue) {
+            return Err(PlanError::Capacity(CapacityError::ExceedsByteCeiling));
+        }
+        let id = self.inner.next_sub_id.fetch_add(1, SeqCst);
+        let rev = self.inner.revision.load(SeqCst);
+        let state = Arc::new(Mutex::new(SubscriberState {
+            filter,
+            query: None,
+            baseline_targets: BTreeMap::new(),
+            baseline_initialized: false,
+            max_queue: max_discovery_queue,
+            queue: VecDeque::with_capacity(max_discovery_queue.min(256)),
+            overflowed: false,
+            minimum_resnapshot_revision: None,
+            last_polled_revision: rev,
+            closed: false,
+        }));
+        self.inner
+            .subscribers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, state.clone());
+        Ok(DiscoverySubscription {
+            id,
+            service: self.clone(),
+            state,
+        })
+    }
+
+    /// Subscribe to incremental discovery events governed by a `DiscoveryQuery`
+    /// (supporting `DiscoveryDedupe::PerBackend`, custom `Backends` filtering, and `resnapshot_catalog`).
+    pub fn subscribe_query(
+        &self,
+        query: DiscoveryQuery,
+        max_discovery_queue: usize,
+    ) -> Result<DiscoverySubscription, PlanError> {
+        query.backends.validate()?;
+        if !(32..=4096).contains(&max_discovery_queue) {
+            return Err(PlanError::Capacity(CapacityError::ExceedsByteCeiling));
+        }
+        let id = self.inner.next_sub_id.fetch_add(1, SeqCst);
+        let rev = self.inner.revision.load(SeqCst);
+        let inv = self
+            .inner
+            .backend_inventory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let has_initial_inv = !inv.processes.is_empty() || !inv.devices.is_empty();
+        let initial_targets = if has_initial_inv {
+            build_catalog_from_backend_inventory(&inv, &query, rev)?
+                .targets
+                .into_iter()
+                .map(|t| (t.id.clone(), t))
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+        let filter = query.as_filter();
+        let state = Arc::new(Mutex::new(SubscriberState {
+            filter,
+            query: Some(query),
+            baseline_targets: initial_targets,
+            baseline_initialized: has_initial_inv,
+            max_queue: max_discovery_queue,
+            queue: VecDeque::with_capacity(max_discovery_queue.min(256)),
+            overflowed: false,
+            minimum_resnapshot_revision: None,
+            last_polled_revision: rev,
+            closed: false,
+        }));
+        self.inner
+            .subscribers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, state.clone());
+        Ok(DiscoverySubscription {
+            id,
+            service: self.clone(),
+            state,
+        })
+    }
+
+    fn unsubscribe(&self, id: u64) {
+        if let Some(sub) = self
+            .inner
+            .subscribers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id)
+        {
+            sub.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
+        }
+    }
+
+    fn publish_filter_only_event(&self, kind: DiscoveryEventKind) -> u64 {
+        self.publish_event_internal(kind, true)
+    }
+
+    pub fn publish_event(&self, kind: DiscoveryEventKind) -> u64 {
+        self.publish_event_internal(kind, false)
+    }
+
+    fn publish_event_internal(&self, kind: DiscoveryEventKind, skip_query_subs: bool) -> u64 {
+        let revision = self.inner.revision.fetch_add(1, SeqCst) + 1;
+        let subs: Vec<Arc<Mutex<SubscriberState>>> = self
+            .inner
+            .subscribers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+
+        for sub in subs {
+            let mut guard = sub.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.closed || (skip_query_subs && guard.query.is_some()) {
+                continue;
+            }
+            let matches = match &kind {
+                DiscoveryEventKind::Added(target) | DiscoveryEventKind::StateChanged(target) => {
+                    match &guard.query {
+                        Some(q) => q.matches_target(target),
+                        None => guard.filter.matches(target),
+                    }
+                }
+                DiscoveryEventKind::Removed(id) => {
+                    let (id_backend, bare) = extract_backend_id_prefix(id);
+                    let backend_ok = match &guard.query {
+                        Some(q) => match q.dedupe {
+                            DiscoveryDedupe::ByLogicalTarget => id_backend.is_none(),
+                            DiscoveryDedupe::PerBackend => {
+                                id_backend.is_some_and(|b| q.backends.for_os(q.os).contains(&b))
+                            }
+                        },
+                        None => true,
+                    };
+                    let kind_ok =
+                        if bare.starts_with("device:") || bare.starts_with("default_output:") {
+                            guard.filter.include_devices
+                        } else if bare.starts_with("input_device:")
+                            || bare.starts_with("default_input:")
+                        {
+                            guard.filter.include_input_devices
+                        } else if bare.starts_with("application:") {
+                            guard.filter.include_applications
+                        } else if bare.starts_with("process:") {
+                            guard.filter.include_processes
+                        } else {
+                            guard.filter.include_applications
+                                || guard.filter.include_processes
+                                || guard.filter.include_devices
+                                || guard.filter.include_input_devices
+                        };
+                    backend_ok && kind_ok
+                }
+                DiscoveryEventKind::DefaultDeviceChanged { .. } => guard.filter.include_devices,
+                DiscoveryEventKind::DefaultInputChanged { .. } => {
+                    guard.filter.include_input_devices
+                }
+                DiscoveryEventKind::WatcherFailed { .. }
+                | DiscoveryEventKind::VisibilityChanged(_)
+                | DiscoveryEventKind::ResnapshotRequired { .. } => true,
+            };
+            if !matches {
+                continue;
+            }
+            push_event_to_subscriber_guard(&mut guard, revision, kind.clone());
+        }
+        revision
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::planner::{CaptureRequest, TargetPlan};
+
+    fn win_backend_inventory(
+        processes: Vec<RawProcessRecord>,
+        devices: Vec<(&str, Option<&str>, bool)>,
+    ) -> BackendRawInventory {
+        BackendRawInventory {
+            processes: processes
+                .into_iter()
+                .map(|process| RawBackendProcessRecord {
+                    backend: BackendId::Wasapi,
+                    process,
+                })
+                .collect(),
+            devices: devices
+                .into_iter()
+                .map(|(id, name, is_def)| RawBackendDeviceRecord {
+                    backend: BackendId::Wasapi,
+                    direction: DeviceDirection::Output,
+                    device_id: id.into(),
+                    name: name.map(Into::into),
+                    is_default: is_def,
+                    is_monitor_sink: false,
+                })
+                .collect(),
+        }
+    }
+
+    fn sample_processes() -> Vec<RawProcessRecord> {
+        vec![
+            RawProcessRecord {
+                identity: ProcessIdentity {
+                    pid: 100,
+                    generation: 1000,
+                },
+                parent_pid: None,
+                app_id: Some("org.mozilla.firefox".into()),
+                name: Some("Firefox".into()),
+                executable_path: Some("C:\\Program Files\\Mozilla Firefox\\firefox.exe".into()),
+                active_audio: None,
+            },
+            RawProcessRecord {
+                identity: ProcessIdentity {
+                    pid: 200,
+                    generation: 2000,
+                },
+                parent_pid: Some(100),
+                app_id: None,
+                name: Some("firefox-audio-helper".into()),
+                executable_path: Some("C:\\Program Files\\Mozilla Firefox\\firefox.exe".into()),
+                active_audio: Some(true),
+            },
+            RawProcessRecord {
+                identity: ProcessIdentity {
+                    pid: 300,
+                    generation: 3000,
+                },
+                parent_pid: None,
+                app_id: Some("com.spotify.client".into()),
+                name: Some("Spotify".into()),
+                executable_path: Some("C:\\Users\\user\\AppData\\Spotify\\Spotify.exe".into()),
+                active_audio: Some(false),
+            },
+            RawProcessRecord {
+                identity: ProcessIdentity {
+                    pid: 400,
+                    generation: 4000,
+                },
+                parent_pid: None,
+                app_id: None,
+                name: Some("Notepad".into()),
+                executable_path: Some("C:\\Windows\\System32\\notepad.exe".into()),
+                active_audio: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn discovery_rolls_up_child_helpers_and_respects_audio_filters() {
+        let service = DiscoveryService::new_for_os(PlatformOs::Windows);
+        let win_q = DiscoveryQuery::all_for_os(PlatformOs::Windows);
+        service
+            .update_backend_inventory(
+                win_backend_inventory(
+                    sample_processes(),
+                    vec![("endpoint-speakers-0", Some("Speakers"), true)],
+                ),
+                &win_q,
+            )
+            .unwrap();
+
+        // Default applications(): audio-bearing only (active or idle), child 200 rolled up to root 100
+        let apps = service.applications(false, false).unwrap();
+        assert_eq!(apps.len(), 2);
+        assert_eq!(apps[0].pid, Some(100));
+        assert_eq!(apps[0].active_audio, Some(true));
+        assert_eq!(apps[0].scope, ProcessScope::Tree);
+        assert_eq!(apps[1].pid, Some(300));
+        assert_eq!(apps[1].active_audio, Some(false));
+
+        let active_apps = service.applications(true, false).unwrap();
+        assert_eq!(active_apps.len(), 1);
+        assert_eq!(active_apps[0].pid, Some(100));
+
+        let all_apps = service.applications(false, true).unwrap();
+        assert_eq!(all_apps.len(), 3);
+        assert_eq!(all_apps[2].pid, Some(400));
+        assert_eq!(all_apps[2].active_audio, None);
+
+        let audio_procs = service.processes(false, false).unwrap();
+        assert_eq!(audio_procs.len(), 2);
+        assert_eq!(audio_procs[0].pid, Some(200));
+        assert_eq!(audio_procs[1].pid, Some(300));
+
+        let out_devs = service.output_devices().unwrap();
+        assert_eq!(out_devs.len(), 1);
+        assert_eq!(
+            out_devs[0].device_id.as_deref(),
+            Some("endpoint-speakers-0")
+        );
+        assert_eq!(out_devs[0].name.as_deref(), Some("Speakers"));
+        assert_eq!(out_devs[0].active_audio, None);
+
+        assert_eq!(service.active_subscriber_count(), 0);
+
+        application_rollup_stops_at_shells_launchers_and_disjoint_apps();
+    }
+
+    #[test]
+    fn find_app_supports_pre_audio_and_rejects_ambiguity() {
+        let service = DiscoveryService::new_for_os(PlatformOs::Windows);
+        let win_q = DiscoveryQuery::all_for_os(PlatformOs::Windows);
+        let mut procs = sample_processes();
+        service
+            .update_backend_inventory(
+                win_backend_inventory(
+                    procs.clone(),
+                    vec![("endpoint-speakers-0", Some("Speakers"), true)],
+                ),
+                &win_q,
+            )
+            .unwrap();
+
+        let notepad = service
+            .find_app("notepad", ProcessScope::Tree, OnRootExit::Stop)
+            .unwrap();
+        assert_eq!(notepad.pid, Some(400));
+        assert_eq!(notepad.kind, TargetKind::Application);
+
+        let lowered = notepad.lower_to_process().unwrap();
+        assert_eq!(lowered.kind, TargetKind::Process);
+        assert_eq!(lowered.pid, Some(400));
+        assert_eq!(lowered.process_start_time, Some(4000));
+
+        assert_eq!(
+            service.find_app("nonexistent", ProcessScope::Tree, OnRootExit::Stop),
+            Err(FindAppError::NotFound)
+        );
+
+        procs.push(RawProcessRecord {
+            identity: ProcessIdentity {
+                pid: 401,
+                generation: 4010,
+            },
+            parent_pid: None,
+            app_id: None,
+            name: Some("Notepad".into()),
+            executable_path: Some("C:\\Windows\\System32\\notepad.exe".into()),
+            active_audio: None,
+        });
+        service
+            .update_backend_inventory(
+                win_backend_inventory(procs, vec![("endpoint-speakers-0", Some("Speakers"), true)]),
+                &win_q,
+            )
+            .unwrap();
+        assert_eq!(
+            service.find_app("Notepad", ProcessScope::Tree, OnRootExit::Stop),
+            Err(FindAppError::AmbiguousMatch(2))
+        );
+    }
+
+    #[test]
+    fn bounded_256_event_subscription_overflow_and_cursor_resnapshot() {
+        let service = DiscoveryService::new_for_os(PlatformOs::Windows);
+        let win_q = DiscoveryQuery::all_for_os(PlatformOs::Windows);
+        service
+            .update_backend_inventory(
+                win_backend_inventory(
+                    sample_processes(),
+                    vec![("endpoint-speakers-0", Some("Speakers"), true)],
+                ),
+                &win_q,
+            )
+            .unwrap();
+
+        let sub1 = service
+            .subscribe(DiscoveryFilter::applications(false, false), 256)
+            .unwrap();
+        let sub2 = service
+            .subscribe(DiscoveryFilter::applications(false, false), 256)
+            .unwrap();
+        assert_eq!(service.active_subscriber_count(), 2);
+
+        let sample_app = CaptureTarget::application(
+            ProcessIdentity {
+                pid: 500,
+                generation: 5000,
+            },
+            Some("app.test".into()),
+            Some("TestApp".into()),
+            None,
+            ProcessScope::Tree,
+            OnRootExit::Stop,
+        )
+        .unwrap()
+        .with_metadata(
+            Some("app.test".into()),
+            Some("TestApp".into()),
+            None,
+            Some(true),
+        );
+
+        for _ in 0..256 {
+            service.publish_event(DiscoveryEventKind::StateChanged(sample_app.clone()));
+        }
+        assert!(!sub1.is_overflowed());
+        assert_eq!(sub1.pending_len(), 256);
+
+        for _ in 0..10 {
+            assert!(sub2.poll_event().is_some());
+        }
+
+        let overflow_rev =
+            service.publish_event(DiscoveryEventKind::StateChanged(sample_app.clone()));
+        assert!(sub1.is_overflowed());
+        assert!(!sub2.is_overflowed());
+        assert_eq!(sub2.pending_len(), 247);
+
+        let mut saw_resnapshot = false;
+        while let Some(ev) = sub1.poll_event() {
+            if ev.kind
+                == (DiscoveryEventKind::ResnapshotRequired {
+                    minimum_revision: overflow_rev,
+                })
+            {
+                saw_resnapshot = true;
+            }
+        }
+        assert!(saw_resnapshot);
+
+        let snap = sub1.resnapshot().unwrap();
+        assert!(!sub1.is_overflowed());
+        assert_eq!(snap.cursor.revision, overflow_rev);
+
+        drop(sub1);
+        assert_eq!(service.active_subscriber_count(), 1);
+        drop(sub2);
+        assert_eq!(service.active_subscriber_count(), 0);
+
+        device_subscription_emits_added_removed_rename_and_respects_filter_and_resnapshot();
+    }
+
+    fn device_subscription_emits_added_removed_rename_and_respects_filter_and_resnapshot() {
+        let service = DiscoveryService::new_for_os(PlatformOs::Windows);
+        let win_q = DiscoveryQuery::all_for_os(PlatformOs::Windows);
+        let procs = sample_processes();
+        service
+            .update_backend_inventory(
+                win_backend_inventory(
+                    procs.clone(),
+                    vec![("endpoint-speakers-0", Some("Speakers"), true)],
+                ),
+                &win_q,
+            )
+            .unwrap();
+
+        let dev_sub = service
+            .subscribe(DiscoveryFilter::output_devices(), 32)
+            .unwrap();
+        let app_sub = service
+            .subscribe(DiscoveryFilter::applications(false, false), 32)
+            .unwrap();
+
+        service
+            .ingest_backend_inventory(
+                win_backend_inventory(
+                    procs.clone(),
+                    vec![("endpoint-speakers-0", Some("Studio Monitors"), true)],
+                ),
+                &win_q,
+            )
+            .unwrap();
+        let ev1 = dev_sub.poll_event().expect("expected rename StateChanged");
+        assert!(matches!(
+            &ev1.kind,
+            DiscoveryEventKind::StateChanged(t)
+                if t.kind == TargetKind::Device
+                    && t.device_id.as_deref() == Some("endpoint-speakers-0")
+                    && t.name.as_deref() == Some("Studio Monitors")
+                    && t.active_audio.is_none()
+        ));
+        assert!(app_sub.poll_event().is_none());
+
+        service
+            .ingest_backend_inventory(
+                win_backend_inventory(
+                    procs.clone(),
+                    vec![
+                        ("endpoint-speakers-0", Some("Studio Monitors"), false),
+                        ("endpoint-usb-dac-1", Some("USB DAC Headphones"), true),
+                    ],
+                ),
+                &win_q,
+            )
+            .unwrap();
+        let ev2 = dev_sub.poll_event().expect("expected DefaultDeviceChanged");
+        assert_eq!(
+            ev2.kind,
+            DiscoveryEventKind::DefaultDeviceChanged {
+                device_id: "endpoint-usb-dac-1".into()
+            }
+        );
+        let ev3 = dev_sub.poll_event().expect("expected device Added");
+        assert!(matches!(
+            &ev3.kind,
+            DiscoveryEventKind::Added(t)
+                if t.kind == TargetKind::Device
+                    && t.device_id.as_deref() == Some("endpoint-usb-dac-1")
+                    && t.name.as_deref() == Some("USB DAC Headphones")
+        ));
+        assert!(ev3.revision > ev2.revision);
+        assert!(app_sub.poll_event().is_none());
+
+        let procs_without_spotify: Vec<RawProcessRecord> = procs
+            .iter()
+            .filter(|p| p.identity.pid != 300)
+            .cloned()
+            .collect();
+        service
+            .ingest_backend_inventory(
+                win_backend_inventory(
+                    procs_without_spotify.clone(),
+                    vec![("endpoint-usb-dac-1", Some("USB DAC Headphones"), true)],
+                ),
+                &win_q,
+            )
+            .unwrap();
+        let dev_removed = dev_sub.poll_event().expect("expected device Removed");
+        assert_eq!(
+            dev_removed.kind,
+            DiscoveryEventKind::Removed("device:endpoint-speakers-0".into())
+        );
+        assert!(dev_sub.poll_event().is_none());
+
+        let app_removed = app_sub.poll_event().expect("expected app Removed");
+        assert_eq!(
+            app_removed.kind,
+            DiscoveryEventKind::Removed("application:300:3000".into())
+        );
+        assert!(app_sub.poll_event().is_none());
+
