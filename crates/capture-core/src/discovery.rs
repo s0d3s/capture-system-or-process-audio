@@ -2305,3 +2305,775 @@ mod tests {
         );
         assert!(app_sub.poll_event().is_none());
 
+        service
+            .ingest_backend_inventory(
+                win_backend_inventory(
+                    procs_without_spotify.clone(),
+                    vec![
+                        ("endpoint-speakers-0", Some("Speakers Replugged"), false),
+                        ("endpoint-usb-dac-1", Some("USB DAC Headphones"), true),
+                    ],
+                ),
+                &win_q,
+            )
+            .unwrap();
+        for idx in 0..40 {
+            let renamed = format!("Speakers Rename #{idx}");
+            service
+                .ingest_backend_inventory(
+                    win_backend_inventory(
+                        procs_without_spotify.clone(),
+                        vec![
+                            ("endpoint-speakers-0", Some(renamed.as_str()), false),
+                            ("endpoint-usb-dac-1", Some("USB DAC Headphones"), true),
+                        ],
+                    ),
+                    &win_q,
+                )
+                .unwrap();
+        }
+        assert!(dev_sub.is_overflowed());
+        let snap = dev_sub.resnapshot().unwrap();
+        assert!(!dev_sub.is_overflowed());
+        assert_eq!(snap.targets.len(), 2);
+        assert_eq!(snap.targets[0].name.as_deref(), Some("Speakers Rename #39"));
+    }
+
+    fn application_rollup_stops_at_shells_launchers_and_disjoint_apps() {
+        let win_service = DiscoveryService::new_for_os(PlatformOs::Windows);
+        let win_q = DiscoveryQuery::all_for_os(PlatformOs::Windows);
+
+        // Real Windows desktop hierarchy:
+        // explorer.exe (9880) -> Code.exe (3584) -> chrome.exe (20300, root) -> chrome.exe (2832, audio utility)
+        let mut windows_procs = vec![
+            RawProcessRecord {
+                identity: ProcessIdentity {
+                    pid: 9880,
+                    generation: 100,
+                },
+                parent_pid: None,
+                app_id: Some("C:\\Windows\\explorer.exe".into()),
+                name: Some("explorer.exe".into()),
+                executable_path: Some("C:\\Windows\\explorer.exe".into()),
+                active_audio: None,
+            },
+            RawProcessRecord {
+                identity: ProcessIdentity {
+                    pid: 3584,
+                    generation: 200,
+                },
+                parent_pid: Some(9880),
+                app_id: Some("D:\\Programs\\Microsoft VS Code\\Code.exe".into()),
+                name: Some("Code.exe".into()),
+                executable_path: Some("D:\\Programs\\Microsoft VS Code\\Code.exe".into()),
+                active_audio: None,
+            },
+            RawProcessRecord {
+                identity: ProcessIdentity {
+                    pid: 20300,
+                    generation: 300,
+                },
+                parent_pid: Some(3584),
+                app_id: Some("C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe".into()),
+                name: Some("chrome.exe".into()),
+                executable_path: Some(
+                    "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe".into(),
+                ),
+                active_audio: None,
+            },
+            RawProcessRecord {
+                identity: ProcessIdentity {
+                    pid: 2832,
+                    generation: 310,
+                },
+                parent_pid: Some(20300),
+                app_id: Some("C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe".into()),
+                name: Some("chrome.exe".into()),
+                executable_path: Some(
+                    "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe".into(),
+                ),
+                active_audio: Some(true),
+            },
+        ];
+
+        win_service
+            .update_backend_inventory(
+                win_backend_inventory(windows_procs.clone(), Vec::new()),
+                &win_q,
+            )
+            .unwrap();
+
+        let apps_playing = win_service.applications(false, false).unwrap();
+        assert_eq!(apps_playing.len(), 1);
+        assert_eq!(apps_playing[0].pid, Some(20300));
+        assert_eq!(apps_playing[0].name.as_deref(), Some("chrome.exe"));
+        assert_eq!(apps_playing[0].active_audio, Some(true));
+        assert_eq!(apps_playing[0].scope, ProcessScope::Tree);
+
+        let found_chrome = win_service
+            .find_app("chrome", ProcessScope::Tree, OnRootExit::Stop)
+            .unwrap();
+        assert_eq!(found_chrome.pid, Some(20300));
+
+        windows_procs[3].active_audio = Some(false);
+        win_service
+            .update_backend_inventory(win_backend_inventory(windows_procs, Vec::new()), &win_q)
+            .unwrap();
+        let apps_idle = win_service.applications(false, false).unwrap();
+        assert_eq!(apps_idle.len(), 1);
+        assert_eq!(apps_idle[0].pid, Some(20300));
+        assert_eq!(apps_idle[0].active_audio, Some(false));
+        assert!(win_service.applications(true, false).unwrap().is_empty());
+
+        // A macOS bundle helper under launchd and Dock must roll up to its application.
+        let mac_service = DiscoveryService::new_for_os(PlatformOs::MacOs);
+        let mac_q = DiscoveryQuery::all_for_os(PlatformOs::MacOs);
+        let mac_procs = vec![
+            RawProcessRecord {
+                identity: ProcessIdentity {
+                    pid: 1,
+                    generation: 1,
+                },
+                parent_pid: None,
+                app_id: Some("/sbin/launchd".into()),
+                name: Some("launchd".into()),
+                executable_path: Some("/sbin/launchd".into()),
+                active_audio: None,
+            },
+            RawProcessRecord {
+                identity: ProcessIdentity {
+                    pid: 50,
+                    generation: 5,
+                },
+                parent_pid: Some(1),
+                app_id: Some("com.apple.dock".into()),
+                name: Some("Dock".into()),
+                executable_path: Some(
+                    "/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock".into(),
+                ),
+                active_audio: None,
+            },
+            RawProcessRecord {
+                identity: ProcessIdentity {
+                    pid: 600,
+                    generation: 60,
+                },
+                parent_pid: Some(50),
+                app_id: Some("com.google.Chrome".into()),
+                name: Some("Google Chrome".into()),
+                executable_path: Some(
+                    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into(),
+                ),
+                active_audio: None,
+            },
+            RawProcessRecord {
+                identity: ProcessIdentity {
+                    pid: 601,
+                    generation: 61,
+                },
+                parent_pid: Some(600),
+                app_id: Some("com.google.Chrome.helper".into()),
+                name: Some("Google Chrome Helper (Audio)".into()),
+                executable_path: Some(
+                    "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Helpers/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper".into(),
+                ),
+                active_audio: Some(true),
+            },
+        ];
+        mac_service
+            .update_backend_inventory(
+                BackendRawInventory {
+                    processes: mac_procs
+                        .into_iter()
+                        .map(|process| RawBackendProcessRecord {
+                            backend: BackendId::CoreAudio,
+                            process,
+                        })
+                        .collect(),
+                    devices: Vec::new(),
+                },
+                &mac_q,
+            )
+            .unwrap();
+        let mac_apps = mac_service.applications(true, false).unwrap();
+        assert_eq!(mac_apps.len(), 1);
+        assert_eq!(mac_apps[0].pid, Some(600));
+        assert_eq!(mac_apps[0].name.as_deref(), Some("Google Chrome"));
+
+        // Simultaneous Chrome + Chrome Canary on macOS (including code_sign_clone .app.bundle,
+        // shared com.google.Chrome.helper bundle ID, multiple helper PIDs 73414/73415, and
+        // ppid=None daemonized crashpad helper) plus disjoint Windows Chrome vs Chrome SxS.
+        let chrome_and_canary = vec![
+            RawProcessRecord {
+                identity: ProcessIdentity {
+                    pid: 30208,
+                    generation: 1_792_653_285_327_000,
+                },
+                parent_pid: None,
+                app_id: Some("com.google.Chrome".into()),
+                name: Some("Google Chrome".into()),
+                executable_path: Some(
+                    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into(),
+                ),
+                active_audio: Some(false),
+            },
+            RawProcessRecord {
+                identity: ProcessIdentity {
+                    pid: 30270,
+                    generation: 1_792_653_293_838_207,
+                },
+                parent_pid: Some(30208),
+                app_id: Some("com.google.Chrome.helper".into()),
+                name: Some("Google Chrome Helper".into()),
+                executable_path: Some(
+                    "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/137.0.7151.69/Helpers/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper".into(),
+                ),
+                active_audio: Some(true),
+            },
+            RawProcessRecord {
+                identity: ProcessIdentity {
+                    pid: 73325,
+                    generation: 1_793_092_920_556_483,
+                },
+                parent_pid: Some(30208),
+                app_id: Some("com.google.Chrome.canary".into()),
+                name: Some("Google Chrome Canary".into()),
+                executable_path: Some(
+                    "/private/var/folders/0l/8jqz15r56gx0jtj9wcf5kbgm0000gn/X/com.google.Chrome.canary.code_sign_clone/code_sign_clone.IR8PfD/Google Chrome Canary.app.bundle/Contents/MacOS/Google Chrome Canary".into(),
+                ),
+                active_audio: None,
+            },
+            RawProcessRecord {
+                identity: ProcessIdentity {
+                    pid: 73414,
+                    generation: 1_793_092_954_861_719,
+                },
+                parent_pid: Some(73325),
+                app_id: Some("com.google.Chrome.helper".into()),
+                name: Some("Google Chrome Helper (Aperitif)".into()),
+                executable_path: Some(
+                    "/Applications/Google Chrome Canary.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/157.0.8100.0/Helpers/Google Chrome Helper (Aperitif).app/Contents/MacOS/Google Chrome Helper (Aperitif)".into(),
+                ),
+                active_audio: Some(true),
+            },
+            RawProcessRecord {
+                identity: ProcessIdentity {
+                    pid: 73415,
+                    generation: 1_793_092_954_862_068,
+                },
+                parent_pid: Some(73325),
+                app_id: Some("com.google.Chrome.helper".into()),
+                name: Some("Google Chrome Helper (Aperitif)".into()),
+                executable_path: Some(
+                    "/Applications/Google Chrome Canary.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/157.0.8100.0/Helpers/Google Chrome Helper (Aperitif).app/Contents/MacOS/Google Chrome Helper (Aperitif)".into(),
+                ),
+                active_audio: Some(false),
+            },
+            RawProcessRecord {
+                identity: ProcessIdentity {
+                    pid: 73332,
+                    generation: 1_793_092_921_000_000,
+                },
+                parent_pid: None,
+                app_id: Some(
+                    "/Applications/Google Chrome Canary.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/157.0.8100.0/Helpers/chrome_crashpad_handler".into(),
+                ),
+                name: Some("chrome_crashpad_handler".into()),
+                executable_path: Some(
+                    "/Applications/Google Chrome Canary.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/157.0.8100.0/Helpers/chrome_crashpad_handler".into(),
+                ),
+                active_audio: None,
+            },
+        ];
+        mac_service
+            .update_backend_inventory(
+                BackendRawInventory {
+                    processes: chrome_and_canary
+                        .into_iter()
+                        .map(|process| RawBackendProcessRecord {
+                            backend: BackendId::CoreAudio,
+                            process,
+                        })
+                        .collect(),
+                    devices: Vec::new(),
+                },
+                &mac_q,
+            )
+            .unwrap();
+
+        let audio_apps = mac_service.applications(false, false).unwrap();
+        assert_eq!(audio_apps.len(), 2);
+        assert_eq!(audio_apps[0].pid, Some(30208));
+        assert_eq!(audio_apps[0].name.as_deref(), Some("Google Chrome"));
+        assert_eq!(audio_apps[0].active_audio, Some(true));
+        assert_eq!(audio_apps[1].pid, Some(73325));
+        assert_eq!(audio_apps[1].name.as_deref(), Some("Google Chrome Canary"));
+        assert_eq!(audio_apps[1].active_audio, Some(true));
+
+        let all_apps = mac_service.applications(false, true).unwrap();
+        assert_eq!(all_apps.len(), 2);
+        assert_eq!(
+            mac_service
+                .find_app("Google Chrome", ProcessScope::Tree, OnRootExit::Stop)
+                .unwrap()
+                .pid,
+            Some(30208)
+        );
+        assert_eq!(
+            mac_service
+                .find_app("Google Chrome Canary", ProcessScope::Tree, OnRootExit::Stop)
+                .unwrap()
+                .pid,
+            Some(73325)
+        );
+
+        // Disjoint Windows Chrome vs Chrome SxS (both named chrome.exe) must not merge
+        let win_chrome = RawProcessRecord {
+            identity: ProcessIdentity {
+                pid: 1000,
+                generation: 100,
+            },
+            parent_pid: None,
+            app_id: Some("C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe".into()),
+            name: Some("chrome.exe".into()),
+            executable_path: Some(
+                "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe".into(),
+            ),
+            active_audio: None,
+        };
+        let win_canary = RawProcessRecord {
+            identity: ProcessIdentity {
+                pid: 2000,
+                generation: 200,
+            },
+            parent_pid: Some(1000),
+            app_id: Some(
+                "C:\\Users\\user\\AppData\\Local\\Google\\Chrome SxS\\Application\\chrome.exe"
+                    .into(),
+            ),
+            name: Some("chrome.exe".into()),
+            executable_path: Some(
+                "C:\\Users\\user\\AppData\\Local\\Google\\Chrome SxS\\Application\\chrome.exe"
+                    .into(),
+            ),
+            active_audio: Some(true),
+        };
+        assert!(!can_roll_up_to_parent(&win_canary, &win_chrome));
+
+        // Runtime interpreter processes (gjs-console, python3.14) hosting distinct apps
+        // must not merge across different app_ids, while same-app_id helpers do roll up.
+        assert!(is_runtime_interpreter_stem("gjs-console"));
+        assert!(is_runtime_interpreter_stem("python3.14"));
+        assert!(!is_runtime_interpreter_stem("firefox"));
+
+        let gjs_notifications = RawProcessRecord {
+            identity: ProcessIdentity {
+                pid: 1797,
+                generation: 2170,
+            },
+            parent_pid: None,
+            app_id: Some("org.gnome.Shell.Notifications".into()),
+            name: Some("org.gnome.Shell.Notifications".into()),
+            executable_path: Some("/usr/bin/gjs-console".into()),
+            active_audio: None,
+        };
+        let gjs_decibels = RawProcessRecord {
+            identity: ProcessIdentity {
+                pid: 12918,
+                generation: 1724290,
+            },
+            parent_pid: Some(1797),
+            app_id: Some("org.gnome.Decibels".into()),
+            name: Some("org.gnome.Decibels".into()),
+            executable_path: Some("/usr/bin/gjs-console".into()),
+            active_audio: Some(true),
+        };
+        let gjs_decibels_worker = RawProcessRecord {
+            identity: ProcessIdentity {
+                pid: 12950,
+                generation: 1724300,
+            },
+            parent_pid: Some(12918),
+            app_id: Some("org.gnome.Decibels".into()),
+            name: Some("org.gnome.Decibels".into()),
+            executable_path: Some("/usr/bin/gjs-console".into()),
+            active_audio: Some(true),
+        };
+        assert!(!can_roll_up_to_parent(&gjs_decibels, &gjs_notifications));
+        assert!(can_roll_up_to_parent(&gjs_decibels_worker, &gjs_decibels));
+
+        assert!(is_shell_or_session_host_stem_for_os(
+            PlatformOs::Windows,
+            "explorer"
+        ));
+        assert!(!is_shell_or_session_host_stem_for_os(
+            PlatformOs::Windows,
+            "systemd"
+        ));
+        assert!(is_shell_or_session_host_stem_for_os(
+            PlatformOs::Linux,
+            "systemd"
+        ));
+        assert!(!is_shell_or_session_host_stem_for_os(
+            PlatformOs::Linux,
+            "explorer"
+        ));
+        assert!(is_shell_or_session_host_stem_for_os(
+            PlatformOs::MacOs,
+            "launchd"
+        ));
+        assert!(!is_shell_or_session_host_stem_for_os(
+            PlatformOs::MacOs,
+            "systemd"
+        ));
+        assert!(is_generic_system_bin_dir_for_os(
+            PlatformOs::Windows,
+            "c:/windows/system32"
+        ));
+        assert!(!is_generic_system_bin_dir_for_os(
+            PlatformOs::Windows,
+            "/usr/bin"
+        ));
+        assert!(is_generic_system_bin_dir_for_os(
+            PlatformOs::Linux,
+            "/usr/bin"
+        ));
+        assert!(is_generic_system_bin_dir_for_os(
+            PlatformOs::MacOs,
+            "/system/library/coreservices"
+        ));
+
+        let linux_tree = vec![
+            RawProcessRecord {
+                identity: ProcessIdentity {
+                    pid: 1,
+                    generation: 1,
+                },
+                parent_pid: None,
+                app_id: Some("/sbin/init".into()),
+                name: Some("systemd".into()),
+                executable_path: Some("/sbin/init".into()),
+                active_audio: None,
+            },
+            RawProcessRecord {
+                identity: ProcessIdentity {
+                    pid: 700,
+                    generation: 70,
+                },
+                parent_pid: Some(1),
+                app_id: Some("/usr/bin/bash".into()),
+                name: Some("bash".into()),
+                executable_path: Some("/usr/bin/bash".into()),
+                active_audio: None,
+            },
+            RawProcessRecord {
+                identity: ProcessIdentity {
+                    pid: 710,
+                    generation: 71,
+                },
+                parent_pid: Some(700),
+                app_id: Some("/opt/firefox/firefox".into()),
+                name: Some("firefox".into()),
+                executable_path: Some("/opt/firefox/firefox".into()),
+                active_audio: None,
+            },
+            RawProcessRecord {
+                identity: ProcessIdentity {
+                    pid: 711,
+                    generation: 72,
+                },
+                parent_pid: Some(710),
+                app_id: Some("/opt/firefox/plugin-container".into()),
+                name: Some("plugin-container".into()),
+                executable_path: Some("/opt/firefox/plugin-container".into()),
+                active_audio: Some(true),
+            },
+        ];
+        let linux_apps = build_process_and_app_targets_for_os(
+            PlatformOs::Linux,
+            &linux_tree,
+            &DiscoveryFilter::applications(true, false),
+        )
+        .unwrap();
+        assert_eq!(linux_apps.len(), 1);
+        assert_eq!(linux_apps[0].pid(), Some(710));
+        assert_eq!(
+            extract_outer_macos_bundle_name(
+                "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary"
+            )
+            .as_deref(),
+            Some("google chrome canary.app")
+        );
+    }
+
+    #[test]
+    fn per_target_backends_and_discovery_query_dedupe_and_order() {
+        use crate::schema::{
+            CombineMode, CombineResolution, DefaultDeviceMode, DiagnosticOptions, ProcessTreeRange,
+            ProcessTreeStrategy, TargetAcquisition,
+        };
+
+        let mic = CaptureTarget::microphone(DefaultDeviceMode::Follow);
+        assert_eq!(mic.kind(), TargetKind::DefaultInput);
+        assert_eq!(mic.id().as_ref(), "default_input:follow");
+        mic.validate().unwrap();
+        assert!(
+            mic.diagnostic_summary(DiagnosticOptions::default())
+                .contains("id=<redacted>")
+        );
+
+        let pinned_twice = mic
+            .clone()
+            .with_backend(BackendId::PipeWire)
+            .with_backend(BackendId::PulseAudio);
+        assert_eq!(pinned_twice.backend(), Some(BackendId::PulseAudio));
+        assert_eq!(
+            pinned_twice.id().as_ref(),
+            "pulseaudio:default_input:follow"
+        );
+        let unpinned = pinned_twice.with_optional_backend(None);
+        assert_eq!(unpinned.id().as_ref(), "default_input:follow");
+        assert!(CaptureTarget::input_device("").is_err());
+
+        let sck_app = CaptureTarget::application(
+            ProcessIdentity {
+                pid: 550,
+                generation: 99_000,
+            },
+            Some("us.zoom.xos".into()),
+            Some("Zoom".into()),
+            None,
+            ProcessScope::Exact,
+            OnRootExit::Stop,
+        )
+        .unwrap()
+        .with_backend(BackendId::ScreenCaptureKit)
+        .with_gain(0.8)
+        .unwrap();
+        let ca_mic = CaptureTarget::microphone(DefaultDeviceMode::Follow);
+
+        let cross_req = CaptureRequest::new(vec![sck_app.clone(), ca_mic.clone()]);
+        let mac_plan = cross_req.inspect_for_os(PlatformOs::MacOs).unwrap();
+        assert_eq!(mac_plan.combine_resolution, CombineResolution::CspaMixer);
+        assert_eq!(mac_plan.selected_backend, None); // cross-backend!
+        assert_eq!(
+            mac_plan.target_plans[0].resolved_backend,
+            BackendId::ScreenCaptureKit
+        );
+        assert_eq!(
+            mac_plan.target_plans[1],
+            TargetPlan {
+                target_index: 1,
+                target_id: ca_mic.id().clone(),
+                resolved_backend: BackendId::CoreAudio,
+                acquisition: TargetAcquisition::DirectEndpoint,
+                attempts: mac_plan.target_plans[1].attempts.clone(),
+            }
+        );
+
+        let native_only_req =
+            CaptureRequest::new(vec![sck_app, ca_mic]).with_combine_mode(CombineMode::NativeOnly);
+        assert_eq!(
+            native_only_req.inspect_for_os(PlatformOs::MacOs),
+            Err(PlanError::UnsupportedCapturePlan)
+        );
+
+        let mic_only_req = CaptureRequest::single(
+            CaptureTarget::microphone(DefaultDeviceMode::Pin).with_backend(BackendId::PipeWire),
+        )
+        .with_tree_strategy(ProcessTreeRange {
+            start_level: ProcessTreeStrategy::NativeKernelCapture,
+            fallback_limit: None,
+        });
+        let mic_linux_plan = mic_only_req.inspect_for_os(PlatformOs::Linux).unwrap();
+        assert_eq!(
+            mic_linux_plan.combine_resolution,
+            CombineResolution::PassThrough(BackendId::PipeWire)
+        );
+        assert_eq!(
+            mic_linux_plan.target_plans[0].acquisition,
+            TargetAcquisition::DirectEndpoint
+        );
+
+        let bad_pin = CaptureRequest::single(
+            CaptureTarget::microphone(DefaultDeviceMode::Follow)
+                .with_backend(BackendId::PulseAudio),
+        );
+        assert_eq!(
+            bad_pin.inspect_for_os(PlatformOs::Windows),
+            Err(PlanError::InvalidBackend)
+        );
+
+        let service = DiscoveryService::new_for_os(PlatformOs::Linux);
+        let input_sub = service
+            .subscribe(DiscoveryFilter::input_devices(), 32)
+            .unwrap();
+        let query_pa_per_backend = DiscoveryQuery::all_for_os(PlatformOs::Linux)
+            .with_backends(
+                Backends::new(
+                    None,
+                    Some(vec![BackendId::PulseAudio, BackendId::PipeWire]),
+                    None,
+                )
+                .unwrap(),
+            )
+            .with_dedupe(DiscoveryDedupe::PerBackend)
+            .with_order(DiscoveryOrder::BackendThenKind);
+        let pb_sub = service
+            .subscribe_query(query_pa_per_backend.clone(), 32)
+            .unwrap();
+
+        let ff_proc = RawProcessRecord {
+            identity: ProcessIdentity {
+                pid: 4200,
+                generation: 88_000,
+            },
+            parent_pid: None,
+            app_id: Some("org.mozilla.firefox".into()),
+            name: Some("Firefox".into()),
+            executable_path: Some("/usr/lib64/firefox/firefox".into()),
+            active_audio: Some(false),
+        };
+        let mut ff_proc_pa = ff_proc.clone();
+        ff_proc_pa.active_audio = Some(true);
+
+        let inv = BackendRawInventory {
+            processes: vec![
+                RawBackendProcessRecord {
+                    backend: BackendId::PipeWire,
+                    process: ff_proc,
+                },
+                RawBackendProcessRecord {
+                    backend: BackendId::PulseAudio,
+                    process: ff_proc_pa,
+                },
+            ],
+            devices: vec![
+                RawBackendDeviceRecord {
+                    backend: BackendId::PipeWire,
+                    direction: DeviceDirection::Input,
+                    device_id: "alsa_input.usb-mic".into(),
+                    name: Some("USB Studio Mic".into()),
+                    is_default: true,
+                    is_monitor_sink: false,
+                },
+                RawBackendDeviceRecord {
+                    backend: BackendId::PulseAudio,
+                    direction: DeviceDirection::Input,
+                    device_id: "alsa_output.pci.analog-stereo.monitor".into(),
+                    name: Some("Monitor of Speakers".into()),
+                    is_default: false,
+                    is_monitor_sink: true,
+                },
+                RawBackendDeviceRecord {
+                    backend: BackendId::PulseAudio,
+                    direction: DeviceDirection::Output,
+                    device_id: "alsa_output.pci.analog-stereo".into(),
+                    name: Some("Speakers".into()),
+                    is_default: true,
+                    is_monitor_sink: false,
+                },
+            ],
+        };
+
+        let query_pw_first = DiscoveryQuery::all_for_os(PlatformOs::Linux).with_backends(
+            Backends::new(
+                None,
+                Some(vec![BackendId::PipeWire, BackendId::PulseAudio]),
+                None,
+            )
+            .unwrap(),
+        );
+        service
+            .ingest_backend_inventory(inv.clone(), &query_pw_first)
+            .unwrap();
+
+        let found_ff = service
+            .find_app("Firefox", ProcessScope::Tree, OnRootExit::Stop)
+            .unwrap();
+        assert_eq!(found_ff.pid(), Some(4200));
+
+        let cat_logical = service.discover_query(&query_pw_first).unwrap();
+        assert_eq!(cat_logical.input_devices.len(), 1);
+        assert_eq!(
+            cat_logical.input_devices[0].device_id().map(|s| s.as_ref()),
+            Some("alsa_input.usb-mic")
+        );
+        assert_eq!(cat_logical.applications.len(), 1);
+        assert_eq!(
+            cat_logical.applications[0].available_backends().as_ref(),
+            &[BackendId::PipeWire, BackendId::PulseAudio]
+        );
+        assert_eq!(cat_logical.applications[0].active_audio(), Some(true));
+
+        let cat_pb = service.discover_query(&query_pa_per_backend).unwrap();
+        assert_eq!(cat_pb.applications.len(), 2);
+        assert_ne!(cat_pb.applications[0].id(), cat_pb.applications[1].id());
+        assert_eq!(cat_pb.targets[0].backend(), Some(BackendId::PulseAudio));
+
+        let mut pb_added_ids = BTreeSet::new();
+        while let Some(ev) = pb_sub.poll_event() {
+            if let DiscoveryEventKind::Added(t) = ev.kind {
+                assert!(t.backend().is_some());
+                assert!(pb_added_ids.insert(t.id().to_string()));
+            }
+        }
+        assert!(pb_added_ids.contains("pulseaudio:application:4200:88000"));
+        assert!(pb_added_ids.contains("pipewire:application:4200:88000"));
+
+        let mut inv2 = inv;
+        inv2.devices[0].is_default = false;
+        inv2.devices.push(RawBackendDeviceRecord {
+            backend: BackendId::PipeWire,
+            direction: DeviceDirection::Input,
+            device_id: "alsa_input.headset-mic".into(),
+            name: Some("Headset Mic".into()),
+            is_default: true,
+            is_monitor_sink: false,
+        });
+        service
+            .ingest_backend_inventory(inv2, &query_pw_first)
+            .unwrap();
+        let mut saw_def_input_change = false;
+        while let Some(ev) = input_sub.poll_event() {
+            if ev.kind
+                == (DiscoveryEventKind::DefaultInputChanged {
+                    device_id: "alsa_input.headset-mic".into(),
+                })
+            {
+                saw_def_input_change = true;
+            }
+        }
+        assert!(saw_def_input_change);
+
+        let mac_inv = BackendRawInventory {
+            processes: vec![RawBackendProcessRecord {
+                backend: BackendId::ScreenCaptureKit,
+                process: RawProcessRecord {
+                    identity: ProcessIdentity {
+                        pid: 900,
+                        generation: 9000,
+                    },
+                    parent_pid: None,
+                    app_id: Some("com.apple.Music".into()),
+                    name: Some("Music".into()),
+                    executable_path: Some(
+                        "/System/Applications/Music.app/Contents/MacOS/Music".into(),
+                    ),
+                    active_audio: Some(true),
+                },
+            }],
+            devices: Vec::new(),
+        };
+        let mac_pb_query =
+            DiscoveryQuery::all_for_os(PlatformOs::MacOs).with_dedupe(DiscoveryDedupe::PerBackend);
+        let mac_cat = build_catalog_from_backend_inventory(&mac_inv, &mac_pb_query, 1).unwrap();
+        assert_eq!(mac_cat.processes.len(), 0);
+        assert_eq!(mac_cat.applications.len(), 1);
+        assert_eq!(mac_cat.applications[0].scope(), ProcessScope::Exact);
+        assert_eq!(
+            mac_cat.applications[0].backend(),
+            Some(BackendId::ScreenCaptureKit)
+        );
+    }
+}
