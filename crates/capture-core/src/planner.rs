@@ -623,3 +623,510 @@ pub fn plan_error_allows_cross_backend_fallback(error: PlanError) -> bool {
     )
 }
 
+pub fn candidate_backends_for_target(
+    os: PlatformOs,
+    os_backends: &[BackendId],
+    target: &CaptureTarget,
+) -> Result<Vec<BackendId>, PlanError> {
+    if os_backends.is_empty() {
+        return Err(PlanError::InvalidBackend);
+    }
+    match target.backend {
+        Some(pinned) => {
+            if !pinned.is_valid_for_os(os) {
+                return Err(PlanError::InvalidBackend);
+            }
+            Ok(vec![pinned])
+        }
+        None => {
+            if os == PlatformOs::MacOs
+                && target.kind == TargetKind::Application
+                && target.scope == ProcessScope::Exact
+                && os_backends == [BackendId::CoreAudio, BackendId::ScreenCaptureKit]
+            {
+                Ok(vec![BackendId::ScreenCaptureKit, BackendId::CoreAudio])
+            } else {
+                Ok(os_backends.to_vec())
+            }
+        }
+    }
+}
+
+/// Reject unknown layouts. Mono and stereo must map to stereo; multichannel layouts
+/// must support identity mapping to an identical native layout.
+pub fn validate_output_converter_target_format(target_format: &Format) -> Result<(), PlanError> {
+    match target_format.layout() {
+        Layout::Unknown => Err(PlanError::UnsupportedCapturePlan),
+        Layout::Known(labels) => {
+            if target_format.channels() <= 2 {
+                let stereo_ref = Format::new(
+                    SampleType::F32,
+                    ByteOrder::Little,
+                    48_000,
+                    2,
+                    Layout::Known(Arc::from([Channel::FrontLeft, Channel::FrontRight])),
+                )
+                .map_err(|_| PlanError::UnsupportedCapturePlan)?;
+                validate_channel_mapping(&stereo_ref, target_format)
+                    .map_err(|_| PlanError::UnsupportedCapturePlan)?;
+                Ok(())
+            } else {
+                let identity_ref = Format::new(
+                    SampleType::F32,
+                    ByteOrder::Little,
+                    target_format.rate(),
+                    target_format.channels(),
+                    Layout::Known(labels.clone()),
+                )
+                .map_err(|_| PlanError::UnsupportedCapturePlan)?;
+                validate_channel_mapping(&identity_ref, target_format)
+                    .map_err(|_| PlanError::UnsupportedCapturePlan)?;
+                Ok(())
+            }
+        }
+    }
+}
+
+pub fn evaluate_target_on_backend(
+    backend: BackendId,
+    target: &CaptureTarget,
+    tree_range: ProcessTreeRange,
+) -> Result<TargetAcquisition, PlanError> {
+    match target.kind {
+        TargetKind::DefaultOutput
+        | TargetKind::Device
+        | TargetKind::DefaultInput
+        | TargetKind::InputDevice => match backend {
+            BackendId::ScreenCaptureKit => Err(PlanError::UnsupportedScope),
+            BackendId::Wasapi
+            | BackendId::PipeWire
+            | BackendId::PulseAudio
+            | BackendId::CoreAudio => Ok(TargetAcquisition::DirectEndpoint),
+        },
+        TargetKind::Process | TargetKind::Application => match backend {
+            BackendId::Wasapi => {
+                if target.scope == ProcessScope::Exact {
+                    return Err(PlanError::UnsupportedScope);
+                }
+                if tree_range.allows(ProcessTreeStrategy::NativeKernelCapture) {
+                    Ok(TargetAcquisition::ProcessTree(
+                        ProcessTreeStrategy::NativeKernelCapture,
+                    ))
+                } else {
+                    Err(PlanError::UnsupportedCapturePlan)
+                }
+            }
+            BackendId::PipeWire | BackendId::CoreAudio => {
+                if tree_range.allows(ProcessTreeStrategy::NativeGraphMix) {
+                    Ok(TargetAcquisition::ProcessTree(
+                        ProcessTreeStrategy::NativeGraphMix,
+                    ))
+                } else {
+                    Err(PlanError::UnsupportedCapturePlan)
+                }
+            }
+            BackendId::PulseAudio => {
+                // PulseAudio process capture uses per-sink-input software mixing.
+                if tree_range.allows(ProcessTreeStrategy::SoftwareStreamMix) {
+                    Ok(TargetAcquisition::ProcessTree(
+                        ProcessTreeStrategy::SoftwareStreamMix,
+                    ))
+                } else {
+                    Err(PlanError::UnsupportedCapturePlan)
+                }
+            }
+            BackendId::ScreenCaptureKit => {
+                if target.kind != TargetKind::Application || target.scope != ProcessScope::Exact {
+                    return Err(PlanError::UnsupportedScope);
+                }
+                if tree_range.allows(ProcessTreeStrategy::NativeKernelCapture) {
+                    Ok(TargetAcquisition::ProcessTree(
+                        ProcessTreeStrategy::NativeKernelCapture,
+                    ))
+                } else if tree_range.allows(ProcessTreeStrategy::NativeGraphMix) {
+                    Ok(TargetAcquisition::ProcessTree(
+                        ProcessTreeStrategy::NativeGraphMix,
+                    ))
+                } else {
+                    Err(PlanError::UnsupportedCapturePlan)
+                }
+            }
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{DiagnosticOptions, DitherMode, ProcessIdentity};
+
+    #[test]
+    fn request_inspect_reports_waterfall_and_caller_owned_overlap_without_side_effects() {
+        let t1 = CaptureTarget::process(
+            ProcessIdentity {
+                pid: 100,
+                generation: 1000,
+            },
+            ProcessScope::Tree,
+            OnRootExit::Stop,
+        )
+        .unwrap();
+        let t2 = CaptureTarget::process(
+            ProcessIdentity {
+                pid: 200,
+                generation: 2000,
+            },
+            ProcessScope::Tree,
+            OnRootExit::Wait {
+                wait_timeout_ns: 2_000_000_000,
+            },
+        )
+        .unwrap();
+
+        let single_req = CaptureRequest::single(t1.clone());
+        let single_plan = single_req.inspect_for_os(PlatformOs::Windows).unwrap();
+        assert_eq!(single_plan.selected_backend, Some(BackendId::Wasapi));
+        assert_eq!(
+            single_plan.combine_resolution,
+            CombineResolution::PassThrough(BackendId::Wasapi)
+        );
+        assert_eq!(
+            single_plan.target_plans[0].acquisition,
+            TargetAcquisition::ProcessTree(ProcessTreeStrategy::NativeKernelCapture)
+        );
+        assert!(!single_plan.uses_software_mixer);
+        assert_eq!(
+            single_plan.overlap_semantics,
+            OverlapCombinationSemantics::SingleTarget
+        );
+
+        let multi_req = CaptureRequest::new(vec![t1.clone(), t1.clone(), t2.clone()]);
+        let multi_plan = multi_req.inspect_for_os(PlatformOs::Windows).unwrap();
+        assert_eq!(multi_plan.selected_backend, Some(BackendId::Wasapi));
+        assert_eq!(multi_plan.combine_resolution, CombineResolution::CspaMixer);
+        assert!(multi_plan.uses_software_mixer);
+        assert!(multi_plan.requires_discovery_subscription);
+        assert_eq!(
+            multi_plan.overlap_semantics,
+            OverlapCombinationSemantics::SoftwareSummation
+        );
+        assert_eq!(multi_plan.duplicate_target_ids, vec![t1.id().clone()]);
+
+        let native_only_dup = multi_req.clone().with_combine_mode(CombineMode::NativeOnly);
+        assert_eq!(
+            native_only_dup.inspect_for_os(PlatformOs::Windows),
+            Err(PlanError::UnsupportedCapturePlan)
+        );
+        assert_eq!(
+            native_only_dup.inspect_for_os(PlatformOs::Linux),
+            Err(PlanError::UnsupportedCapturePlan)
+        );
+
+        let distinct_native =
+            CaptureRequest::new(vec![t1, t2]).with_combine_mode(CombineMode::NativeOnly);
+        assert_eq!(
+            distinct_native.inspect_for_os(PlatformOs::Windows),
+            Err(PlanError::UnsupportedCapturePlan)
+        );
+        let linux_plan = distinct_native.inspect_for_os(PlatformOs::Linux).unwrap();
+        assert_eq!(linux_plan.selected_backend, Some(BackendId::PipeWire));
+        assert_eq!(
+            linux_plan.combine_resolution,
+            CombineResolution::SharedNativeGraphMix(BackendId::PipeWire)
+        );
+        assert_eq!(
+            linux_plan.overlap_semantics,
+            OverlapCombinationSemantics::NativeSetUnion
+        );
+    }
+
+    #[test]
+    fn planner_enforces_encapsulation_multichannel_converter_and_readiness_abort_rules() {
+        let mut forged = CaptureTarget::microphone(DefaultDeviceMode::Follow);
+        forged.id = "pipewire:default_input:follow".into(); // backend is still None
+        assert_eq!(forged.validate(), Err(PlanError::InvalidTarget));
+
+        let mut forged2 =
+            CaptureTarget::microphone(DefaultDeviceMode::Follow).with_backend(BackendId::PipeWire);
+        forged2.id = "pulseaudio:default_input:follow".into(); // mismatched backend prefix
+        assert_eq!(forged2.validate(), Err(PlanError::InvalidTarget));
+
+        let pinned_dev = CaptureTarget::microphone(DefaultDeviceMode::Pin)
+            .with_backend(BackendId::CoreAudio)
+            .with_gain(0.75)
+            .unwrap()
+            .resolve_pinned_endpoint(None, Some("BuiltInMic"));
+        assert_eq!(pinned_dev.kind(), TargetKind::InputDevice);
+        assert_eq!(pinned_dev.backend(), Some(BackendId::CoreAudio));
+        assert_eq!(
+            pinned_dev.id().as_ref(),
+            "coreaudio:input_device:BuiltInMic"
+        );
+        assert_eq!(pinned_dev.clean_device_id(), Some("BuiltInMic"));
+        assert!((pinned_dev.gain() - 0.75).abs() <= 1e-6);
+        pinned_dev.validate().unwrap();
+        assert!(
+            pinned_dev
+                .diagnostic_summary(DiagnosticOptions::default())
+                .contains("id=<redacted>")
+        );
+
+        let mono_known = Format::new(
+            SampleType::I16,
+            ByteOrder::Little,
+            16_000,
+            1,
+            Layout::Known(Arc::from([Channel::Mono])),
+        )
+        .unwrap();
+        let req_mono =
+            CaptureRequest::single(CaptureTarget::default_output(DefaultDeviceMode::Follow))
+                .with_output_converter(Some(OutputConverterConfig::new(
+                    mono_known,
+                    DitherMode::Tpdf,
+                )));
+        assert!(req_mono.inspect_for_os(PlatformOs::Windows).is_ok());
+
+        let surround_51 = Format::new(
+            SampleType::I24,
+            ByteOrder::Little,
+            48_000,
+            6,
+            Layout::Known(Arc::from([
+                Channel::FrontLeft,
+                Channel::FrontRight,
+                Channel::Center,
+                Channel::LowFrequency,
+                Channel::RearLeft,
+                Channel::RearRight,
+            ])),
+        )
+        .unwrap();
+        let req_51 =
+            CaptureRequest::single(CaptureTarget::default_output(DefaultDeviceMode::Follow))
+                .with_output_converter(Some(OutputConverterConfig::new(
+                    surround_51,
+                    DitherMode::Tpdf,
+                )));
+        assert!(req_51.inspect_for_os(PlatformOs::Windows).is_ok());
+
+        let unknown_layout = Format::new(
+            SampleType::I16,
+            ByteOrder::Little,
+            16_000,
+            1,
+            Layout::Unknown,
+        )
+        .unwrap();
+        let req_unknown =
+            CaptureRequest::single(CaptureTarget::default_output(DefaultDeviceMode::Follow))
+                .with_output_converter(Some(OutputConverterConfig::new(
+                    unknown_layout,
+                    DitherMode::Tpdf,
+                )));
+        assert_eq!(
+            req_unknown.inspect_for_os(PlatformOs::Windows),
+            Err(PlanError::UnsupportedCapturePlan)
+        );
+
+        let proc_target = CaptureTarget::process(
+            ProcessIdentity {
+                pid: 42,
+                generation: 420,
+            },
+            ProcessScope::Tree,
+            OnRootExit::Stop,
+        )
+        .unwrap()
+        .with_backend(BackendId::PulseAudio);
+        let pa_req = CaptureRequest::single(proc_target.clone()).with_allow_reroute(true);
+        let pa_plan = pa_req.inspect_for_os(PlatformOs::Linux).unwrap();
+        assert_eq!(
+            pa_plan.target_plans[0].acquisition,
+            TargetAcquisition::ProcessTree(ProcessTreeStrategy::SoftwareStreamMix)
+        );
+        assert_eq!(pa_plan.combine_resolution, CombineResolution::CspaMixer);
+
+        let unpinned_proc = CaptureTarget::process(
+            ProcessIdentity {
+                pid: 42,
+                generation: 420,
+            },
+            ProcessScope::Tree,
+            OnRootExit::Stop,
+        )
+        .unwrap();
+        let linux_req = CaptureRequest::single(unpinned_proc);
+        let fb_plan = linux_req
+            .resolve_plan_for_os_with_readiness(PlatformOs::Linux, |b, _| {
+                if b == BackendId::PipeWire {
+                    Err(PlanError::BackendUnavailable)
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap();
+        assert_eq!(
+            fb_plan.target_plans[0].resolved_backend,
+            BackendId::PulseAudio
+        );
+
+        let perm_err = linux_req.resolve_plan_for_os_with_readiness(PlatformOs::Linux, |b, _| {
+            if b == BackendId::PipeWire {
+                Err(PlanError::PermissionDenied)
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(perm_err, Err(PlanError::PermissionDenied));
+
+        let win_proc = CaptureTarget::process(
+            ProcessIdentity {
+                pid: 99,
+                generation: 990,
+            },
+            ProcessScope::Tree,
+            OnRootExit::Stop,
+        )
+        .unwrap();
+        let ver_err = CaptureRequest::single(win_proc).resolve_plan_for_os_with_capability(
+            PlatformOs::Windows,
+            |b, _| {
+                Err(CapabilityError::BackendVersionTooOld {
+                    backend: b,
+                    required: (10, 0, 20348),
+                    observed: (10, 0, 19041),
+                })
+            },
+        );
+        assert_eq!(
+            ver_err,
+            Err(CapabilityError::BackendVersionTooOld {
+                backend: BackendId::Wasapi,
+                required: (10, 0, 20348),
+                observed: (10, 0, 19041),
+            })
+        );
+
+        let cap_fb = linux_req
+            .resolve_plan_for_os_with_capability(PlatformOs::Linux, |b, _| {
+                if b == BackendId::PipeWire {
+                    Err(CapabilityError::ClientLibraryUnavailable {
+                        backend: b,
+                        detail: "libpipewire-0.3.so.0 missing".into(),
+                    })
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap();
+        assert_eq!(
+            cap_fb.target_plans[0].resolved_backend,
+            BackendId::PulseAudio
+        );
+    }
+
+    #[test]
+    fn permission_domains_and_policy_resolve_target_requirements_across_platforms() {
+        let mic = CaptureTarget::microphone(DefaultDeviceMode::Follow);
+        let out = CaptureTarget::default_output(DefaultDeviceMode::Follow);
+        let app_exact = CaptureTarget::application(
+            ProcessIdentity {
+                pid: 700,
+                generation: 7000,
+            },
+            Some("com.example.Zoom".into()),
+            Some("Zoom".into()),
+            None,
+            ProcessScope::Exact,
+            OnRootExit::Stop,
+        )
+        .unwrap();
+        let app_tree = app_exact.clone().with_scope(ProcessScope::Tree);
+
+        let req_default = CaptureRequest::new(vec![mic.clone(), app_exact.clone()]);
+        assert_eq!(
+            req_default.permission_policy(),
+            PermissionPolicy::AutoRequest
+        );
+        let req_check_only = req_default
+            .clone()
+            .with_permission_policy(PermissionPolicy::CheckOnly);
+        assert_eq!(
+            req_check_only.permission_policy(),
+            PermissionPolicy::CheckOnly
+        );
+        assert_eq!(
+            req_check_only
+                .inspect_for_os(PlatformOs::MacOs)
+                .unwrap()
+                .permission_policy,
+            PermissionPolicy::CheckOnly
+        );
+
+        let mac_exact_kinds = req_default
+            .required_permission_kinds_for_os(PlatformOs::MacOs)
+            .unwrap();
+        assert_eq!(
+            mac_exact_kinds,
+            BTreeSet::from([PermissionKind::Microphone, PermissionKind::ScreenRecording])
+        );
+
+        let mac_tree_kinds = CaptureRequest::new(vec![mic.clone(), app_tree])
+            .required_permission_kinds_for_os(PlatformOs::MacOs)
+            .unwrap();
+        assert_eq!(
+            mac_tree_kinds,
+            BTreeSet::from([PermissionKind::Microphone, PermissionKind::SystemAudio])
+        );
+
+        let mac_13_kinds = required_permission_kinds_for_os_with_filter(
+            std::slice::from_ref(&app_exact),
+            &Backends::default(),
+            ProcessTreeRange::default(),
+            PlatformOs::MacOs,
+            |b, tk| {
+                b != BackendId::CoreAudio
+                    || matches!(tk, TargetKind::DefaultInput | TargetKind::InputDevice)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            mac_13_kinds,
+            BTreeSet::from([PermissionKind::ScreenRecording])
+        );
+
+        assert_eq!(
+            required_permission_kinds_for_os(
+                std::slice::from_ref(&out),
+                &Backends::default(),
+                PlatformOs::Windows
+            )
+            .unwrap(),
+            BTreeSet::from([PermissionKind::SystemAudio])
+        );
+        assert_eq!(
+            required_permission_kinds_for_os(
+                std::slice::from_ref(&mic),
+                &Backends::default(),
+                PlatformOs::Windows
+            )
+            .unwrap(),
+            BTreeSet::from([PermissionKind::Microphone])
+        );
+
+        assert_eq!(
+            required_permission_kinds_for_os(&[], &Backends::default(), PlatformOs::MacOs).unwrap(),
+            BTreeSet::from([
+                PermissionKind::Microphone,
+                PermissionKind::SystemAudio,
+                PermissionKind::ScreenRecording,
+            ])
+        );
+        assert_eq!(
+            required_permission_kinds_for_os(&[], &Backends::default(), PlatformOs::Windows)
+                .unwrap(),
+            BTreeSet::from([PermissionKind::Microphone, PermissionKind::SystemAudio])
+        );
+    }
+}
