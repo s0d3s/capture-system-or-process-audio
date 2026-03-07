@@ -829,3 +829,256 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn cspa_mixer_accumulates_sanitizes_duplicates_and_runs_zero_steady_allocations() {
+        let fmt = test_format();
+        let t1 = target(10, 1.0);
+        let t2 = target(20, 0.5);
+        // Duplicate t1 included intentionally to test caller-owned overlap summation
+        let mut mixer =
+            CspaMixer::new(fmt, &[t1.clone(), t1, t2], MixerConfig::default(), 4).unwrap();
+
+        let p1 = MixerInputPacket {
+            samples: vec![0.25, -0.25, 0.5, -0.5, f32::NAN, 0.25, 0.6, -0.6],
+            frames: 4,
+            timestamp: Some(Stamp {
+                ticks: 1_000_000,
+                ticks_per_second: 10_000_000,
+                clock_domain: 1,
+                provenance: Provenance::Native,
+                uncertainty_ns: Some(200_000),
+            }),
+            arrival_ns: 100_000_000,
+        };
+        let p2 = MixerInputPacket {
+            samples: vec![0.25, -0.25, 0.5, -0.5, 0.25, 0.25, 0.6, -0.6],
+            frames: 4,
+            timestamp: Some(Stamp {
+                ticks: 1_020_000,
+                ticks_per_second: 10_000_000,
+                clock_domain: 1,
+                provenance: Provenance::Native,
+                uncertainty_ns: Some(300_000),
+            }),
+            arrival_ns: 102_000_000,
+        };
+        let p3 = MixerInputPacket {
+            samples: vec![0.5, 0.5, -0.5, 0.5, f32::INFINITY, -0.5, 0.2, -0.2],
+            frames: 4,
+            timestamp: Some(Stamp {
+                ticks: 1_030_000,
+                ticks_per_second: 10_000_000,
+                clock_domain: 1,
+                provenance: Provenance::Native,
+                uncertainty_ns: Some(250_000),
+            }),
+            arrival_ns: 103_000_000,
+        };
+
+        mixer.push_input_packet(0, p1).unwrap();
+        mixer.push_input_packet(1, p2).unwrap();
+        mixer.push_input_packet(2, p3).unwrap();
+
+        let mut out = vec![0.0_f32; 8];
+        let (outcome, meta) = mixer.mix_block_into(4, 105_000_000, 0, &mut out).unwrap();
+        assert_eq!(outcome, MixStepOutcome::Produced(4));
+        assert_eq!(meta.contributing_mask, 0b111);
+        // Sample 0: 0.25 + 0.25 + 0.5 * 0.5 = 0.75
+        assert!((out[0] - 0.75).abs() <= 1e-6);
+        // Sample 4 had NaN on input 0 and +Inf on input 2 -> only input 1 (0.25) contributes
+        assert!((out[4] - 0.25).abs() <= 1e-6);
+        assert_eq!(meta.nonfinite_samples, 2);
+        assert_eq!(meta.nonfinite_inputs, 0b101);
+        // Sample 6: 0.6 + 0.6 + 0.2*0.5 = 1.3 (> 1.0, unclamped f32 default, counted as clipped)
+        assert!((out[6] - 1.3).abs() <= 1e-6);
+        assert_eq!(meta.clipped_samples, 2);
+        // Calibrated skew: 103ms - 100ms = 3ms (3_000_000 ns), uncertainty = 300_000 ns
+        assert_eq!(meta.skew_estimate_ns, Some(3_000_000));
+        assert_eq!(meta.skew_uncertainty_ns, Some(300_000));
+
+        let clean_samples = [0.1_f32; 8];
+        for i in 0..3 {
+            mixer
+                .push_input_packet(
+                    i,
+                    MixerInputPacket {
+                        samples: clean_samples.to_vec(),
+                        frames: 4,
+                        timestamp: None,
+                        arrival_ns: 0,
+                    },
+                )
+                .unwrap();
+        }
+        let measured = allocation_counter::measure(|| {
+            let (res, m) = mixer.mix_block_into(4, 200_000_000, 0, &mut out).unwrap();
+            assert_eq!(res, MixStepOutcome::Produced(4));
+            assert_eq!(m.skew_estimate_ns, None);
+        });
+        assert_eq!(measured.count_total, 0);
+
+        let t1_keep = target(10, 1.0);
+        let t3_new = target(30, 0.5);
+        mixer
+            .push_input_packet(
+                0,
+                MixerInputPacket {
+                    samples: vec![0.4_f32; 8],
+                    frames: 4,
+                    timestamp: None,
+                    arrival_ns: 0,
+                },
+            )
+            .unwrap();
+        let new_targets = [t1_keep, t3_new];
+        let reconfig_allocs = allocation_counter::measure(|| {
+            let mapping = mixer.reconfigure_targets(&new_targets).unwrap();
+            assert_eq!(mapping, &[Some(0), None]);
+        });
+        assert_eq!(reconfig_allocs.count_total, 0);
+        let (swap_res, swap_meta) = mixer.mix_block_into(4, 210_000_000, 0, &mut out).unwrap();
+        assert_eq!(swap_res, MixStepOutcome::Produced(4));
+        assert_eq!(swap_meta.contributing_mask, 0b01);
+        assert!((out[0] - 0.4).abs() <= 1e-6);
+    }
+
+    #[test]
+    fn cspa_mixer_handles_drift_hysteresis_idle_silence_and_input_failure_modes() {
+        let fmt = test_format();
+        let t1 = target(10, 1.0);
+        let t2 = target(20, 1.0);
+        let mut config = MixerConfig {
+            silence_on_idle: false,
+            ..MixerConfig::default()
+        };
+        let mut mixer = CspaMixer::new(fmt.clone(), &[t1.clone(), t2.clone()], config, 64).unwrap();
+
+        let mut out = vec![0.0_f32; 128];
+        let (parked, _) = mixer.mix_block_into(64, 10_000_000, 0, &mut out).unwrap();
+        assert_eq!(parked, MixStepOutcome::ParkedIdle);
+
+        config.silence_on_idle = true;
+        let mut idle_mixer =
+            CspaMixer::new(fmt.clone(), &[t1.clone(), t2.clone()], config, 64).unwrap();
+        let (synth, synth_meta) = idle_mixer
+            .mix_block_into(64, 10_000_000, 0, &mut out)
+            .unwrap();
+        assert_eq!(synth, MixStepOutcome::Produced(64));
+        assert!(synth_meta.synthesized_silence);
+
+        let prim = vec![0.25_f32; 128];
+        let shft = vec![0.75_f32; 128];
+        // Skew above the threshold starts the hold timer without an immediate slip.
+        let slipped0 = mixer
+            .apply_drift_correction(0, 6_000_000, 100_000_000, &prim, &shft, &mut out)
+            .unwrap();
+        assert!(!slipped0);
+        // Sustained at t=600ms (>= 500ms hold) triggers 64-frame crossfade slip
+        let slipped1 = mixer
+            .apply_drift_correction(0, 6_000_000, 600_000_000, &prim, &shft, &mut out)
+            .unwrap();
+        assert!(slipped1);
+        assert!((out[0] - 0.25).abs() <= 1e-6);
+        assert!((out[126] - (0.25 * (1.0 / 64.0) + 0.75 * (63.0 / 64.0))).abs() <= 1e-5);
+
+        mixer
+            .set_input_state(0, ParticipationState::Failed(42))
+            .unwrap();
+        mixer
+            .push_input_packet(
+                1,
+                MixerInputPacket {
+                    samples: vec![0.5_f32; 128],
+                    frames: 64,
+                    timestamp: None,
+                    arrival_ns: 0,
+                },
+            )
+            .unwrap();
+        let (deg_outcome, deg_meta) = mixer.mix_block_into(64, 700_000_000, 0, &mut out).unwrap();
+        assert_eq!(deg_outcome, MixStepOutcome::Produced(64));
+        assert_eq!(deg_meta.failed_inputs, 0b01);
+        assert_eq!(deg_meta.contributing_mask, 0b10);
+
+        let fail_cfg = MixerConfig {
+            on_input_failure: OnInputFailure::Fail,
+            ..MixerConfig::default()
+        };
+        let mut fail_mixer = CspaMixer::new(fmt, &[t1, t2], fail_cfg, 64).unwrap();
+        fail_mixer
+            .set_input_state(0, ParticipationState::Failed(99))
+            .unwrap();
+        let (fail_outcome, _) = fail_mixer
+            .mix_block_into(64, 700_000_000, 0, &mut out)
+            .unwrap();
+        assert_eq!(fail_outcome, MixStepOutcome::Failed(99));
+    }
+
+    #[test]
+    fn cspa_mixer_gates_cross_clock_domain_skew_and_auto_slips_sustained_queue_lead() {
+        let fmt = test_format();
+        let t_sys = CaptureTarget::default_output(crate::schema::DefaultDeviceMode::Follow);
+        let t_mic = CaptureTarget::microphone(crate::schema::DefaultDeviceMode::Follow);
+        let mut mixer = CspaMixer::new(fmt, &[t_sys, t_mic], MixerConfig::default(), 480).unwrap();
+
+        let blk = vec![0.25_f32; 960];
+        // Distinct clock domains (domain 1 vs domain 2) must report skew_estimate_ns == None
+        mixer
+            .push_input_samples(
+                0,
+                &blk,
+                480,
+                Some(Stamp {
+                    ticks: 48_000,
+                    ticks_per_second: 48_000,
+                    clock_domain: 1,
+                    provenance: Provenance::Native,
+                    uncertainty_ns: Some(200_000),
+                }),
+                0,
+            )
+            .unwrap();
+        mixer
+            .push_input_samples(
+                1,
+                &blk,
+                480,
+                Some(Stamp {
+                    ticks: 960_000,
+                    ticks_per_second: 48_000,
+                    clock_domain: 2,
+                    provenance: Provenance::Native,
+                    uncertainty_ns: Some(200_000),
+                }),
+                0,
+            )
+            .unwrap();
+
+        let mut out = vec![0.0_f32; 960];
+        let (res, meta) = mixer.mix_block_into(480, 10_000_000, 0, &mut out).unwrap();
+        assert_eq!(res, MixStepOutcome::Produced(480));
+        assert_eq!(meta.skew_estimate_ns, None);
+        assert_eq!(meta.skew_uncertainty_ns, None);
+
+        // Sustained 1-packet excess lead (10ms >= 5ms threshold) on input 1 over >= 500ms hold triggers auto-slip
+        mixer
+            .push_input_samples(1, &blk, 480, None, 20_000_000)
+            .unwrap(); // extra lead packet on mic
+        for step in 0..60u64 {
+            let now_ns = 20_000_000 + step * 10_000_000;
+            let allocs = allocation_counter::measure(|| {
+                mixer
+                    .push_input_samples(0, &blk, 480, None, now_ns)
+                    .unwrap();
+                mixer
+                    .push_input_samples(1, &blk, 480, None, now_ns)
+                    .unwrap();
+                let (r, _) = mixer.mix_block_into(480, now_ns, 0, &mut out).unwrap();
+                assert_eq!(r, MixStepOutcome::Produced(480));
+            });
+            assert_eq!(allocs.count_total, 0);
+        }
+        assert_eq!(mixer.input_diagnostics()[1].drift_slips, 1);
+        assert_eq!(mixer.queued_packets(1), 0);
+    }
+}
