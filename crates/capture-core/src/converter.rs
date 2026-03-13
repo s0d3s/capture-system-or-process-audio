@@ -700,3 +700,513 @@ impl FrameReblocker {
         })
     }
 
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
+
+    pub fn block_frames(&self) -> usize {
+        self.block_frames
+    }
+
+    pub fn buffered_frames(&self) -> usize {
+        self.len_samples / self.channels
+    }
+
+    pub fn clear(&mut self) {
+        self.head = 0;
+        self.len_samples = 0;
+    }
+
+    pub fn push_samples(&mut self, samples: &[f32]) -> Result<(), Reason> {
+        if !samples.len().is_multiple_of(self.channels) {
+            return Err(Reason::IncompleteFrame);
+        }
+        let cap = self.ring.len();
+        if self.len_samples + samples.len() > cap {
+            return Err(Reason::Capacity(CapacityError::ExceedsByteCeiling));
+        }
+        let tail = (self.head + self.len_samples) % cap;
+        let first = samples.len().min(cap - tail);
+        self.ring[tail..tail + first].copy_from_slice(&samples[..first]);
+        if first < samples.len() {
+            let rem = samples.len() - first;
+            self.ring[..rem].copy_from_slice(&samples[first..]);
+        }
+        self.len_samples += samples.len();
+        Ok(())
+    }
+
+    pub fn pop_block_into(&mut self, out_samples: &mut [f32]) -> Result<bool, Reason> {
+        let needed = self.block_frames * self.channels;
+        if out_samples.len() < needed {
+            return Err(Reason::IncompleteFrame);
+        }
+        if self.len_samples < needed {
+            return Ok(false);
+        }
+        let cap = self.ring.len();
+        let first = needed.min(cap - self.head);
+        out_samples[..first].copy_from_slice(&self.ring[self.head..self.head + first]);
+        if first < needed {
+            let rem = needed - first;
+            out_samples[first..needed].copy_from_slice(&self.ring[..rem]);
+        }
+        self.head = (self.head + needed) % cap;
+        self.len_samples -= needed;
+        Ok(true)
+    }
+
+    pub fn peek_into(&self, frame_offset: usize, out_samples: &mut [f32]) -> Result<bool, Reason> {
+        if !out_samples.len().is_multiple_of(self.channels) {
+            return Err(Reason::IncompleteFrame);
+        }
+        let offset_samples = frame_offset
+            .checked_mul(self.channels)
+            .ok_or(Reason::Capacity(CapacityError::Overflow))?;
+        let needed = out_samples.len();
+        if offset_samples.saturating_add(needed) > self.len_samples {
+            return Ok(false);
+        }
+        let cap = self.ring.len();
+        let start = (self.head + offset_samples) % cap;
+        let first = needed.min(cap - start);
+        out_samples[..first].copy_from_slice(&self.ring[start..start + first]);
+        if first < needed {
+            let rem = needed - first;
+            out_samples[first..needed].copy_from_slice(&self.ring[..rem]);
+        }
+        Ok(true)
+    }
+
+    pub fn discard_frames(&mut self, frames: usize) -> usize {
+        let drop_samples = frames.saturating_mul(self.channels).min(self.len_samples);
+        let cap = self.ring.len();
+        self.head = (self.head + drop_samples) % cap;
+        self.len_samples -= drop_samples;
+        drop_samples / self.channels
+    }
+}
+
+fn decode_samples_sanitized(
+    in_bytes: &[u8],
+    sample_type: SampleType,
+    order: ByteOrder,
+    out_f32: &mut Vec<f32>,
+    nonfinite_count: &mut u64,
+) -> Result<(), Reason> {
+    match sample_type {
+        SampleType::F32 => {
+            if !in_bytes.len().is_multiple_of(4) {
+                return Err(Reason::IncompleteFrame);
+            }
+            for chunk in in_bytes.chunks_exact(4) {
+                let b: [u8; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]];
+                let val = match order {
+                    ByteOrder::Little => f32::from_le_bytes(b),
+                    ByteOrder::Big => f32::from_be_bytes(b),
+                };
+                if val.is_finite() {
+                    out_f32.push(val);
+                } else {
+                    *nonfinite_count = nonfinite_count.saturating_add(1);
+                    out_f32.push(0.0);
+                }
+            }
+        }
+        SampleType::I16 => {
+            if !in_bytes.len().is_multiple_of(2) {
+                return Err(Reason::IncompleteFrame);
+            }
+            for chunk in in_bytes.chunks_exact(2) {
+                let b: [u8; 2] = [chunk[0], chunk[1]];
+                let val = match order {
+                    ByteOrder::Little => i16::from_le_bytes(b),
+                    ByteOrder::Big => i16::from_be_bytes(b),
+                };
+                out_f32.push((f32::from(val) / 32768.0).clamp(-1.0, 1.0));
+            }
+        }
+        SampleType::I24 => {
+            if !in_bytes.len().is_multiple_of(3) {
+                return Err(Reason::IncompleteFrame);
+            }
+            for chunk in in_bytes.chunks_exact(3) {
+                let signed = match order {
+                    ByteOrder::Little => {
+                        let raw = u32::from(chunk[0])
+                            | (u32::from(chunk[1]) << 8)
+                            | (u32::from(chunk[2]) << 16);
+                        ((raw << 8) as i32) >> 8
+                    }
+                    ByteOrder::Big => {
+                        let raw = (u32::from(chunk[0]) << 16)
+                            | (u32::from(chunk[1]) << 8)
+                            | u32::from(chunk[2]);
+                        ((raw << 8) as i32) >> 8
+                    }
+                };
+                out_f32.push(((signed as f64) / 8_388_608.0).clamp(-1.0, 1.0) as f32);
+            }
+        }
+        SampleType::I32 => {
+            if !in_bytes.len().is_multiple_of(4) {
+                return Err(Reason::IncompleteFrame);
+            }
+            for chunk in in_bytes.chunks_exact(4) {
+                let b: [u8; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]];
+                let val = match order {
+                    ByteOrder::Little => i32::from_le_bytes(b),
+                    ByteOrder::Big => i32::from_be_bytes(b),
+                };
+                out_f32.push(((val as f64) / 2_147_483_648.0).clamp(-1.0, 1.0) as f32);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_samples_quantized(
+    samples: &[f32],
+    sample_type: SampleType,
+    order: ByteOrder,
+    dither: DitherMode,
+    seed: u64,
+    sample_counter: &mut u64,
+    clipped_count: &mut u64,
+    out_bytes: &mut Vec<u8>,
+) {
+    for &raw in samples {
+        let idx = *sample_counter;
+        *sample_counter = sample_counter.wrapping_add(1);
+        let clean = if raw.is_finite() { f64::from(raw) } else { 0.0 };
+        if clean.abs() > 1.0 {
+            *clipped_count = clipped_count.saturating_add(1);
+        }
+        let dither_lsb = match dither {
+            DitherMode::Tpdf => tpdf_dither_lsb(seed, idx),
+            DitherMode::None => 0.0,
+        };
+        match sample_type {
+            SampleType::F32 => {
+                let val = clean as f32;
+                let bytes = match order {
+                    ByteOrder::Little => val.to_le_bytes(),
+                    ByteOrder::Big => val.to_be_bytes(),
+                };
+                out_bytes.extend_from_slice(&bytes);
+            }
+            SampleType::I16 => {
+                let q = (clean * 32767.0 + dither_lsb)
+                    .round()
+                    .clamp(-32768.0, 32767.0) as i16;
+                let bytes = match order {
+                    ByteOrder::Little => q.to_le_bytes(),
+                    ByteOrder::Big => q.to_be_bytes(),
+                };
+                out_bytes.extend_from_slice(&bytes);
+            }
+            SampleType::I24 => {
+                let q = (clean * 8_388_607.0 + dither_lsb)
+                    .round()
+                    .clamp(-8_388_608.0, 8_388_607.0) as i32;
+                let le = q.to_le_bytes();
+                match order {
+                    ByteOrder::Little => out_bytes.extend_from_slice(&le[..3]),
+                    ByteOrder::Big => {
+                        out_bytes.push(le[2]);
+                        out_bytes.push(le[1]);
+                        out_bytes.push(le[0]);
+                    }
+                }
+            }
+            SampleType::I32 => {
+                let q = (clean * 2_147_483_647.0 + dither_lsb)
+                    .round()
+                    .clamp(-2_147_483_648.0, 2_147_483_647.0) as i32;
+                let bytes = match order {
+                    ByteOrder::Little => q.to_le_bytes(),
+                    ByteOrder::Big => q.to_be_bytes(),
+                };
+                out_bytes.extend_from_slice(&bytes);
+            }
+        }
+    }
+}
+
+fn resample_sinc_into(
+    input: &[f32],
+    channels: usize,
+    in_rate: u32,
+    out_rate: u32,
+    half_wing_taps: usize,
+    out: &mut Vec<f32>,
+) -> usize {
+    let in_frames = input.len() / channels;
+    let out_frames = ((in_frames as u64) * u64::from(out_rate) / u64::from(in_rate)) as usize;
+    out.clear();
+    let ratio = f64::from(out_rate) / f64::from(in_rate);
+    let cutoff = ratio.min(1.0) * 0.45;
+
+    for out_f in 0..out_frames {
+        let center = (out_f as f64) / ratio;
+        let base = center.floor() as isize;
+        for ch in 0..channels {
+            let mut acc = 0.0_f64;
+            let mut weight_sum = 0.0_f64;
+            for tap in -(half_wing_taps as isize)..=(half_wing_taps as isize) {
+                let src_f = base + tap;
+                let x = (src_f as f64) - center;
+                let window_pos = x / (half_wing_taps as f64);
+                if window_pos.abs() >= 1.0 {
+                    continue;
+                }
+                let w = 0.42
+                    + 0.5 * (std::f64::consts::PI * window_pos).cos()
+                    + 0.08 * (2.0 * std::f64::consts::PI * window_pos).cos();
+                let sinc_arg = 2.0 * cutoff * x;
+                let sinc = if sinc_arg.abs() < 1e-12 {
+                    1.0
+                } else {
+                    (std::f64::consts::PI * sinc_arg).sin() / (std::f64::consts::PI * sinc_arg)
+                };
+                let coeff = 2.0 * cutoff * sinc * w;
+                weight_sum += coeff;
+                if src_f >= 0 && (src_f as usize) < in_frames {
+                    let s = input[(src_f as usize) * channels + ch];
+                    if s.is_finite() {
+                        acc += f64::from(s) * coeff;
+                    }
+                }
+            }
+            if weight_sum.abs() > 1e-12 {
+                acc /= weight_sum;
+            }
+            out.push(acc as f32);
+        }
+    }
+    out_frames
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn output_converter_quantizes_dithers_clamps_and_maps_layouts_with_zero_steady_allocations() {
+        let in_fmt = Format::new(
+            SampleType::F32,
+            ByteOrder::Little,
+            48000,
+            1,
+            Layout::Known(Arc::from([Channel::Mono])),
+        )
+        .unwrap();
+        let out_fmt = Format::new(
+            SampleType::I16,
+            ByteOrder::Little,
+            16000,
+            2,
+            Layout::Known(Arc::from([Channel::FrontLeft, Channel::FrontRight])),
+        )
+        .unwrap();
+
+        let mut conv = OutputConverter::new(
+            in_fmt.clone(),
+            OutputConverterConfig::new(out_fmt.clone(), DitherMode::Tpdf).with_seed(0xC59A_2026),
+            480,
+        )
+        .unwrap();
+        assert_eq!(conv.group_delay_input_frames(), 16);
+
+        let mut in_bytes = Vec::with_capacity(480 * 4);
+        for i in 0..480 {
+            let s = if i == 0 {
+                f32::NAN
+            } else if i == 1 {
+                1.5
+            } else if i == 2 {
+                -1.5
+            } else {
+                ((2.0 * std::f32::consts::PI * 1000.0 * (i as f32) / 48000.0).sin()) * 0.5
+            };
+            in_bytes.extend_from_slice(&s.to_le_bytes());
+        }
+
+        let mut out_bytes = Vec::with_capacity(160 * 4);
+        let frames = conv.convert_into(&in_bytes, &mut out_bytes).unwrap();
+        assert_eq!(frames, 160);
+        assert_eq!(out_bytes.len(), 160 * 4);
+        assert_eq!(conv.stats().nonfinite_samples, 1);
+
+        let measured = allocation_counter::measure(|| {
+            for _ in 0..1000 {
+                let f = conv.convert_into(&in_bytes, &mut out_bytes).unwrap();
+                assert_eq!(f, 160);
+            }
+        });
+        assert_eq!(measured.count_total, 0);
+    }
+
+    #[test]
+    fn output_converter_rejects_ambiguous_layouts_and_handles_on_format_change() {
+        let unknown_stereo = Format::new(
+            SampleType::F32,
+            ByteOrder::Little,
+            48000,
+            2,
+            Layout::Unknown,
+        )
+        .unwrap();
+        let unknown_mono = Format::new(
+            SampleType::F32,
+            ByteOrder::Little,
+            48000,
+            1,
+            Layout::Unknown,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_channel_mapping(&unknown_stereo, &unknown_mono),
+            Err(Reason::UnsupportedChannelMapping)
+        );
+
+        let stereo_96k = Format::new(
+            SampleType::F32,
+            ByteOrder::Little,
+            96000,
+            2,
+            Layout::Unknown,
+        )
+        .unwrap();
+        assert_eq!(
+            evaluate_format_change(&unknown_stereo, &stereo_96k, OnFormatChange::Adapt, None),
+            Ok(true)
+        );
+        assert_eq!(
+            evaluate_format_change(&unknown_stereo, &stereo_96k, OnFormatChange::Fail, None),
+            Err(Reason::FormatChanged)
+        );
+    }
+
+    #[test]
+    fn input_normalizer_and_reblocker_preserve_seams_order_independence_and_zero_allocations() {
+        let mono_16k_i16 = Format::new(
+            SampleType::I16,
+            ByteOrder::Little,
+            16_000,
+            1,
+            Layout::Known(Arc::from([Channel::Mono])),
+        )
+        .unwrap();
+        let stereo_48k_f32 = Format::new(
+            SampleType::F32,
+            ByteOrder::Little,
+            48_000,
+            2,
+            Layout::Known(Arc::from([Channel::FrontLeft, Channel::FrontRight])),
+        )
+        .unwrap();
+
+        let (wf_ab, res_ab) = resolve_mixer_working_format(
+            &[mono_16k_i16.clone(), stereo_48k_f32.clone()],
+            None,
+            InputConversionPolicy::AutoWhenMixing,
+        )
+        .unwrap();
+        let (wf_ba, res_ba) = resolve_mixer_working_format(
+            &[stereo_48k_f32.clone(), mono_16k_i16.clone()],
+            None,
+            InputConversionPolicy::AutoWhenMixing,
+        )
+        .unwrap();
+        assert_eq!(wf_ab, stereo_48k_f32);
+        assert_eq!(wf_ab, wf_ba);
+        assert!(res_ab && res_ba);
+        assert_eq!(
+            resolve_mixer_working_format(
+                &[mono_16k_i16.clone(), stereo_48k_f32.clone()],
+                None,
+                InputConversionPolicy::StrictNoResample,
+            ),
+            Err(PlanError::UnsupportedCapturePlan)
+        );
+
+        let bypass =
+            InputNormalizer::new(stereo_48k_f32.clone(), stereo_48k_f32.clone(), 1024).unwrap();
+        assert!(bypass.is_identity_bypass());
+        assert!(!bypass.is_resampled());
+        assert_eq!(bypass.group_delay_input_frames(), 0);
+
+        // Prime-chunk vs continuous single-shot seam equivalence on 16k Mono I16 -> 48k Stereo F32
+        let total_in_frames = 8_000usize;
+        let mut raw_16k = Vec::with_capacity(total_in_frames * 2);
+        for f in 0..total_in_frames {
+            let t = (f as f64) / 16_000.0;
+            let s =
+                (0.75 * (2.0 * std::f64::consts::PI * 997.0 * t).sin() * 32767.0).round() as i16;
+            raw_16k.extend_from_slice(&s.to_le_bytes());
+        }
+
+        let mut single_norm = InputNormalizer::new(
+            mono_16k_i16.clone(),
+            stereo_48k_f32.clone(),
+            total_in_frames,
+        )
+        .unwrap();
+        assert_eq!(single_norm.group_delay_input_frames(), 32);
+        let mut single_out = Vec::with_capacity(total_in_frames * 6);
+        let single_frames = single_norm
+            .normalize_into(&raw_16k, &mut single_out)
+            .unwrap();
+        assert!(single_frames > 23_800);
+
+        let mut chunk_norm =
+            InputNormalizer::new(mono_16k_i16.clone(), stereo_48k_f32.clone(), 1024).unwrap();
+        let mut chunk_tmp = Vec::with_capacity(1024 * 8);
+        let mut chunk_all = Vec::with_capacity(single_out.len());
+        let mut cursor = 0usize;
+        for &step in [67usize, 137, 320, 441, 480, 1024].iter().cycle() {
+            if cursor >= total_in_frames {
+                break;
+            }
+            let take = step.min(total_in_frames - cursor);
+            chunk_norm
+                .normalize_into(&raw_16k[cursor * 2..(cursor + take) * 2], &mut chunk_tmp)
+                .unwrap();
+            chunk_all.extend_from_slice(&chunk_tmp);
+            cursor += take;
+        }
+        assert_eq!(chunk_all.len(), single_out.len());
+        let max_seam_diff = single_out
+            .iter()
+            .zip(chunk_all.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_seam_diff <= 1e-6,
+            "unexpected seam diff: {max_seam_diff}"
+        );
+
+        let mut reblocker = FrameReblocker::new(2, 480, 480 * 8).unwrap();
+        let packet_160 = &raw_16k[..160 * 2]; // 10 ms at 16 kHz -> 480 frames at 48 kHz
+        let mut block_out = vec![0.0_f32; 480 * 2];
+        chunk_norm
+            .normalize_into(packet_160, &mut chunk_tmp)
+            .unwrap();
+        reblocker.push_samples(&chunk_tmp).unwrap();
+        let _ = reblocker.pop_block_into(&mut block_out).unwrap();
+
+        let allocs = allocation_counter::measure(|| {
+            for _ in 0..1_000 {
+                chunk_norm
+                    .normalize_into(packet_160, &mut chunk_tmp)
+                    .unwrap();
+                reblocker.push_samples(&chunk_tmp).unwrap();
+                while reblocker.pop_block_into(&mut block_out).unwrap() {}
+            }
+        });
+        assert_eq!(allocs.count_total, 0);
+    }
+}
