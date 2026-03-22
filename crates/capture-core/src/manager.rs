@@ -1016,3 +1016,621 @@ impl MultiInputManager {
                 }
             }
 
+            // Negative drift check (producer slower than consumer while continuous audio is flowing)
+            if pipe.has_last_block
+                && queued_pkts == 0
+                && pipe.reblocker.buffered_frames() < block_frames
+                && pipe.reblocker.buffered_frames() + threshold_frames >= block_frames
+            {
+                let deficit_frames = nominal.saturating_sub(total_avail).max(threshold_frames);
+                let obs_skew_ns = ((deficit_frames as u64) * 1_000_000_000) / rate_hz;
+                let consume_new = block_frames - threshold_frames;
+                let tail_start = consume_new * ch;
+                pipe.primary_scratch.copy_from_slice(&pipe.last_block);
+                pipe.shifted_scratch[..threshold_frames * ch]
+                    .copy_from_slice(&pipe.last_block[tail_start..]);
+                pipe.reblocker
+                    .peek_into(0, &mut pipe.shifted_scratch[threshold_frames * ch..])?;
+                let repeated = mixer.apply_drift_correction(
+                    input_index,
+                    obs_skew_ns,
+                    now_ns,
+                    &pipe.primary_scratch,
+                    &pipe.shifted_scratch,
+                    &mut pipe.out_block_scratch,
+                )?;
+                if repeated {
+                    pipe.reblocker.discard_frames(consume_new);
+                    pipe.last_block.copy_from_slice(&pipe.out_block_scratch);
+                    mixer.push_input_samples(
+                        input_index,
+                        &pipe.out_block_scratch,
+                        block_frames,
+                        timestamp,
+                        now_ns,
+                    )?;
+                    pushed_blocks += 1;
+                    break;
+                }
+            }
+
+            if !pipe.reblocker.pop_block_into(&mut pipe.out_block_scratch)? {
+                break;
+            }
+            if total_avail <= nominal + threshold_frames / 2
+                && nominal <= total_avail + threshold_frames / 2
+            {
+                let clear_skew = self
+                    .request
+                    .mixer_config
+                    .drift_threshold_ns
+                    .saturating_sub(self.request.mixer_config.drift_hysteresis_ns);
+                let _ = mixer.apply_drift_correction(
+                    input_index,
+                    clear_skew,
+                    now_ns,
+                    &pipe.out_block_scratch,
+                    &pipe.out_block_scratch,
+                    &mut pipe.primary_scratch,
+                );
+            }
+            pipe.last_block.copy_from_slice(&pipe.out_block_scratch);
+            pipe.has_last_block = true;
+            mixer.push_input_samples(
+                input_index,
+                &pipe.out_block_scratch,
+                block_frames,
+                timestamp,
+                now_ns,
+            )?;
+            pushed_blocks += 1;
+        }
+
+        mixer.write_input_diagnostics(
+            &mut self.diagnostics.lock().unwrap_or_else(|e| e.into_inner()),
+        );
+        Ok(pushed_blocks)
+    }
+
+    pub fn push_input_packet(
+        &self,
+        input_index: usize,
+        packet: MixerInputPacket,
+    ) -> Result<(), Reason> {
+        let mut mixer = self.mixer.lock().unwrap_or_else(|e| e.into_inner());
+        mixer.push_input_packet(input_index, packet)?;
+        mixer.write_input_diagnostics(
+            &mut self.diagnostics.lock().unwrap_or_else(|e| e.into_inner()),
+        );
+        Ok(())
+    }
+
+    pub fn set_input_state(
+        &self,
+        input_index: usize,
+        state: ParticipationState,
+    ) -> Result<(), Reason> {
+        let mut mixer = self.mixer.lock().unwrap_or_else(|e| e.into_inner());
+        mixer.set_input_state(input_index, state)?;
+        mixer.write_input_diagnostics(
+            &mut self.diagnostics.lock().unwrap_or_else(|e| e.into_inner()),
+        );
+        Ok(())
+    }
+
+    fn poll_mix_bytes_unlocked(
+        &self,
+        frames: usize,
+        now_ns: u64,
+        oldest_wait_ns: u64,
+        out_bytes: &mut Vec<u8>,
+    ) -> Result<(MixStepOutcome, MixedBlockMetadata), ReadError> {
+        let mut mixer = self.mixer.lock().unwrap_or_else(|e| e.into_inner());
+        let ch = usize::from(mixer.format().channels());
+        let total_samples = frames * ch;
+        let mut mix_scratch = self.mix_scratch.lock().unwrap_or_else(|e| e.into_inner());
+        if mix_scratch.len() < total_samples {
+            mix_scratch.resize(total_samples, 0.0);
+        }
+        let (outcome, meta) = mixer
+            .mix_block_into(
+                frames,
+                now_ns,
+                oldest_wait_ns,
+                &mut mix_scratch[..total_samples],
+            )
+            .map_err(|_| ReadError::InvalidDestination)?;
+        mixer.write_input_diagnostics(
+            &mut self.diagnostics.lock().unwrap_or_else(|e| e.into_inner()),
+        );
+
+        let final_outcome = if let MixStepOutcome::Produced(_) = outcome {
+            let mut conv_opt = self.converter.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(conv) = conv_opt.as_mut() {
+                let mut raw_bytes = self
+                    .raw_bytes_scratch
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                raw_bytes.clear();
+                for &sample in &mix_scratch[..total_samples] {
+                    raw_bytes.extend_from_slice(&sample.to_le_bytes());
+                }
+                let out_frames = conv
+                    .convert_into(&raw_bytes, out_bytes)
+                    .map_err(|_| ReadError::InvalidDestination)?;
+                MixStepOutcome::Produced(out_frames)
+            } else {
+                out_bytes.clear();
+                for &sample in &mix_scratch[..total_samples] {
+                    out_bytes.extend_from_slice(&sample.to_le_bytes());
+                }
+                outcome
+            }
+        } else {
+            outcome
+        };
+
+        *self.last_metadata.lock().unwrap_or_else(|e| e.into_inner()) = Some(meta);
+        self.last_metadata_seq.fetch_add(1, SeqCst);
+        Ok((final_outcome, meta))
+    }
+
+    /// Pull one mixed (and optionally converted) block into `out_bytes` under exclusive one-reader arbitration.
+    pub fn poll_mix_bytes(
+        &self,
+        frames: usize,
+        now_ns: u64,
+        oldest_wait_ns: u64,
+        out_bytes: &mut Vec<u8>,
+    ) -> Result<(MixStepOutcome, MixedBlockMetadata), ReadError> {
+        let _guard = self.read_lock.try_lock().map_err(|err| match err {
+            TryLockError::WouldBlock => ReadError::AlreadyPending,
+            TryLockError::Poisoned(_) => ReadError::Poisoned,
+        })?;
+        self.poll_mix_bytes_unlocked(frames, now_ns, oldest_wait_ns, out_bytes)
+    }
+
+    /// Drain any previously buffered remainder frames (`pending_out_slice` or `pending_out_bytes`)
+    /// into an owned `ReadResult` using `self.out_pool` (`StorageBudget`-accounted).
+    pub fn try_pop_pending_owned(
+        &self,
+        requested_frames: usize,
+    ) -> Result<Option<(ReadResult, MixedBlockMetadata)>, ReadError> {
+        let _guard = self.read_lock.try_lock().map_err(|err| match err {
+            TryLockError::WouldBlock => ReadError::AlreadyPending,
+            TryLockError::Poisoned(_) => ReadError::Poisoned,
+        })?;
+        self.try_pop_pending_owned_unlocked(requested_frames.max(1))
+    }
+
+    fn try_pop_pending_owned_unlocked(
+        &self,
+        req_frames: usize,
+    ) -> Result<Option<(ReadResult, MixedBlockMetadata)>, ReadError> {
+        let mut out_st = self.output_state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((mut pending_slice, meta)) = out_st.pending_out_slice.take() {
+            let emit_frames = pending_slice.frames.min(req_frames);
+            let emit_slice = Slice {
+                block: pending_slice.block.clone(),
+                first: pending_slice.first,
+                frames: emit_frames,
+            };
+            if emit_frames < pending_slice.frames {
+                pending_slice.first += emit_frames;
+                pending_slice.frames -= emit_frames;
+                out_st.pending_out_slice = Some((pending_slice, meta));
+            }
+            drop(out_st);
+            *self.last_metadata.lock().unwrap_or_else(|e| e.into_inner()) = Some(meta);
+            let emit_bytes = emit_slice.bytes().len() as u64;
+            return Ok(Some((
+                ReadResult {
+                    frames: emit_frames,
+                    chunks: vec![emit_slice],
+                    first_packet: None,
+                    last_packet: None,
+                    reason: PartialReason::Complete,
+                    control: None,
+                    copies: CopyStats {
+                        bytes: emit_bytes,
+                        destinations: 1,
+                        ..Default::default()
+                    },
+                },
+                meta,
+            )));
+        }
+
+        if let Some((byte_off, rem_frames, meta)) = out_st.pending_out_bytes.take() {
+            let stride = out_st.out_pool.format().bytes_per_frame();
+            let emit_frames = rem_frames.min(req_frames);
+            let emit_bytes = emit_frames * stride;
+            out_st.sequence = out_st.sequence.saturating_add(1);
+            let hdr = Header {
+                sequence: out_st.sequence,
+                segment: meta.membership_version,
+                generation: 1,
+                frames: emit_frames,
+                sample_position: None,
+                timestamp: None,
+            };
+            let MixedOutputBufferState {
+                ref mut out_pool,
+                ref out_bytes_scratch,
+                ref mut pending_out_bytes,
+                ..
+            } = *out_st;
+            let block = out_pool
+                .offer(&out_bytes_scratch[byte_off..byte_off + emit_bytes], hdr)
+                .map_err(|_| ReadError::InvalidDestination)?;
+            if emit_frames < rem_frames {
+                *pending_out_bytes = Some((byte_off + emit_bytes, rem_frames - emit_frames, meta));
+            }
+            drop(out_st);
+            *self.last_metadata.lock().unwrap_or_else(|e| e.into_inner()) = Some(meta);
+            let slice = Slice {
+                block,
+                first: 0,
+                frames: emit_frames,
+            };
+            return Ok(Some((
+                ReadResult {
+                    frames: emit_frames,
+                    chunks: vec![slice],
+                    first_packet: None,
+                    last_packet: None,
+                    reason: PartialReason::Complete,
+                    control: None,
+                    copies: CopyStats {
+                        bytes: emit_bytes as u64,
+                        destinations: 1,
+                        ..Default::default()
+                    },
+                },
+                meta,
+            )));
+        }
+        Ok(None)
+    }
+
+    /// Drain any previously buffered remainder frames into caller `dst` with `0` heap allocations.
+    pub fn try_pop_pending_into(
+        &self,
+        dst: &mut [u8],
+        requested_frames: usize,
+    ) -> Result<Option<(ReadResult, MixedBlockMetadata)>, ReadError> {
+        let _guard = self.read_lock.try_lock().map_err(|err| match err {
+            TryLockError::WouldBlock => ReadError::AlreadyPending,
+            TryLockError::Poisoned(_) => ReadError::Poisoned,
+        })?;
+        self.try_pop_pending_into_unlocked(dst, requested_frames.max(1))
+    }
+
+    fn try_pop_pending_into_unlocked(
+        &self,
+        dst: &mut [u8],
+        req_frames: usize,
+    ) -> Result<Option<(ReadResult, MixedBlockMetadata)>, ReadError> {
+        let out_stride = self.output_format.bytes_per_frame();
+        if dst.len() < req_frames.saturating_mul(out_stride) {
+            return Err(ReadError::InvalidDestination);
+        }
+        let mut out_st = self.output_state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((byte_off, rem_frames, meta)) = out_st.pending_out_bytes.take() {
+            let emit_frames = rem_frames.min(req_frames);
+            let emit_bytes = emit_frames * out_stride;
+            dst[..emit_bytes]
+                .copy_from_slice(&out_st.out_bytes_scratch[byte_off..byte_off + emit_bytes]);
+            if emit_frames < rem_frames {
+                out_st.pending_out_bytes =
+                    Some((byte_off + emit_bytes, rem_frames - emit_frames, meta));
+            }
+            drop(out_st);
+            *self.last_metadata.lock().unwrap_or_else(|e| e.into_inner()) = Some(meta);
+            return Ok(Some((
+                ReadResult {
+                    frames: emit_frames,
+                    chunks: Vec::new(),
+                    first_packet: None,
+                    last_packet: None,
+                    reason: PartialReason::Complete,
+                    control: None,
+                    copies: CopyStats {
+                        bytes: emit_bytes as u64,
+                        destinations: 1,
+                        ..Default::default()
+                    },
+                },
+                meta,
+            )));
+        }
+
+        if let Some((mut pending_slice, meta)) = out_st.pending_out_slice.take() {
+            let emit_frames = pending_slice.frames.min(req_frames);
+            let emit_bytes = emit_frames * out_stride;
+            let src_bytes = pending_slice.bytes();
+            dst[..emit_bytes].copy_from_slice(&src_bytes[..emit_bytes]);
+            if emit_frames < pending_slice.frames {
+                pending_slice.first += emit_frames;
+                pending_slice.frames -= emit_frames;
+                out_st.pending_out_slice = Some((pending_slice, meta));
+            }
+            drop(out_st);
+            *self.last_metadata.lock().unwrap_or_else(|e| e.into_inner()) = Some(meta);
+            return Ok(Some((
+                ReadResult {
+                    frames: emit_frames,
+                    chunks: Vec::new(),
+                    first_packet: None,
+                    last_packet: None,
+                    reason: PartialReason::Complete,
+                    control: None,
+                    copies: CopyStats {
+                        bytes: emit_bytes as u64,
+                        destinations: 1,
+                        ..Default::default()
+                    },
+                },
+                meta,
+            )));
+        }
+        Ok(None)
+    }
+
+    /// Mix one `block_frames` quantum (unless remainder frames are already pending) and return up
+    /// to `requested_frames` as an owned `Pool`-backed `ReadResult` (`StorageBudget`-charged).
+    pub fn read_mixed_owned(
+        &self,
+        requested_frames: usize,
+        now_ns: u64,
+        oldest_wait_ns: u64,
+    ) -> Result<(ReadResult, MixedBlockMetadata), ReadError> {
+        let _guard = self.read_lock.try_lock().map_err(|err| match err {
+            TryLockError::WouldBlock => ReadError::AlreadyPending,
+            TryLockError::Poisoned(_) => ReadError::Poisoned,
+        })?;
+        let req_frames = requested_frames.max(1);
+        if let Some(res) = self.try_pop_pending_owned_unlocked(req_frames)? {
+            return Ok(res);
+        }
+
+        let mut out_st = self.output_state.lock().unwrap_or_else(|e| e.into_inner());
+        let (outcome, meta) = self.poll_mix_bytes_unlocked(
+            self.block_frames,
+            now_ns,
+            oldest_wait_ns,
+            &mut out_st.out_bytes_scratch,
+        )?;
+
+        match outcome {
+            MixStepOutcome::Produced(out_frames) => {
+                out_st.sequence = out_st.sequence.saturating_add(1);
+                let hdr = Header {
+                    sequence: out_st.sequence,
+                    segment: meta.membership_version,
+                    generation: 1,
+                    frames: out_frames,
+                    sample_position: None,
+                    timestamp: None,
+                };
+                let MixedOutputBufferState {
+                    ref mut out_pool,
+                    ref out_bytes_scratch,
+                    ref mut pending_out_slice,
+                    ..
+                } = *out_st;
+                let block = out_pool
+                    .offer(out_bytes_scratch, hdr)
+                    .map_err(|_| ReadError::InvalidDestination)?;
+                let emit_frames = out_frames.min(req_frames);
+                if emit_frames < out_frames {
+                    *pending_out_slice = Some((
+                        Slice {
+                            block: block.clone(),
+                            first: emit_frames,
+                            frames: out_frames - emit_frames,
+                        },
+                        meta,
+                    ));
+                }
+                let slice = Slice {
+                    block,
+                    first: 0,
+                    frames: emit_frames,
+                };
+                let emit_bytes = slice.bytes().len() as u64;
+                Ok((
+                    ReadResult {
+                        frames: emit_frames,
+                        chunks: vec![slice],
+                        first_packet: None,
+                        last_packet: None,
+                        reason: PartialReason::Complete,
+                        control: None,
+                        copies: CopyStats {
+                            bytes: emit_bytes,
+                            destinations: 1,
+                            ..Default::default()
+                        },
+                    },
+                    meta,
+                ))
+            }
+            MixStepOutcome::ParkedIdle => Ok((
+                ReadResult {
+                    frames: 0,
+                    chunks: Vec::new(),
+                    first_packet: None,
+                    last_packet: None,
+                    reason: PartialReason::Timeout,
+                    control: None,
+                    copies: Default::default(),
+                },
+                meta,
+            )),
+            MixStepOutcome::Eof => Ok((
+                ReadResult {
+                    frames: 0,
+                    chunks: Vec::new(),
+                    first_packet: None,
+                    last_packet: None,
+                    reason: PartialReason::Eof,
+                    control: None,
+                    copies: Default::default(),
+                },
+                meta,
+            )),
+            MixStepOutcome::Failed(_) => Ok((
+                ReadResult {
+                    frames: 0,
+                    chunks: Vec::new(),
+                    first_packet: None,
+                    last_packet: None,
+                    reason: PartialReason::Failure(Failure::Backend),
+                    control: None,
+                    copies: Default::default(),
+                },
+                meta,
+            )),
+        }
+    }
+
+    /// Mix one `block_frames` quantum (unless remainder bytes are already pending) directly into
+    /// caller `dst` with **`0` steady-state heap allocations** (`pending_out_bytes` remainder slicing).
+    pub fn read_mixed_into(
+        &self,
+        dst: &mut [u8],
+        requested_frames: usize,
+        now_ns: u64,
+        oldest_wait_ns: u64,
+    ) -> Result<(ReadResult, MixedBlockMetadata), ReadError> {
+        let _guard = self.read_lock.try_lock().map_err(|err| match err {
+            TryLockError::WouldBlock => ReadError::AlreadyPending,
+            TryLockError::Poisoned(_) => ReadError::Poisoned,
+        })?;
+        let req_frames = requested_frames.max(1);
+        let out_stride = self.output_format.bytes_per_frame();
+        if dst.len() < req_frames.saturating_mul(out_stride) {
+            return Err(ReadError::InvalidDestination);
+        }
+        if let Some(res) = self.try_pop_pending_into_unlocked(dst, req_frames)? {
+            return Ok(res);
+        }
+
+        let mut out_st = self.output_state.lock().unwrap_or_else(|e| e.into_inner());
+        let (outcome, meta) = self.poll_mix_bytes_unlocked(
+            self.block_frames,
+            now_ns,
+            oldest_wait_ns,
+            &mut out_st.out_bytes_scratch,
+        )?;
+
+        match outcome {
+            MixStepOutcome::Produced(out_frames) => {
+                out_st.sequence = out_st.sequence.saturating_add(1);
+                let emit_frames = out_frames.min(req_frames);
+                let emit_bytes = emit_frames * out_stride;
+                dst[..emit_bytes].copy_from_slice(&out_st.out_bytes_scratch[..emit_bytes]);
+                if emit_frames < out_frames {
+                    out_st.pending_out_bytes = Some((emit_bytes, out_frames - emit_frames, meta));
+                }
+                Ok((
+                    ReadResult {
+                        frames: emit_frames,
+                        chunks: Vec::new(),
+                        first_packet: None,
+                        last_packet: None,
+                        reason: PartialReason::Complete,
+                        control: None,
+                        copies: CopyStats {
+                            bytes: emit_bytes as u64,
+                            destinations: 1,
+                            ..Default::default()
+                        },
+                    },
+                    meta,
+                ))
+            }
+            MixStepOutcome::ParkedIdle => Ok((
+                ReadResult {
+                    frames: 0,
+                    chunks: Vec::new(),
+                    first_packet: None,
+                    last_packet: None,
+                    reason: PartialReason::Timeout,
+                    control: None,
+                    copies: Default::default(),
+                },
+                meta,
+            )),
+            MixStepOutcome::Eof => Ok((
+                ReadResult {
+                    frames: 0,
+                    chunks: Vec::new(),
+                    first_packet: None,
+                    last_packet: None,
+                    reason: PartialReason::Eof,
+                    control: None,
+                    copies: Default::default(),
+                },
+                meta,
+            )),
+            MixStepOutcome::Failed(_) => Ok((
+                ReadResult {
+                    frames: 0,
+                    chunks: Vec::new(),
+                    first_packet: None,
+                    last_packet: None,
+                    reason: PartialReason::Failure(Failure::Backend),
+                    control: None,
+                    copies: Default::default(),
+                },
+                meta,
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        schema::{
+            BackendId, Backends, ByteOrder, Channel, DefaultDeviceMode, Format, Header, Layout,
+            OnRootExit, ProcessScope, SampleType, TargetKind,
+        },
+        storage::Pool,
+    };
+
+    const ROOT: ProcessIdentity = ProcessIdentity {
+        pid: 10,
+        generation: 100,
+    };
+    const CHILD: ProcessIdentity = ProcessIdentity {
+        pid: 11,
+        generation: 200,
+    };
+    const GRANDCHILD: ProcessIdentity = ProcessIdentity {
+        pid: 12,
+        generation: 300,
+    };
+
+    #[test]
+    fn multi_input_manager_overlap_topology_and_remainder_slicing() {
+        let target = CaptureTarget::application(
+            ROOT,
+            Some("com.example.app".into()),
+            Some("Example".into()),
+            Some("/bin/example".into()),
+            ProcessScope::Tree,
+            OnRootExit::Wait {
+                wait_timeout_ns: 5_000_000_000,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            target.lower_to_process().unwrap().kind(),
+            TargetKind::Process
+        );
+        assert!(Backends::new(Some(vec![BackendId::PipeWire]), None, None).is_err());
+
