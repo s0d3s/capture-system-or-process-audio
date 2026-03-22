@@ -1634,3 +1634,415 @@ mod tests {
         );
         assert!(Backends::new(Some(vec![BackendId::PipeWire]), None, None).is_err());
 
+        let fmt_m3 = Arc::new(
+            Format::new(
+                SampleType::F32,
+                ByteOrder::Little,
+                48000,
+                2,
+                Layout::Known(Arc::from([Channel::FrontLeft, Channel::FrontRight])),
+            )
+            .unwrap(),
+        );
+        let t_dup = CaptureTarget::process(ROOT, ProcessScope::Tree, OnRootExit::Stop).unwrap();
+        let t_child = CaptureTarget::process(CHILD, ProcessScope::Tree, OnRootExit::Stop).unwrap();
+        let req_m3 = CaptureRequest::new(vec![t_dup.clone(), t_dup.clone(), t_child.clone()]);
+        let mut multi = MultiInputManager::new(req_m3, fmt_m3, 64).unwrap();
+        assert_eq!(multi.input_handles().len(), 3);
+        assert_eq!(
+            multi.input_handles()[0]
+                .snapshot()
+                .unwrap()
+                .participation_state,
+            ParticipationState::Starting
+        );
+        let p_tickets: Vec<_> = (0..4)
+            .map(|_| multi.acquire_pending_open().unwrap())
+            .collect();
+        assert!(matches!(
+            multi.acquire_pending_open(),
+            Err(ManagerError::Capacity)
+        ));
+        drop(p_tickets);
+        assert!(multi.acquire_pending_open().is_ok());
+        assert!(multi.attach_topology_source(0, "pw-node-77").unwrap());
+        assert!(!multi.attach_topology_source(2, "pw-node-77").unwrap());
+        assert!(multi.retire_topology_target(0).is_empty());
+        assert_eq!(
+            multi.retire_topology_target(2),
+            vec![Arc::<str>::from("pw-node-77")]
+        );
+        for idx in 0..3 {
+            multi
+                .push_input_packet(
+                    idx,
+                    MixerInputPacket {
+                        samples: vec![0.25_f32; 128],
+                        frames: 64,
+                        timestamp: None,
+                        arrival_ns: 0,
+                    },
+                )
+                .unwrap();
+        }
+        let (owned_r1, out_meta) = multi.read_mixed_owned(32, 1000, 0).unwrap();
+        assert_eq!(owned_r1.frames, 32);
+        assert!(multi.has_pending_output());
+        assert_eq!(out_meta.contributing_mask, 0b111);
+        let first_f32 = f32::from_le_bytes(owned_r1.chunks[0].bytes()[0..4].try_into().unwrap());
+        assert!((first_f32 - 0.75).abs() <= 1e-6);
+        let (owned_r2, _) = multi.read_mixed_owned(32, 1000, 0).unwrap();
+        assert_eq!(owned_r2.frames, 32);
+        assert!(!multi.has_pending_output());
+        assert_eq!(
+            multi.input_handles()[0]
+                .snapshot()
+                .unwrap()
+                .participation_state,
+            ParticipationState::Active
+        );
+        let t_grand =
+            CaptureTarget::process(GRANDCHILD, ProcessScope::Tree, OnRootExit::Stop).unwrap();
+        let mapping = multi
+            .reconfigure_targets(vec![t_child.clone(), t_grand.clone()])
+            .unwrap();
+        assert_eq!(mapping, vec![Some(2), None]);
+        assert_eq!(multi.targets(), &[t_child, t_grand]);
+        assert_eq!(multi.input_handles().len(), 2);
+        assert_eq!(
+            multi.input_handles()[0]
+                .snapshot()
+                .unwrap()
+                .participation_state,
+            ParticipationState::Active
+        );
+        assert_eq!(
+            multi.input_handles()[1]
+                .snapshot()
+                .unwrap()
+                .participation_state,
+            ParticipationState::Starting
+        );
+    }
+
+    #[test]
+    fn retained_block_keeps_session_charged() {
+        let limits = StorageLimits::new(8, 4096, 8, 262144).unwrap();
+        let budget = StorageBudget::new(2, 557056).unwrap();
+        let format = Arc::new(
+            Format::new(
+                SampleType::F32,
+                ByteOrder::Little,
+                48000,
+                2,
+                Layout::Unknown,
+            )
+            .unwrap(),
+        );
+        let mut pool =
+            Pool::new_reserved(limits, 4096, format, budget.reserve(limits, 16384).unwrap())
+                .unwrap();
+        let held = pool
+            .offer(
+                &[7; 8],
+                Header {
+                    sequence: 1,
+                    segment: 1,
+                    generation: 1,
+                    frames: 1,
+                    sample_position: None,
+                    timestamp: None,
+                },
+            )
+            .unwrap();
+        drop(pool);
+        let second = budget.reserve(limits, 16384).unwrap();
+        assert_eq!(budget.resident_sessions(), 2);
+        assert_eq!(budget.reserved_bytes(), 557056);
+        assert!(matches!(
+            budget.reserve(limits, 16384),
+            Err(AdmissionError::Full)
+        ));
+        assert_eq!(held.bytes(), &[7; 8]);
+        std::thread::spawn(move || drop(held)).join().unwrap();
+        assert_eq!(budget.resident_sessions(), 1);
+        assert_eq!(budget.reserved_bytes(), 278528);
+        let replacement = budget.reserve(limits, 16384).unwrap();
+        drop(second);
+        drop(replacement);
+        assert_eq!(budget.reserved_bytes(), 0);
+        assert_eq!(budget.resident_sessions(), 0);
+    }
+
+    #[test]
+    fn admission_limits_overflow_and_reuse() {
+        let limits = StorageLimits::new(1, 1, 8, 8).unwrap();
+        assert!(matches!(
+            StorageBudget::new(0, 8),
+            Err(AdmissionError::Invalid(CapacityError::Zero))
+        ));
+        let budget = StorageBudget::new(2, 24).unwrap();
+        assert!(matches!(
+            budget.reserve(limits, usize::MAX),
+            Err(AdmissionError::Invalid(CapacityError::Overflow))
+        ));
+        assert!(matches!(
+            budget.reserve(limits, 17),
+            Err(AdmissionError::Invalid(CapacityError::ExceedsByteCeiling))
+        ));
+        for _ in 0..1000 {
+            let first = budget.reserve(limits, 8).unwrap();
+            assert!(matches!(
+                budget.reserve(limits, 1),
+                Err(AdmissionError::Full)
+            ));
+            assert_eq!(budget.resident_sessions(), 1);
+            let second = budget.reserve(limits, 0).unwrap();
+            assert_eq!(budget.reserved_bytes(), 24);
+            assert!(matches!(
+                budget.reserve(limits, 0),
+                Err(AdmissionError::Full)
+            ));
+            let clone = first.retain();
+            drop(first);
+            assert_eq!(budget.reserved_bytes(), 24);
+            drop(clone);
+            drop(second);
+            assert_eq!(budget.resident_sessions(), 0);
+            assert_eq!(budget.reserved_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn heterogeneous_multi_input_manager_normalizes_compensates_drift_and_runs_zero_allocations() {
+        use crate::schema::Channel;
+
+        let t_app = CaptureTarget::application(
+            ROOT,
+            Some("us.zoom.xos".into()),
+            Some("Zoom".into()),
+            None,
+            ProcessScope::Exact,
+            OnRootExit::Stop,
+        )
+        .unwrap()
+        .with_backend(BackendId::ScreenCaptureKit);
+        let t_mic =
+            CaptureTarget::microphone(DefaultDeviceMode::Follow).with_backend(BackendId::CoreAudio);
+
+        let fmt_48k_stereo = Arc::new(
+            Format::new(
+                SampleType::F32,
+                ByteOrder::Little,
+                48_000,
+                2,
+                Layout::Known(Arc::from([Channel::FrontLeft, Channel::FrontRight])),
+            )
+            .unwrap(),
+        );
+        let fmt_16k_mono_i16 = Arc::new(
+            Format::new(
+                SampleType::I16,
+                ByteOrder::Little,
+                16_000,
+                1,
+                Layout::Known(Arc::from([Channel::Mono])),
+            )
+            .unwrap(),
+        );
+
+        let req = CaptureRequest::new(vec![t_app.clone(), t_mic.clone()]);
+        let mut multi = MultiInputManager::new_heterogeneous(
+            req,
+            vec![
+                (BackendId::ScreenCaptureKit, fmt_48k_stereo.clone()),
+                (BackendId::CoreAudio, fmt_16k_mono_i16.clone()),
+            ],
+            480,
+            1024,
+        )
+        .unwrap();
+
+        assert_eq!(multi.working_format(), &fmt_48k_stereo);
+        assert_eq!(
+            multi.input_handles()[0].backend(),
+            BackendId::ScreenCaptureKit
+        );
+        assert!(!multi.input_handles()[0].is_resampled());
+        assert!(multi.input_handles()[0].is_identity_bypass());
+        assert_eq!(multi.input_handles()[1].backend(), BackendId::CoreAudio);
+        assert!(multi.input_handles()[1].is_resampled());
+        assert!(!multi.input_handles()[1].is_identity_bypass());
+
+        // The microphone packet models a clock running 0.625% fast.
+        let mut app_pkt = Vec::with_capacity(480 * 8);
+        for _ in 0..(480 * 2) {
+            app_pkt.extend_from_slice(&0.25_f32.to_le_bytes());
+        }
+        let mut mic_fast_pkt = Vec::with_capacity(161 * 2);
+        for _ in 0..161 {
+            mic_fast_pkt.extend_from_slice(&(8192_i16).to_le_bytes()); // ~0.25 FS
+        }
+
+        let mut out_bytes = Vec::with_capacity(480 * 8);
+        // Prime initial filter delay (32 input frames at 16 kHz)
+        multi.push_raw_input_bytes(0, &app_pkt, None, 0).unwrap();
+        multi
+            .push_raw_input_bytes(1, &mic_fast_pkt, None, 0)
+            .unwrap();
+        multi
+            .push_raw_input_bytes(1, &mic_fast_pkt, None, 5_000_000)
+            .unwrap();
+        let _ = multi
+            .poll_mix_bytes(480, 10_000_000, 0, &mut out_bytes)
+            .unwrap();
+
+        let allocs = allocation_counter::measure(|| {
+            for step in 1..=300u64 {
+                let now_ns = step * 10_000_000;
+                multi
+                    .push_raw_input_bytes(0, &app_pkt, None, now_ns)
+                    .unwrap();
+                multi
+                    .push_raw_input_bytes(1, &mic_fast_pkt, None, now_ns)
+                    .unwrap();
+                let (outcome, _) = multi
+                    .poll_mix_bytes(480, now_ns, 0, &mut out_bytes)
+                    .unwrap();
+                assert_eq!(outcome, MixStepOutcome::Produced(480));
+            }
+        });
+        assert_eq!(allocs.count_total, 0);
+        let mic_snap = multi.input_handles()[1].snapshot().unwrap();
+        assert!(mic_snap.drift_slips >= 2);
+        assert_eq!(mic_snap.dropped_frames, 0);
+
+        let mapping = multi
+            .reconfigure_targets_with_formats(
+                vec![t_mic.clone()],
+                vec![(BackendId::CoreAudio, fmt_16k_mono_i16.clone())],
+            )
+            .unwrap();
+        assert_eq!(mapping, vec![Some(1)]);
+        assert!(multi.input_handles()[0].is_resampled());
+
+        let mut dst_sub = vec![0u8; 240 * 8];
+        multi
+            .push_raw_input_bytes(0, &mic_fast_pkt, None, 3_010_000_000)
+            .unwrap();
+        let _ = multi
+            .read_mixed_into(&mut dst_sub, 240, 3_010_000_000, 0)
+            .unwrap();
+        let _ = multi
+            .read_mixed_into(&mut dst_sub, 240, 3_010_000_000, 0)
+            .unwrap();
+
+        let into_allocs = allocation_counter::measure(|| {
+            for step in 302..=400u64 {
+                let now_ns = step * 10_000_000;
+                multi
+                    .push_raw_input_bytes(0, &mic_fast_pkt, None, now_ns)
+                    .unwrap();
+                let (r1, m1) = multi.read_mixed_into(&mut dst_sub, 240, now_ns, 0).unwrap();
+                assert_eq!(r1.frames, 240);
+                assert!(multi.has_pending_output());
+                let (r2, m2) = multi.read_mixed_into(&mut dst_sub, 240, now_ns, 0).unwrap();
+                assert_eq!(r2.frames, 240);
+                assert!(!multi.has_pending_output());
+                assert_eq!(m1.membership_version, m2.membership_version);
+            }
+        });
+        assert_eq!(into_allocs.count_total, 0);
+        assert!(multi.last_block_metadata().is_some());
+    }
+
+    #[test]
+    fn multi_input_manager_charges_out_pool_budget_and_enforces_hot_swap_format_gates() {
+        use crate::schema::Channel;
+
+        let fmt_16k_mono = Arc::new(
+            Format::new(
+                SampleType::F32,
+                ByteOrder::Little,
+                16_000,
+                1,
+                Layout::Known(Arc::from([Channel::Mono])),
+            )
+            .unwrap(),
+        );
+        let fmt_48k_stereo = Arc::new(
+            Format::new(
+                SampleType::F32,
+                ByteOrder::Little,
+                48_000,
+                2,
+                Layout::Known(Arc::from([Channel::FrontLeft, Channel::FrontRight])),
+            )
+            .unwrap(),
+        );
+        let t1 = CaptureTarget::microphone(DefaultDeviceMode::Follow);
+        let t2 = CaptureTarget::default_output(DefaultDeviceMode::Follow);
+
+        let shared_budget = StorageBudget::new(16, 4 * 1024 * 1024).unwrap();
+        let req_16k = CaptureRequest::single(t1.clone());
+        let mut mgr_16k = MultiInputManager::new_heterogeneous_with_budget(
+            req_16k,
+            vec![(BackendId::Wasapi, fmt_16k_mono.clone())],
+            default_block_frames_for_rate(16_000, 1024),
+            1024,
+            shared_budget.clone(),
+        )
+        .unwrap();
+        assert_eq!(shared_budget.resident_sessions(), 0);
+        assert_eq!(shared_budget.reserved_bytes(), 8 * 1024 * 4);
+        let stream_limits = StorageLimits::new(8, 256, 8, 8 * 256 * 8).unwrap();
+        let mut stream_res = Vec::new();
+        for _ in 0..16 {
+            stream_res.push(shared_budget.reserve(stream_limits, 0).unwrap());
+        }
+        assert_eq!(shared_budget.resident_sessions(), 16);
+        drop(stream_res);
+
+        let tiny_budget = StorageBudget::new(4, 16 * 1024).unwrap();
+        let too_small = MultiInputManager::new_heterogeneous_with_budget(
+            CaptureRequest::single(t1.clone()),
+            vec![(BackendId::Wasapi, fmt_16k_mono.clone())],
+            160,
+            1024,
+            tiny_budget,
+        );
+        assert_eq!(too_small.err(), Some(ManagerError::Capacity));
+
+        let promote_err = mgr_16k.reconfigure_targets_with_formats(
+            vec![t1.clone(), t2.clone()],
+            vec![
+                (BackendId::Wasapi, fmt_16k_mono.clone()),
+                (BackendId::Wasapi, fmt_48k_stereo.clone()),
+            ],
+        );
+        assert_eq!(promote_err, Err(ManagerError::WorkingFormatChanged));
+        assert_eq!(mgr_16k.targets().len(), 1); // original state untouched on error!
+
+        drop(mgr_16k);
+        assert_eq!(shared_budget.reserved_bytes(), 0);
+
+        let strict_req = CaptureRequest::single(t2.clone())
+            .with_input_conversion(InputConversionPolicy::StrictNoResample);
+        let mut strict_mgr = MultiInputManager::new_heterogeneous(
+            strict_req,
+            vec![(BackendId::Wasapi, fmt_48k_stereo.clone())],
+            480,
+            1024,
+        )
+        .unwrap();
+        let strict_err = strict_mgr.reconfigure_targets_with_formats(
+            vec![t2, t1],
+            vec![
+                (BackendId::Wasapi, fmt_48k_stereo),
+                (BackendId::Wasapi, fmt_16k_mono),
+            ],
+        );
+        assert_eq!(strict_err, Err(ManagerError::Unsupported));
+        assert_eq!(strict_mgr.targets().len(), 1);
+    }
+}
