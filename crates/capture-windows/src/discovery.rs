@@ -570,3 +570,474 @@ impl PlatformDiscovery {
     }
 }
 
+impl DiscoveryBackend for PlatformDiscovery {
+    fn new() -> Self {
+        Self {
+            service: DiscoveryService::new_for_os(PlatformOs::Windows),
+            backends: Backends::default(),
+            worker: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn with_backends(backends: Backends) -> Result<Self, CapabilityError> {
+        Self::validate_windows_backends(&backends)?;
+        Ok(Self {
+            service: DiscoveryService::new_for_os(PlatformOs::Windows),
+            backends,
+            worker: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    fn service(&self) -> &DiscoveryService {
+        &self.service
+    }
+
+    fn backends(&self) -> &Backends {
+        &self.backends
+    }
+
+    fn is_watcher_running(&self) -> bool {
+        let mut guard = self.worker.lock().unwrap_or_else(|e| e.into_inner());
+        if self.service.active_subscriber_count() == 0
+            && let Some(mut worker) = guard.take()
+        {
+            worker.stop_and_join();
+        }
+        guard.is_some()
+    }
+
+    fn refresh_once(&self) -> Result<u64, CapabilityError> {
+        Self::validate_windows_backends(&self.backends)?;
+        let mut query = DiscoveryQuery::all_for_os(PlatformOs::Windows);
+        query.backends = self.backends.clone();
+        let inv = collect_windows_backend_inventory()?;
+        let rev = self
+            .service
+            .update_backend_inventory(inv, &query)
+            .map_err(CapabilityError::from)?;
+        self.reap_idle_watcher();
+        Ok(rev)
+    }
+
+    fn default_output_device_id(&self) -> Result<Option<Arc<str>>, CapabilityError> {
+        self.refresh_once()?;
+        Ok(self.service.default_output_device_id())
+    }
+
+    fn default_input_device_id(&self) -> Result<Option<Arc<str>>, CapabilityError> {
+        self.refresh_once()?;
+        Ok(self.service.default_input_device_id())
+    }
+
+    fn process(
+        &self,
+        pid: u32,
+        scope: ProcessScope,
+        on_root_exit: OnRootExit,
+    ) -> Result<CaptureTarget, CapabilityError> {
+        let identity = crate::process::inspect_process(pid)?;
+        CaptureTarget::process(identity, scope, on_root_exit).map_err(CapabilityError::from)
+    }
+
+    fn discover_query(&self, query: &DiscoveryQuery) -> Result<TargetCatalog, CapabilityError> {
+        Self::validate_windows_backends(&query.backends)?;
+        let inv = collect_windows_backend_inventory()?;
+        let _ = self
+            .service
+            .update_backend_inventory(inv, query)
+            .map_err(CapabilityError::from)?;
+        self.reap_idle_watcher();
+        self.service
+            .discover_query(query)
+            .map_err(CapabilityError::from)
+    }
+
+    fn subscribe(
+        &self,
+        filter: DiscoveryFilter,
+        max_discovery_queue: usize,
+    ) -> Result<DiscoverySubscription, CapabilityError> {
+        let _ = self.refresh_once();
+        let sub = self.service.subscribe(filter, max_discovery_queue)?;
+        self.ensure_watcher_started();
+        Ok(sub)
+    }
+
+    fn subscribe_query(
+        &self,
+        query: DiscoveryQuery,
+        max_discovery_queue: usize,
+    ) -> Result<DiscoverySubscription, CapabilityError> {
+        Self::validate_windows_backends(&query.backends)?;
+        let _ = self.refresh_once();
+        let sub = self.service.subscribe_query(query, max_discovery_queue)?;
+        self.ensure_watcher_started();
+        Ok(sub)
+    }
+}
+
+struct DefaultEndpointObserverState {
+    ref_count: usize,
+    latest_id: Arc<Mutex<Option<String>>>,
+    worker: Option<WatcherWorker>,
+}
+
+static DEFAULT_ENDPOINT_OBSERVER: OnceLock<Mutex<DefaultEndpointObserverState>> = OnceLock::new();
+static DEFAULT_INPUT_OBSERVER: OnceLock<Mutex<DefaultEndpointObserverState>> = OnceLock::new();
+
+fn observer_state() -> &'static Mutex<DefaultEndpointObserverState> {
+    DEFAULT_ENDPOINT_OBSERVER.get_or_init(|| {
+        Mutex::new(DefaultEndpointObserverState {
+            ref_count: 0,
+            latest_id: Arc::new(Mutex::new(None)),
+            worker: None,
+        })
+    })
+}
+
+fn input_observer_state() -> &'static Mutex<DefaultEndpointObserverState> {
+    DEFAULT_INPUT_OBSERVER.get_or_init(|| {
+        Mutex::new(DefaultEndpointObserverState {
+            ref_count: 0,
+            latest_id: Arc::new(Mutex::new(None)),
+            worker: None,
+        })
+    })
+}
+
+fn spawn_default_flow_observer(
+    flow: EDataFlow,
+    latest_bg: Arc<Mutex<Option<String>>>,
+) -> WatcherWorker {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_bg = stop.clone();
+    let join = thread::spawn(move || {
+        let _apt = Apartment::new().ok();
+        let enumerator: Option<IMMDeviceEnumerator> =
+            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok() };
+        let dirty = Arc::new(AtomicBool::new(true));
+        let client: IMMNotificationClient = EndpointNotificationClient {
+            target_flow: Some(flow),
+            latest_default_id: Some(latest_bg.clone()),
+            dirty: Some(dirty.clone()),
+            wake_thread: thread::current(),
+        }
+        .into();
+        let registered = if let Some(ref enum_ref) = enumerator {
+            // SAFETY: registers nonblocking `IMMNotificationClient` callback on this MTA thread.
+            unsafe {
+                enum_ref
+                    .RegisterEndpointNotificationCallback(&client)
+                    .is_ok()
+            }
+        } else {
+            false
+        };
+
+        while !stop_bg.load(SeqCst) {
+            if dirty.swap(false, SeqCst) || !registered {
+                let current = if let Some(ref enum_ref) = enumerator {
+                    // SAFETY: enumerator is owned by this dedicated MTA observer thread.
+                    unsafe {
+                        enum_ref
+                            .GetDefaultAudioEndpoint(flow, eConsole)
+                            .ok()
+                            .and_then(|dev| {
+                                let raw = dev.GetId().ok()?;
+                                let text = raw.to_string().ok();
+                                CoTaskMemFree(Some(raw.0.cast()));
+                                text
+                            })
+                    }
+                } else {
+                    query_default_endpoint_id_for_flow(flow).ok().flatten()
+                };
+                if current.is_some() {
+                    *latest_bg.lock().unwrap_or_else(|e| e.into_inner()) = current;
+                }
+            }
+            if !dirty.load(SeqCst) && !stop_bg.load(SeqCst) {
+                thread::park_timeout(Duration::from_millis(500));
+            }
+        }
+
+        if registered && let Some(ref enum_ref) = enumerator {
+            // SAFETY: unregisters callback outside any `IMMNotificationClient` method before dropping `enumerator`.
+            unsafe {
+                let _ = enum_ref.UnregisterEndpointNotificationCallback(&client);
+            }
+        }
+    });
+    WatcherWorker {
+        stop,
+        join: Some(join),
+    }
+}
+
+/// Event-driven default render endpoint observer (`eRender`, `eConsole`).
+pub struct PlatformDefaultOutputObserver {
+    latest_id: Arc<Mutex<Option<String>>>,
+}
+
+impl DefaultEndpointObserver for PlatformDefaultOutputObserver {
+    fn acquire() -> Self {
+        let mut guard = observer_state().lock().unwrap_or_else(|e| e.into_inner());
+        if guard.ref_count == 0 {
+            let initial = query_default_render_endpoint_id().ok().flatten();
+            *guard.latest_id.lock().unwrap_or_else(|e| e.into_inner()) = initial;
+            guard.worker = Some(spawn_default_flow_observer(
+                eRender,
+                guard.latest_id.clone(),
+            ));
+        }
+        guard.ref_count += 1;
+        Self {
+            latest_id: guard.latest_id.clone(),
+        }
+    }
+
+    fn latest_endpoint_id(&self) -> Option<String> {
+        self.latest_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn changed_from(&self, expected_id: Option<&str>) -> Option<String> {
+        let guard = self.latest_id.lock().unwrap_or_else(|e| e.into_inner());
+        let cur = guard.as_deref()?;
+        if Some(cur) != expected_id {
+            Some(cur.to_owned())
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for PlatformDefaultOutputObserver {
+    fn drop(&mut self) {
+        let mut guard = observer_state().lock().unwrap_or_else(|e| e.into_inner());
+        guard.ref_count = guard.ref_count.saturating_sub(1);
+        if guard.ref_count == 0
+            && let Some(mut worker) = guard.worker.take()
+        {
+            worker.stop_and_join();
+        }
+    }
+}
+
+/// Event-driven default capture endpoint observer (`eCapture`, `eConsole`).
+pub struct PlatformDefaultInputObserver {
+    latest_id: Arc<Mutex<Option<String>>>,
+}
+
+impl DefaultEndpointObserver for PlatformDefaultInputObserver {
+    fn acquire() -> Self {
+        let mut guard = input_observer_state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if guard.ref_count == 0 {
+            let initial = query_default_capture_endpoint_id().ok().flatten();
+            *guard.latest_id.lock().unwrap_or_else(|e| e.into_inner()) = initial;
+            guard.worker = Some(spawn_default_flow_observer(
+                eCapture,
+                guard.latest_id.clone(),
+            ));
+        }
+        guard.ref_count += 1;
+        Self {
+            latest_id: guard.latest_id.clone(),
+        }
+    }
+
+    fn latest_endpoint_id(&self) -> Option<String> {
+        self.latest_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn changed_from(&self, expected_id: Option<&str>) -> Option<String> {
+        let guard = self.latest_id.lock().unwrap_or_else(|e| e.into_inner());
+        let cur = guard.as_deref()?;
+        if Some(cur) != expected_id {
+            Some(cur.to_owned())
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for PlatformDefaultInputObserver {
+    fn drop(&mut self) {
+        let mut guard = input_observer_state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.ref_count = guard.ref_count.saturating_sub(1);
+        if guard.ref_count == 0
+            && let Some(mut worker) = guard.worker.take()
+        {
+            worker.stop_and_join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Discovery, core::discovery::DiscoveryDedupe};
+    use std::process::{Command, Stdio};
+
+    type TestResult<Value> = std::result::Result<Value, Box<dyn std::error::Error + Send + Sync>>;
+
+    #[test]
+    fn platform_discovery_one_shot_leaves_no_watcher_and_supports_pre_audio_process()
+    -> TestResult<()> {
+        let discovery = Discovery::with_backends(Backends::default())?;
+        assert_eq!(discovery.service().os(), PlatformOs::Windows);
+        let devices = discovery.output_devices()?;
+        assert!(!devices.is_empty());
+        assert!(!discovery.is_watcher_running());
+        assert!(discovery.default_output_device_id()?.is_some());
+        for dev in &devices {
+            assert!(dev.active_audio().is_none());
+            let name = dev.name().map_or("", |s| s.as_ref());
+            let id = dev.device_id().map_or("", |s| s.as_ref());
+            assert!(!name.is_empty());
+            assert!(!id.is_empty());
+            assert_ne!(name, id);
+        }
+
+        let _apps = discovery.applications(false, false)?;
+        let _procs = discovery.processes(false, false)?;
+        assert!(!discovery.is_watcher_running());
+
+        let mut child = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "process::tests::identity_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+
+        let target = discovery.process(child.id(), ProcessScope::Tree, OnRootExit::Stop)?;
+        assert_eq!(target.pid(), Some(child.id()));
+        assert!(target.process_start_time().is_some());
+
+        let sub = discovery.subscribe(DiscoveryFilter::applications(false, false), 256)?;
+        assert!(discovery.is_watcher_running());
+        drop(sub);
+        assert!(!discovery.is_watcher_running());
+
+        let mut q = DiscoveryQuery::all_for_os(PlatformOs::Windows);
+        q.dedupe = DiscoveryDedupe::PerBackend;
+        let q_sub = discovery.subscribe_query(q, 256)?;
+        assert!(discovery.is_watcher_running());
+        let q_cat = q_sub.resnapshot_catalog()?;
+        assert!(!q_cat.output_devices.is_empty());
+        assert!(
+            q_cat
+                .output_devices
+                .iter()
+                .all(|d| d.id().starts_with("wasapi:device:"))
+        );
+        drop(q_sub);
+        assert!(!discovery.is_watcher_running());
+
+        drop(child.stdin.take());
+        let _ = child.wait();
+        Ok(())
+    }
+
+    #[test]
+    fn sta_thread_compatibility_and_default_endpoint_observer_benchmark() -> TestResult<()> {
+        let sta_join = thread::spawn(|| -> TestResult<()> {
+            unsafe {
+                CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
+            }
+            let def_id = query_default_render_endpoint_id()?;
+            assert!(def_id.is_some());
+            let inv = collect_windows_backend_inventory()?;
+            assert!(!inv.devices.is_empty());
+            unsafe {
+                CoUninitialize();
+            }
+            Ok(())
+        });
+        sta_join.join().map_err(|_| "STA thread panicked")??;
+
+        let mut direct_us = Vec::with_capacity(20);
+        for _ in 0..20 {
+            let t0 = std::time::Instant::now();
+            let id = query_default_render_endpoint_id()?;
+            assert!(id.is_some());
+            direct_us.push(t0.elapsed().as_micros() as u64);
+        }
+        direct_us.sort_unstable();
+
+        let lease = PlatformDefaultOutputObserver::acquire();
+        let mut cached_ns = Vec::with_capacity(20);
+        for _ in 0..20 {
+            let t0 = std::time::Instant::now();
+            let id = lease.latest_endpoint_id();
+            assert!(id.is_some());
+            cached_ns.push(t0.elapsed().as_nanos() as u64);
+        }
+        cached_ns.sort_unstable();
+        drop(lease);
+
+        let guard = observer_state().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(guard.ref_count, 0);
+        assert!(guard.worker.is_none());
+        drop(guard);
+
+        let discovery = crate::Discovery::new();
+        let out_devs = discovery.output_devices()?;
+        let in_devs = discovery.input_devices()?;
+        assert!(!discovery.backend().is_watcher_running());
+        if !in_devs.is_empty() {
+            assert!(discovery.default_input_device_id()?.is_some());
+        }
+        for in_dev in &in_devs {
+            assert_eq!(in_dev.kind(), crate::core::schema::TargetKind::InputDevice);
+            assert!(in_dev.active_audio().is_none());
+            let in_id = in_dev.device_id().map_or("", |s| s.as_ref());
+            let in_name = in_dev.name().map_or("", |s| s.as_ref());
+            assert!(!in_id.is_empty());
+            assert!(!in_name.is_empty());
+            assert_ne!(in_name, in_id);
+            assert!(
+                out_devs
+                    .iter()
+                    .all(|o| o.device_id().map_or("", |s| s.as_ref()) != in_id),
+                "eRender device leaked into input_devices()"
+            );
+        }
+        let catalog = discovery.discover_query(&DiscoveryQuery::all_for_os(PlatformOs::Windows))?;
+        assert_eq!(catalog.output_devices.len(), out_devs.len());
+        assert_eq!(catalog.input_devices.len(), in_devs.len());
+
+        let in_sub = discovery.subscribe(DiscoveryFilter::input_devices(), 64)?;
+        assert!(discovery.backend().is_watcher_running());
+        let resnap = in_sub.resnapshot()?;
+        assert_eq!(resnap.targets.len(), in_devs.len());
+        drop(in_sub);
+        assert!(!discovery.backend().is_watcher_running());
+
+        let in_lease = PlatformDefaultInputObserver::acquire();
+        if !in_devs.is_empty() {
+            assert!(in_lease.latest_endpoint_id().is_some());
+        }
+        drop(in_lease);
+        let in_guard = input_observer_state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(in_guard.ref_count, 0);
+        assert!(in_guard.worker.is_none());
+        Ok(())
+    }
+}
