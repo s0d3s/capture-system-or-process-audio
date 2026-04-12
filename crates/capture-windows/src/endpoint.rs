@@ -736,3 +736,608 @@ impl PlatformStream {
         )
     }
 
+    pub fn open_with_options(
+        target: &CaptureTarget,
+        tree_range: ProcessTreeRange,
+        backends: &Backends,
+        policy: Overflow,
+        timing: TimingRequirement,
+    ) -> Result<Self, CapabilityError> {
+        Self::open_with_permission_policy(
+            target,
+            tree_range,
+            backends,
+            policy,
+            timing,
+            PermissionPolicy::AutoRequest,
+        )
+    }
+
+    pub fn open_with_permission_policy(
+        target: &CaptureTarget,
+        tree_range: ProcessTreeRange,
+        backends: &Backends,
+        policy: Overflow,
+        timing: TimingRequirement,
+        _permission_policy: PermissionPolicy,
+    ) -> Result<Self, CapabilityError> {
+        check_capture_target(target, tree_range, backends, timing)?;
+        crate::permissions::ensure_windows_target_permission(target)?;
+        let open_target = WasapiOpenTarget::from_capture_target(target)?;
+        Self::open_internal(
+            open_target,
+            target.clone(),
+            policy,
+            None,
+            None,
+            Duration::from_secs(5),
+        )
+        .map_err(|(_, err)| err)
+    }
+
+    pub fn open_observed(
+        target: &CaptureTarget,
+        policy: Overflow,
+        trace: Arc<Trace>,
+    ) -> Result<Self, CapabilityError> {
+        check_capture_target(
+            target,
+            ProcessTreeRange::default(),
+            &Backends::default(),
+            TimingRequirement::Raw,
+        )?;
+        let open_target = WasapiOpenTarget::from_capture_target(target)?;
+        Self::open_internal(
+            open_target,
+            target.clone(),
+            policy,
+            Some(trace),
+            None,
+            Duration::from_secs(5),
+        )
+        .map_err(|(_, err)| err)
+    }
+
+    #[cfg(any(test, feature = "native-tests"))]
+    pub fn diagnostic_process_tree_observed(
+        root: ProcessIdentity,
+        policy: Overflow,
+        trace: Arc<Trace>,
+    ) -> Result<Self, CapabilityError> {
+        let target = CaptureTarget::process(
+            root,
+            ProcessScope::Tree,
+            crate::core::schema::OnRootExit::Stop,
+        )
+        .map_err(CapabilityError::from)?;
+        Self::open_internal(
+            WasapiOpenTarget::ProcessTree(root),
+            target,
+            policy,
+            Some(trace),
+            None,
+            Duration::from_secs(5),
+        )
+        .map_err(|(_, err)| err)
+    }
+
+    #[cfg(any(test, feature = "native-tests"))]
+    pub fn diagnostic_process_tree(
+        root: ProcessIdentity,
+        policy: Overflow,
+    ) -> Result<Self, CapabilityError> {
+        let target = CaptureTarget::process(
+            root,
+            ProcessScope::Tree,
+            crate::core::schema::OnRootExit::Stop,
+        )
+        .map_err(CapabilityError::from)?;
+        Self::open_internal(
+            WasapiOpenTarget::ProcessTree(root),
+            target,
+            policy,
+            None,
+            None,
+            Duration::from_secs(5),
+        )
+        .map_err(|(_, err)| err)
+    }
+
+    pub(crate) fn open_reserved_target(
+        open_target: WasapiOpenTarget,
+        display_target: CaptureTarget,
+        policy: Overflow,
+        budget: StorageBudget,
+        startup_timeout: Duration,
+    ) -> Result<Self, (Option<StartupCleanup>, CapabilityError)> {
+        Self::open_internal(
+            open_target,
+            display_target,
+            policy,
+            None,
+            Some(budget),
+            startup_timeout,
+        )
+    }
+
+    fn open_internal(
+        open_target: WasapiOpenTarget,
+        display_target: CaptureTarget,
+        policy: Overflow,
+        trace: Option<Arc<Trace>>,
+        budget: Option<StorageBudget>,
+        startup_timeout: Duration,
+    ) -> Result<Self, (Option<StartupCleanup>, CapabilityError)> {
+        let stop_event = Arc::new(Event::new(true).map_err(|err| (None, err))?);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(ReadySignal::new());
+        let worker_stop_event = stop_event.clone();
+        let worker_stop_flag = stop_flag.clone();
+        let worker_ready = ready.clone();
+        let worker_trace = trace.clone();
+        let ended = Arc::new(AtomicU32::new(0));
+        let worker_ended = ended.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("wasapi-acquisition".into())
+            .spawn(move || {
+                let initialized = (|| -> Result<_, CapabilityError> {
+                    let apartment = Apartment::new()?;
+                    let scheduling = CaptureTask::new()?;
+                    let (native, format) = open(open_target, display_target)?;
+                    let stride = format.pcm.bytes_per_frame();
+                    let limits = StorageLimits::new(8, 4096, stride, 8 * 4096 * stride)
+                        .map_err(|_| CapabilityError::CapacityExceeded)?;
+                    let active_budget = match budget {
+                        Some(provided) => provided,
+                        None => StorageBudget::new(1, limits.total_bytes() + 16384)
+                            .map_err(|_| CapabilityError::CapacityExceeded)?,
+                    };
+                    let metadata_bytes = worker_trace.as_ref().map_or(6024usize, |tr| {
+                        6024usize.saturating_add(tr.storage_bytes()).min(16384)
+                    });
+                    let reservation = active_budget
+                        .reserve(limits, metadata_bytes)
+                        .map_err(|_| CapabilityError::CapacityExceeded)?;
+                    let retained_reservation = reservation.retain();
+                    let pool = Pool::new_reserved(limits, 4096, format.pcm.clone(), reservation)
+                        .map_err(|_| CapabilityError::CapacityExceeded)?;
+                    let (producer, reader) = if let Some(tr) = worker_trace {
+                        ordering::channel_observed(pool, 4, tr)
+                    } else {
+                        ordering::channel(pool, 4)
+                    }
+                    .map_err(|_| CapabilityError::CapacityExceeded)?;
+                    // SAFETY: worker owns the initialized native client and its event.
+                    unsafe {
+                        if worker_stop_flag.load(SeqCst)
+                            || WaitForSingleObject(worker_stop_event.handle(), 0) == WAIT_OBJECT_0
+                        {
+                            return Err(CapabilityError::Stopped);
+                        }
+                        native.client.Start().map_err(map_windows_error)?;
+                    }
+                    Ok((
+                        apartment,
+                        scheduling,
+                        native,
+                        format,
+                        producer,
+                        reader,
+                        retained_reservation,
+                    ))
+                })();
+                match initialized {
+                    Err(error) => {
+                        let _ = sender.send(Err(error));
+                    }
+                    Ok((
+                        apartment,
+                        scheduling,
+                        native,
+                        format,
+                        mut producer,
+                        reader,
+                        retained_reservation,
+                    )) => {
+                        if sender
+                            .send(Ok((format, reader, retained_reservation)))
+                            .is_ok()
+                            && acquire(
+                                &native,
+                                &mut producer,
+                                &worker_stop_event,
+                                &worker_stop_flag,
+                                &worker_ready,
+                                policy,
+                                &worker_ended,
+                            )
+                            .is_err()
+                        {
+                            let _ = worker_ended.compare_exchange(0, 3, SeqCst, SeqCst);
+                            producer.fail_capture(Failure::Backend);
+                        }
+                        let _ = worker_ended.compare_exchange(0, 1, SeqCst, SeqCst);
+                        drop(native);
+                        drop(scheduling);
+                        drop(apartment);
+                        producer.close();
+                        drop(producer);
+                        worker_ready.notify();
+                    }
+                }
+            })
+            .map_err(|_| (None, CapabilityError::CapacityExceeded))?;
+        match receiver.recv_timeout(startup_timeout) {
+            Ok(Ok((native_format, reader, reservation))) => {
+                let control = reader.control_handle();
+                Ok(Self {
+                    native_format,
+                    trace,
+                    reads: ReadStream::new(reader),
+                    control,
+                    default_cancel: Cancellation::default(),
+                    stop_event,
+                    stop_flag,
+                    ready,
+                    ended,
+                    worker: Mutex::new(Some(worker)),
+                    _reservation: reservation,
+                })
+            }
+            Ok(Err(error)) => {
+                let _ = worker.join();
+                Err((None, error))
+            }
+            Err(_) => {
+                stop_flag.store(true, SeqCst);
+                let _ = stop_event.signal();
+                let cleanup = StartupCleanup::new(stop_flag, worker);
+                Err((Some(cleanup), CapabilityError::CleanupTimeout))
+            }
+        }
+    }
+
+    pub(crate) fn stop_checked(&self, mode: Stop) -> Result<(), CapabilityError> {
+        let _ = self.ended.compare_exchange(0, 1, SeqCst, SeqCst);
+        self.control.stop(mode);
+        self.stop_flag.store(true, SeqCst);
+        let res = self.stop_event.signal();
+        self.ready.notify();
+        res
+    }
+
+    pub(crate) fn poll_read_with_cancel(
+        &self,
+        frames: usize,
+        timeout: Duration,
+        cancel: Cancellation,
+    ) -> Result<ReadResult, ReadError> {
+        poll_read_stream(
+            StreamReadContext {
+                reads: &self.reads,
+                ready: &self.ready,
+                trace: self.trace.as_ref(),
+            },
+            frames,
+            timeout,
+            cancel,
+        )
+    }
+
+    pub(crate) fn poll_read_into_with_cancel(
+        &self,
+        destination: &mut [u8],
+        frames: usize,
+        timeout: Duration,
+        cancel: Cancellation,
+    ) -> Result<ReadResult, ReadError> {
+        poll_read_stream_into(
+            StreamReadContext {
+                reads: &self.reads,
+                ready: &self.ready,
+                trace: self.trace.as_ref(),
+            },
+            self.native_format.pcm.clone(),
+            destination,
+            frames,
+            timeout,
+            cancel,
+        )
+    }
+
+    #[cfg(any(test, feature = "native-tests"))]
+    pub fn from_synthetic_packets(
+        native_format: NativeFormat,
+        clock_domain: u64,
+        packets_bytes: Vec<(Vec<u8>, usize, u64)>,
+        budget: StorageBudget,
+    ) -> Result<Self, CapabilityError> {
+        let stop_event = Arc::new(Event::new(true)?);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(ReadySignal::new());
+        let worker_stop_flag = stop_flag.clone();
+        let worker_ready = ready.clone();
+        let ended = Arc::new(AtomicU32::new(0));
+        let worker_ended = ended.clone();
+        let stride = native_format.pcm.bytes_per_frame();
+        let slot_count = (packets_bytes.len() + 8).clamp(16, 256);
+        let limits = StorageLimits::new(slot_count, 1024, stride, slot_count * 1024 * stride)
+            .map_err(|_| CapabilityError::CapacityExceeded)?;
+        let reservation = budget
+            .reserve(limits, 6024)
+            .map_err(|_| CapabilityError::CapacityExceeded)?;
+        let retained_reservation = reservation.retain();
+        let pool = Pool::new_reserved(limits, 1024, native_format.pcm.clone(), reservation)
+            .map_err(|_| CapabilityError::CapacityExceeded)?;
+        let (mut producer, reader) =
+            ordering::channel(pool, slot_count).map_err(|_| CapabilityError::CapacityExceeded)?;
+        let control = reader.control_handle();
+        let worker = thread::spawn(move || {
+            let mut adapter = Packets::with_clock_domain(clock_domain, true);
+            let mut pos = 0u64;
+            for (bytes, frames, qpc_100ns) in packets_bytes {
+                if producer.control_handle().stopping() || worker_stop_flag.load(SeqCst) {
+                    break;
+                }
+                while !producer.control_handle().stopping() && !worker_stop_flag.load(SeqCst) {
+                    let pkt = Packet {
+                        bytes: &bytes,
+                        silent: false,
+                        frames,
+                        discontinuity: false,
+                        timestamp_error: false,
+                        position: pos,
+                        qpc_100ns,
+                    };
+                    match adapter.publish(&mut producer, pkt, Overflow::DropNewest) {
+                        Offer::Queued => {
+                            pos = pos.saturating_add(frames as u64);
+                            worker_ready.notify();
+                            break;
+                        }
+                        Offer::QueueDropped | Offer::PoolDropped => {
+                            thread::park_timeout(Duration::from_micros(500));
+                        }
+                        Offer::Failed(_) | Offer::Stopped => break,
+                    }
+                }
+            }
+            let _ = worker_ended.compare_exchange(0, 2, SeqCst, SeqCst);
+            producer.close();
+            drop(producer);
+            worker_ready.notify();
+        });
+        Ok(Self {
+            native_format,
+            trace: None,
+            reads: ReadStream::new(reader),
+            control,
+            default_cancel: Cancellation::default(),
+            stop_event,
+            stop_flag,
+            ready,
+            ended,
+            worker: Mutex::new(Some(worker)),
+            _reservation: retained_reservation,
+        })
+    }
+}
+
+impl AudioStreamBackend for PlatformStream {
+    #[inline]
+    fn format(&self) -> &Arc<Format> {
+        &self.native_format.pcm
+    }
+
+    #[inline]
+    fn trace(&self) -> Option<&Arc<Trace>> {
+        self.trace.as_ref()
+    }
+
+    #[inline]
+    fn control_handle(&self) -> ControlHandle {
+        self.control.clone()
+    }
+
+    #[inline]
+    fn default_cancel(&self) -> Cancellation {
+        self.default_cancel.clone()
+    }
+
+    fn end_reason(&self) -> Option<EndReason> {
+        if let Some(failure) = self.control.snapshot().failure {
+            return Some(EndReason::Failed(failure));
+        }
+        match self.ended.load(SeqCst) {
+            1 => Some(EndReason::Stopped),
+            2 => Some(EndReason::TargetExited),
+            3 => Some(EndReason::Failed(Failure::Backend)),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn read_with_cancel(
+        &mut self,
+        frames: usize,
+        timeout: Duration,
+        cancel: Cancellation,
+    ) -> Result<ReadResult, ReadError> {
+        self.poll_read_with_cancel(frames, timeout, cancel)
+    }
+
+    #[inline]
+    fn read_into_with_cancel(
+        &mut self,
+        destination: &mut [u8],
+        frames: usize,
+        timeout: Duration,
+        cancel: Cancellation,
+    ) -> Result<ReadResult, ReadError> {
+        self.poll_read_into_with_cancel(destination, frames, timeout, cancel)
+    }
+
+    fn stop(&self, mode: Stop) {
+        let _ = self.stop_checked(mode);
+    }
+
+    fn resources_done(&self) -> bool {
+        let mut guard = self.worker.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.as_ref().is_some_and(JoinHandle::is_finished)
+            && guard.take().unwrap().join().is_err()
+        {
+            self.control.fail(Failure::Backend);
+        }
+        guard.is_none() && self.control.resources_done()
+    }
+
+    fn wait_cleanup(&self, timeout: Duration) -> bool {
+        let started = Instant::now();
+        while !self.resources_done() && started.elapsed() < timeout {
+            thread::park_timeout(Duration::from_millis(1));
+        }
+        self.resources_done()
+    }
+}
+
+impl OpenableStreamBackend for PlatformStream {
+    #[inline]
+    fn open_with_permission_policy(
+        target: &CaptureTarget,
+        tree_range: ProcessTreeRange,
+        backends: &Backends,
+        overflow: Overflow,
+        timing: TimingRequirement,
+        permission_policy: PermissionPolicy,
+    ) -> Result<Self, CapabilityError> {
+        Self::open_with_permission_policy(
+            target,
+            tree_range,
+            backends,
+            overflow,
+            timing,
+            permission_policy,
+        )
+    }
+}
+
+impl Drop for PlatformStream {
+    fn drop(&mut self) {
+        self.stop(Stop::Abort);
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+
+    #[test]
+    fn backlog_does_not_need_another_event() -> Result<(), CapabilityError> {
+        let mut remaining = 35;
+        let mut consume = || {
+            if remaining == 0 {
+                return Ok(DrainState::Empty);
+            }
+            remaining -= 1;
+            Ok(DrainState::Consumed)
+        };
+        assert_eq!(drain_turn(&mut consume)?, DrainState::Consumed);
+        assert_eq!(drain_turn(&mut consume)?, DrainState::Empty);
+        assert_eq!(remaining, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn stop_and_error_end_the_turn() -> Result<(), CapabilityError> {
+        let mut calls = 0;
+        assert_eq!(
+            drain_turn(|| {
+                calls += 1;
+                Ok(DrainState::Terminal)
+            })?,
+            DrainState::Terminal
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(
+            drain_turn(|| Err(CapabilityError::DeviceUnavailable)),
+            Err(CapabilityError::DeviceUnavailable)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn startup_cleanup_preserves_worker_ownership_on_timeout() -> Result<(), CapabilityError> {
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop_flag.clone();
+        let worker = thread::spawn(move || {
+            while !worker_stop.load(SeqCst) {
+                thread::park_timeout(Duration::from_millis(5));
+            }
+        });
+        let cleanup = StartupCleanup::new(stop_flag, worker);
+        assert!(!cleanup.is_complete());
+        assert!(cleanup.wait(Duration::from_millis(500)));
+        assert!(cleanup.is_complete());
+        Ok(())
+    }
+
+    fn read_into_via_generic_stream<B: AudioStreamBackend>(
+        stream: &mut crate::core::traits::AudioStream<B>,
+        dst: &mut [u8],
+        frames: usize,
+        timeout: Duration,
+    ) -> Result<ReadResult, ReadError> {
+        stream.read_into(dst, frames, timeout)
+    }
+
+    #[test]
+    fn endpoint_stream_read_into_is_zero_allocation_and_zero_timeout_nonblocking()
+    -> Result<(), CapabilityError> {
+        let fmt = Arc::new(
+            Format::new(
+                SampleType::F32,
+                ByteOrder::Little,
+                48_000,
+                2,
+                Layout::Known(Arc::from([Channel::FrontLeft, Channel::FrontRight])),
+            )
+            .unwrap(),
+        );
+        let budget = StorageBudget::new(4, 4 * 1024 * 1024).unwrap();
+        let pkts: Vec<(Vec<u8>, usize, u64)> = (0..12usize)
+            .map(|p| (vec![0u8; 256 * 8], 256, 1_000_000 + (p as u64) * 53_333))
+            .collect();
+        let mut stream = crate::AudioStream::new(PlatformStream::from_synthetic_packets(
+            NativeFormat {
+                target: CaptureTarget::device("synth-dev").unwrap(),
+                native_mix_known: true,
+                endpoint: "synth-dev".into(),
+                pcm: fmt,
+                buffer_frames: 2560,
+                channel_mask: Some(0x3),
+            },
+            1,
+            pkts,
+            budget,
+        )?);
+        let mut dst = [0u8; 256 * 8];
+        let _ = read_into_via_generic_stream(&mut stream, &mut dst, 256, Duration::from_millis(50))
+            .unwrap();
+        let allocs = allocation_counter::measure(|| {
+            for _ in 0..8 {
+                let _ = read_into_via_generic_stream(
+                    &mut stream,
+                    &mut dst,
+                    256,
+                    Duration::from_millis(20),
+                )
+                .unwrap();
+            }
+        });
+        assert_eq!(allocs.count_total, 0);
+        stream.stop(Stop::Abort);
+        assert!(stream.wait_cleanup(Duration::from_secs(2)));
+        Ok(())
+    }
+}
