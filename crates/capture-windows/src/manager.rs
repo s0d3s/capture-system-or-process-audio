@@ -1588,3 +1588,1051 @@ impl PlatformManager {
                     }
                 }
 
+                if target_exited {
+                    if let Some(old) = streams[idx].take() {
+                        old.stop(Stop::Drain);
+                        let _ = old.wait_cleanup(cleanup_timeout);
+                    }
+                    match targets_ref.targets()[idx].on_root_exit() {
+                        OnRootExit::Stop => {
+                            let _ = multi.set_input_state(idx, ParticipationState::Exited);
+                        }
+                        OnRootExit::Wait { wait_timeout_ns } => {
+                            wait_deadlines[idx] =
+                                Some(Instant::now() + Duration::from_nanos(wait_timeout_ns));
+                            let _ = multi.set_input_state(idx, ParticipationState::WaitingRelaunch);
+                        }
+                    }
+                } else if target_failed {
+                    if let Some(old) = streams[idx].take() {
+                        old.stop(Stop::Abort);
+                    }
+                    let _ = multi.set_input_state(idx, ParticipationState::Failed(13));
+                }
+            }
+
+            if pushed_any
+                || targets_ref.mixer_config().silence_on_idle
+                || timeout.is_zero()
+                || call_started.elapsed() >= timeout
+                || cancel.is_cancelled()
+            {
+                break;
+            }
+            thread::park_timeout(
+                Duration::from_millis(5).min(timeout.saturating_sub(call_started.elapsed())),
+            );
+        }
+
+        started_at.elapsed().as_nanos() as u64
+    }
+}
+
+impl CaptureManagerBackend for PlatformManager {
+    fn open_with_options(
+        request: CaptureRequest,
+        overflow: Overflow,
+        timing: TimingRequirement,
+    ) -> Result<Self, CapabilityError> {
+        Self::open_impl(request, overflow, timing)
+    }
+
+    #[inline]
+    fn plan(&self) -> &CapturePlanReport {
+        &self.plan
+    }
+
+    #[inline]
+    fn selected_backend(&self) -> BackendId {
+        BackendId::Wasapi
+    }
+
+    #[inline]
+    fn is_software_mix(&self) -> bool {
+        matches!(self.engine, PlatformExecutionEngine::SoftwareMix { .. })
+    }
+
+    fn working_format(&self) -> Option<&Arc<Format>> {
+        match &self.engine {
+            PlatformExecutionEngine::PassThrough { stream, .. } => {
+                stream.as_deref().map(AudioStreamBackend::format)
+            }
+            PlatformExecutionEngine::SoftwareMix { multi, .. } => Some(multi.working_format()),
+        }
+    }
+
+    fn output_format(&self) -> Option<&Arc<Format>> {
+        match &self.engine {
+            PlatformExecutionEngine::PassThrough { stream, .. } => {
+                stream.as_deref().map(AudioStreamBackend::format)
+            }
+            PlatformExecutionEngine::SoftwareMix { multi, .. } => Some(multi.output_format()),
+        }
+    }
+
+    #[inline]
+    fn targets(&self) -> &[CaptureTarget] {
+        self.request.targets()
+    }
+
+    fn input_handles(&self) -> &[InputStatusHandle] {
+        match &self.engine {
+            PlatformExecutionEngine::SoftwareMix { multi, .. } => multi.input_handles(),
+            PlatformExecutionEngine::PassThrough { .. } => &[],
+        }
+    }
+
+    fn membership_descriptor(&self) -> Option<MembershipDescriptor> {
+        match &self.engine {
+            PlatformExecutionEngine::SoftwareMix { multi, .. } => {
+                Some(multi.membership_descriptor())
+            }
+            PlatformExecutionEngine::PassThrough { .. } => None,
+        }
+    }
+
+    #[inline]
+    fn last_block_metadata(&self) -> Option<MixedBlockMetadata> {
+        self.last_metadata
+    }
+
+    #[inline]
+    fn session_id(&self) -> u64 {
+        self.session_counter
+    }
+
+    #[inline]
+    fn segment_id(&self) -> u64 {
+        self.segment_counter
+    }
+
+    #[inline]
+    fn on_format_change(&self) -> OnFormatChange {
+        self.request.on_format_change()
+    }
+
+    #[inline]
+    fn route_guard(&self) -> Option<&RouteRollbackGuard> {
+        Some(&self.route_guard)
+    }
+
+    fn update_targets(&mut self, new_targets: Vec<CaptureTarget>) -> Result<u64, CapabilityError> {
+        self.update_targets_impl(new_targets)
+    }
+
+    fn notify_default_device_changed(
+        &mut self,
+        new_device_id: Option<&str>,
+    ) -> Result<bool, CapabilityError> {
+        self.notify_default_flow_changed(TargetKind::DefaultOutput, new_device_id)
+    }
+
+    fn notify_default_input_changed(
+        &mut self,
+        new_device_id: Option<&str>,
+    ) -> Result<bool, CapabilityError> {
+        self.notify_default_flow_changed(TargetKind::DefaultInput, new_device_id)
+    }
+
+    fn reopen_relaunched_target(
+        &mut self,
+        target_index: usize,
+        new_pid: u32,
+    ) -> Result<(), CapabilityError> {
+        self.reopen_relaunched_target_impl(target_index, new_pid)
+    }
+
+    #[inline]
+    fn default_cancel(&self) -> Cancellation {
+        self.default_cancel.clone()
+    }
+
+    fn read_with_cancel(
+        &mut self,
+        frames: usize,
+        timeout: Duration,
+        cancel: Cancellation,
+    ) -> Result<ReadResult, ReadError> {
+        if frames == 0 {
+            return Err(ReadError::InvalidRequest);
+        }
+        self.poll_default_device_follow();
+        let _guard = self.read_lock.try_lock().map_err(|err| match err {
+            TryLockError::WouldBlock => ReadError::AlreadyPending,
+            TryLockError::Poisoned(_) => ReadError::Poisoned,
+        })?;
+
+        if let Some(boundary) = self.pending_boundary.take() {
+            return Ok(ReadResult {
+                frames: 0,
+                chunks: Vec::new(),
+                first_packet: None,
+                last_packet: None,
+                reason: PartialReason::Boundary,
+                control: Some(ordering::Control {
+                    sequence: 0,
+                    generation: boundary.session,
+                    segment: boundary.segment,
+                    format: boundary.format,
+                    kind: ordering::ControlKind::Recovered,
+                    losses: ordering::Losses::default(),
+                    records: 1,
+                }),
+                copies: Default::default(),
+            });
+        }
+
+        if self.stopped {
+            return Ok(ReadResult {
+                frames: 0,
+                chunks: Vec::new(),
+                first_packet: None,
+                last_packet: None,
+                reason: PartialReason::Eof,
+                control: None,
+                copies: Default::default(),
+            });
+        }
+        if self.terminal_error.is_some() {
+            return Ok(ReadResult {
+                frames: 0,
+                chunks: Vec::new(),
+                first_packet: None,
+                last_packet: None,
+                reason: PartialReason::Failure(Failure::Backend),
+                control: None,
+                copies: Default::default(),
+            });
+        }
+        if cancel.is_cancelled() {
+            return Ok(ReadResult {
+                frames: 0,
+                chunks: Vec::new(),
+                first_packet: None,
+                last_packet: None,
+                reason: PartialReason::Cancelled,
+                control: None,
+                copies: Default::default(),
+            });
+        }
+        drop(_guard);
+
+        match &mut self.engine {
+            PlatformExecutionEngine::PassThrough {
+                stream,
+                waiting_relaunch,
+                wait_deadline,
+            } => {
+                let Some(active) = stream.as_mut() else {
+                    return Ok(ReadResult {
+                        frames: 0,
+                        chunks: Vec::new(),
+                        first_packet: None,
+                        last_packet: None,
+                        reason: PartialReason::Eof,
+                        control: None,
+                        copies: Default::default(),
+                    });
+                };
+                let res = active.read_with_cancel(frames, timeout, cancel)?;
+                if res.reason == PartialReason::Eof
+                    && active.end_reason() == Some(EndReason::TargetExited)
+                    && let Some(t) = self.request.targets().first()
+                    && let OnRootExit::Wait { wait_timeout_ns } = t.on_root_exit()
+                    && !*waiting_relaunch
+                {
+                    *waiting_relaunch = true;
+                    *wait_deadline = Some(Instant::now() + Duration::from_nanos(wait_timeout_ns));
+                }
+                if res.frames > 0 {
+                    self.last_metadata = Some(MixedBlockMetadata {
+                        membership_version: self.segment_counter,
+                        contributing_mask: 1,
+                        late_inputs: 0,
+                        failed_inputs: 0,
+                        nonfinite_inputs: 0,
+                        synthesized_silence: false,
+                        clipped_samples: 0,
+                        nonfinite_samples: 0,
+                        drift_slips: 0,
+                        skew_estimate_ns: Some(0),
+                        skew_uncertainty_ns: Some(0),
+                    });
+                }
+                Ok(res)
+            }
+            PlatformExecutionEngine::SoftwareMix { multi, .. } => {
+                if let Some((res, meta)) = multi.try_pop_pending_owned(frames)? {
+                    self.last_metadata = Some(meta);
+                    return Ok(res);
+                }
+                let now_ns = self.drain_software_mix_inputs(timeout, &cancel);
+                if cancel.is_cancelled() {
+                    return Ok(ReadResult {
+                        frames: 0,
+                        chunks: Vec::new(),
+                        first_packet: None,
+                        last_packet: None,
+                        reason: PartialReason::Cancelled,
+                        control: None,
+                        copies: Default::default(),
+                    });
+                }
+                let align_ns = self.request.mixer_config().alignment_window_ns;
+                let PlatformExecutionEngine::SoftwareMix { multi, .. } = &self.engine else {
+                    unreachable!()
+                };
+                let (res, meta) = multi.read_mixed_owned(frames, now_ns, align_ns)?;
+                self.last_metadata = Some(meta);
+                Ok(res)
+            }
+        }
+    }
+
+    fn read_into_with_cancel(
+        &mut self,
+        destination: &mut [u8],
+        frames: usize,
+        timeout: Duration,
+        cancel: Cancellation,
+    ) -> Result<ReadResult, ReadError> {
+        if frames == 0 {
+            return Err(ReadError::InvalidRequest);
+        }
+        self.poll_default_device_follow();
+        let _guard = self.read_lock.try_lock().map_err(|err| match err {
+            TryLockError::WouldBlock => ReadError::AlreadyPending,
+            TryLockError::Poisoned(_) => ReadError::Poisoned,
+        })?;
+
+        if let Some(boundary) = self.pending_boundary.take() {
+            return Ok(ReadResult {
+                frames: 0,
+                chunks: Vec::new(),
+                first_packet: None,
+                last_packet: None,
+                reason: PartialReason::Boundary,
+                control: Some(ordering::Control {
+                    sequence: 0,
+                    generation: boundary.session,
+                    segment: boundary.segment,
+                    format: boundary.format,
+                    kind: ordering::ControlKind::Recovered,
+                    losses: ordering::Losses::default(),
+                    records: 1,
+                }),
+                copies: Default::default(),
+            });
+        }
+
+        if self.stopped {
+            return Ok(ReadResult {
+                frames: 0,
+                chunks: Vec::new(),
+                first_packet: None,
+                last_packet: None,
+                reason: PartialReason::Eof,
+                control: None,
+                copies: Default::default(),
+            });
+        }
+        if self.terminal_error.is_some() {
+            return Ok(ReadResult {
+                frames: 0,
+                chunks: Vec::new(),
+                first_packet: None,
+                last_packet: None,
+                reason: PartialReason::Failure(Failure::Backend),
+                control: None,
+                copies: Default::default(),
+            });
+        }
+        if cancel.is_cancelled() {
+            return Ok(ReadResult {
+                frames: 0,
+                chunks: Vec::new(),
+                first_packet: None,
+                last_packet: None,
+                reason: PartialReason::Cancelled,
+                control: None,
+                copies: Default::default(),
+            });
+        }
+        drop(_guard);
+
+        match &mut self.engine {
+            PlatformExecutionEngine::PassThrough {
+                stream,
+                waiting_relaunch,
+                wait_deadline,
+            } => {
+                let Some(active) = stream.as_mut() else {
+                    return Ok(ReadResult {
+                        frames: 0,
+                        chunks: Vec::new(),
+                        first_packet: None,
+                        last_packet: None,
+                        reason: PartialReason::Eof,
+                        control: None,
+                        copies: Default::default(),
+                    });
+                };
+                let res = active.read_into_with_cancel(destination, frames, timeout, cancel)?;
+                if res.reason == PartialReason::Eof
+                    && active.end_reason() == Some(EndReason::TargetExited)
+                    && let Some(t) = self.request.targets().first()
+                    && let OnRootExit::Wait { wait_timeout_ns } = t.on_root_exit()
+                    && !*waiting_relaunch
+                {
+                    *waiting_relaunch = true;
+                    *wait_deadline = Some(Instant::now() + Duration::from_nanos(wait_timeout_ns));
+                }
+                if res.frames > 0 {
+                    self.last_metadata = Some(MixedBlockMetadata {
+                        membership_version: self.segment_counter,
+                        contributing_mask: 1,
+                        late_inputs: 0,
+                        failed_inputs: 0,
+                        nonfinite_inputs: 0,
+                        synthesized_silence: false,
+                        clipped_samples: 0,
+                        nonfinite_samples: 0,
+                        drift_slips: 0,
+                        skew_estimate_ns: Some(0),
+                        skew_uncertainty_ns: Some(0),
+                    });
+                }
+                Ok(res)
+            }
+            PlatformExecutionEngine::SoftwareMix { multi, .. } => {
+                let out_stride = multi.output_format().bytes_per_frame();
+                if destination.len() < frames.saturating_mul(out_stride) {
+                    return Err(ReadError::InvalidDestination);
+                }
+                if let Some((res, meta)) = multi.try_pop_pending_into(destination, frames)? {
+                    self.last_metadata = Some(meta);
+                    return Ok(res);
+                }
+                let now_ns = self.drain_software_mix_inputs(timeout, &cancel);
+                if cancel.is_cancelled() {
+                    return Ok(ReadResult {
+                        frames: 0,
+                        chunks: Vec::new(),
+                        first_packet: None,
+                        last_packet: None,
+                        reason: PartialReason::Cancelled,
+                        control: None,
+                        copies: Default::default(),
+                    });
+                }
+                let align_ns = self.request.mixer_config().alignment_window_ns;
+                let PlatformExecutionEngine::SoftwareMix { multi, .. } = &self.engine else {
+                    unreachable!()
+                };
+                let (res, meta) = multi.read_mixed_into(destination, frames, now_ns, align_ns)?;
+                self.last_metadata = Some(meta);
+                Ok(res)
+            }
+        }
+    }
+
+    fn stop(&mut self, mode: Stop) {
+        self.stopped = true;
+        self.default_observer = None;
+        self.default_input_observer = None;
+        if mode == Stop::Abort {
+            self.pending_boundary = None;
+        }
+        if let Some(cleanup) = &self.pending_cleanup {
+            cleanup.cancel();
+        }
+        match &mut self.engine {
+            PlatformExecutionEngine::PassThrough {
+                stream,
+                waiting_relaunch,
+                wait_deadline,
+            } => {
+                *waiting_relaunch = false;
+                *wait_deadline = None;
+                if let Some(active) = stream.as_ref() {
+                    active.stop(mode);
+                }
+            }
+            PlatformExecutionEngine::SoftwareMix {
+                multi,
+                streams,
+                wait_deadlines,
+                ..
+            } => {
+                if mode == Stop::Abort {
+                    multi.clear_pending_output();
+                }
+                for d in wait_deadlines.iter_mut() {
+                    *d = None;
+                }
+                for stream in streams.iter().flatten() {
+                    stream.stop(mode);
+                }
+            }
+        }
+    }
+
+    fn wait_cleanup(&mut self, timeout: Duration) -> bool {
+        let started = Instant::now();
+        match &mut self.engine {
+            PlatformExecutionEngine::PassThrough { stream, .. } => {
+                if let Some(active) = stream.as_ref() {
+                    let _ = active.wait_cleanup(timeout);
+                }
+            }
+            PlatformExecutionEngine::SoftwareMix { streams, .. } => {
+                for stream in streams.iter().flatten() {
+                    let rem = timeout.saturating_sub(started.elapsed());
+                    let _ = stream.wait_cleanup(rem);
+                }
+            }
+        }
+        if let Some(cleanup) = &self.pending_cleanup {
+            let rem = timeout.saturating_sub(started.elapsed());
+            let _ = cleanup.wait(rem);
+        }
+        self.resources_done()
+    }
+
+    fn resources_done(&self) -> bool {
+        let engine_done = match &self.engine {
+            PlatformExecutionEngine::PassThrough { stream, .. } => stream
+                .as_deref()
+                .is_none_or(AudioStreamBackend::resources_done),
+            PlatformExecutionEngine::SoftwareMix { streams, .. } => streams
+                .iter()
+                .flatten()
+                .all(AudioStreamBackend::resources_done),
+        };
+        let cleanup_done = self
+            .pending_cleanup
+            .as_ref()
+            .is_none_or(StartupCleanup::is_complete);
+        engine_done && cleanup_done
+    }
+}
+
+impl Drop for PlatformManager {
+    fn drop(&mut self) {
+        self.stop(Stop::Abort);
+        let _ = self.wait_cleanup(self.cleanup_timeout.min(Duration::from_millis(500)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        CaptureManager, NativeFormat,
+        core::schema::{CombineMode, DitherMode, InputConversionPolicy, OutputConverterConfig},
+    };
+
+    fn read_into_via_generic_manager<B: CaptureManagerBackend>(
+        mgr: &mut crate::core::traits::CaptureManager<B>,
+        dst: &mut [u8],
+        frames: usize,
+        timeout: Duration,
+    ) -> Result<ReadResult, ReadError> {
+        mgr.read_into(dst, frames, timeout)
+    }
+
+    fn make_tone_packets_i16_mono(
+        rate_hz: u32,
+        freq_hz: f64,
+        packets: usize,
+        frames_per_pkt: usize,
+    ) -> Vec<(Vec<u8>, usize, u64)> {
+        let mut out = Vec::with_capacity(packets);
+        let step_qpc = (frames_per_pkt as u64 * 10_000_000) / u64::from(rate_hz);
+        for p in 0..packets {
+            let mut bytes = Vec::with_capacity(frames_per_pkt * 2);
+            for n in 0..frames_per_pkt {
+                let idx = p * frames_per_pkt + n;
+                let t = idx as f64 / f64::from(rate_hz);
+                let v = (0.25 * (2.0 * std::f64::consts::PI * freq_hz * t).sin() * 32767.0).round()
+                    as i16;
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            out.push((bytes, frames_per_pkt, 1_000_000 + (p as u64) * step_qpc));
+        }
+        out
+    }
+
+    fn make_tone_packets_f32_stereo(
+        rate_hz: u32,
+        freq_l: f64,
+        freq_r: f64,
+        packets: usize,
+        frames_per_pkt: usize,
+    ) -> Vec<(Vec<u8>, usize, u64)> {
+        let mut out = Vec::with_capacity(packets);
+        let step_qpc = (frames_per_pkt as u64 * 10_000_000) / u64::from(rate_hz);
+        for p in 0..packets {
+            let mut bytes = Vec::with_capacity(frames_per_pkt * 8);
+            for n in 0..frames_per_pkt {
+                let idx = p * frames_per_pkt + n;
+                let t = idx as f64 / f64::from(rate_hz);
+                let l = (0.25 * (2.0 * std::f64::consts::PI * freq_l * t).sin()) as f32;
+                let r = (0.25 * (2.0 * std::f64::consts::PI * freq_r * t).sin()) as f32;
+                bytes.extend_from_slice(&l.to_le_bytes());
+                bytes.extend_from_slice(&r.to_le_bytes());
+            }
+            out.push((bytes, frames_per_pkt, 1_000_000 + (p as u64) * step_qpc));
+        }
+        out
+    }
+
+    #[test]
+    fn unified_manager_heterogeneous_mix_runs_zero_steady_allocations_and_preserves_tones()
+    -> Result<(), CapabilityError> {
+        let mic_fmt = Arc::new(
+            Format::new(
+                SampleType::I16,
+                ByteOrder::Little,
+                16_000,
+                1,
+                Layout::Known(Arc::from([Channel::Mono])),
+            )
+            .unwrap(),
+        );
+        let sys_fmt = Arc::new(
+            Format::new(
+                SampleType::F32,
+                ByteOrder::Little,
+                48_000,
+                2,
+                Layout::Known(Arc::from([Channel::FrontLeft, Channel::FrontRight])),
+            )
+            .unwrap(),
+        );
+        let budget = StorageBudget::new(8, 32 * 1024 * 1024).unwrap();
+        let mic_pkts = make_tone_packets_i16_mono(16_000, 500.0, 50, 160);
+        let sys_pkts = make_tone_packets_f32_stereo(48_000, 1000.0, 1500.0, 50, 480);
+
+        let mic_target = CaptureTarget::input_device("synth-mic-0").unwrap();
+        let sys_target = CaptureTarget::device("synth-sys-0").unwrap();
+        let mic_stream = PlatformStream::from_synthetic_packets(
+            NativeFormat {
+                target: mic_target.clone(),
+                native_mix_known: true,
+                endpoint: "synth-mic-0".into(),
+                pcm: mic_fmt,
+                buffer_frames: 1600,
+                channel_mask: Some(0x4),
+            },
+            crate::core::stream_runtime::endpoint_clock_domain("synth-mic-0", 2),
+            mic_pkts,
+            budget.clone(),
+        )?;
+        let sys_stream = PlatformStream::from_synthetic_packets(
+            NativeFormat {
+                target: sys_target.clone(),
+                native_mix_known: true,
+                endpoint: "synth-sys-0".into(),
+                pcm: sys_fmt,
+                buffer_frames: 4800,
+                channel_mask: Some(0x3),
+            },
+            1,
+            sys_pkts,
+            budget.clone(),
+        )?;
+
+        let req = CaptureRequest::new(vec![mic_target, sys_target]);
+        let mut mgr = CaptureManager::from_backend(PlatformManager::from_synthetic_streams(
+            req,
+            vec![mic_stream, sys_stream],
+            budget,
+        )?);
+        assert!(mgr.is_software_mix());
+        assert!(mgr.route_guard().is_some_and(|g| !g.allow_reroute()));
+        assert_eq!(mgr.working_format().unwrap().rate(), 48_000);
+        assert_eq!(mgr.working_format().unwrap().channels(), 2);
+        assert!(mgr.input_handles()[0].is_resampled());
+        assert!(!mgr.input_handles()[0].is_identity_bypass());
+        assert!(!mgr.input_handles()[1].is_resampled());
+        assert!(mgr.input_handles()[1].is_identity_bypass());
+
+        let mut dst = [0u8; 256 * 8];
+        let mut mixed_samples = Vec::with_capacity(48_000);
+        for _ in 0..2 {
+            let res =
+                read_into_via_generic_manager(&mut mgr, &mut dst, 256, Duration::from_millis(40))
+                    .unwrap();
+            for b in dst[..res.frames * 8].chunks_exact(4) {
+                mixed_samples.push(f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+            }
+        }
+        let mut measured_reads = 0usize;
+        let allocs = allocation_counter::measure(|| {
+            for _ in 0..64 {
+                let res = read_into_via_generic_manager(
+                    &mut mgr,
+                    &mut dst,
+                    256,
+                    Duration::from_millis(40),
+                )
+                .unwrap();
+                if res.frames > 0 {
+                    measured_reads += 1;
+                }
+            }
+        });
+        assert!(measured_reads >= 40);
+        assert_eq!(
+            allocs.count_total, 0,
+            "CaptureManager<PlatformManager>::read_into allocated {} times in steady state",
+            allocs.count_total
+        );
+
+        drop(mgr);
+        let budget2 = StorageBudget::new(8, 32 * 1024 * 1024).unwrap();
+        let mic_t2 = CaptureTarget::input_device("synth-mic-1").unwrap();
+        let sys_t2 = CaptureTarget::device("synth-sys-1").unwrap();
+        let m2 = PlatformStream::from_synthetic_packets(
+            NativeFormat {
+                target: mic_t2.clone(),
+                native_mix_known: true,
+                endpoint: "synth-mic-1".into(),
+                pcm: Arc::new(
+                    Format::new(
+                        SampleType::I16,
+                        ByteOrder::Little,
+                        16_000,
+                        1,
+                        Layout::Known(Arc::from([Channel::Mono])),
+                    )
+                    .unwrap(),
+                ),
+                buffer_frames: 1600,
+                channel_mask: Some(0x4),
+            },
+            3,
+            make_tone_packets_i16_mono(16_000, 500.0, 40, 160),
+            budget2.clone(),
+        )?;
+        let s2 = PlatformStream::from_synthetic_packets(
+            NativeFormat {
+                target: sys_t2.clone(),
+                native_mix_known: true,
+                endpoint: "synth-sys-1".into(),
+                pcm: Arc::new(
+                    Format::new(
+                        SampleType::F32,
+                        ByteOrder::Little,
+                        48_000,
+                        2,
+                        Layout::Known(Arc::from([Channel::FrontLeft, Channel::FrontRight])),
+                    )
+                    .unwrap(),
+                ),
+                buffer_frames: 4800,
+                channel_mask: Some(0x3),
+            },
+            1,
+            make_tone_packets_f32_stereo(48_000, 1000.0, 1500.0, 40, 480),
+            budget2.clone(),
+        )?;
+        let mut mgr2 = CaptureManager::from_backend(PlatformManager::from_synthetic_streams(
+            CaptureRequest::new(vec![mic_t2, sys_t2]),
+            vec![m2, s2],
+            budget2,
+        )?);
+        mixed_samples.clear();
+        for _ in 0..80 {
+            let res = mgr2
+                .read_into(&mut dst, 256, Duration::from_millis(40))
+                .unwrap();
+            for b in dst[..res.frames * 8].chunks_exact(4) {
+                mixed_samples.push(f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+            }
+            if mixed_samples.len() >= 14_400 * 2 {
+                break;
+            }
+        }
+        mgr2.stop(Stop::Abort);
+        assert!(mgr2.wait_cleanup(Duration::from_secs(2)));
+        assert!(mixed_samples.len() >= 9_600 * 2);
+
+        let window_frames = 4_800usize;
+        let start_frame = 2_400usize;
+        let tone_amp = |ch_offset: usize, freq: f64| -> f64 {
+            let (mut sin_acc, mut cos_acc) = (0.0_f64, 0.0_f64);
+            for k in 0..window_frames {
+                let s = f64::from(mixed_samples[(start_frame + k) * 2 + ch_offset]);
+                let angle = 2.0 * std::f64::consts::PI * freq * (k as f64 / 48_000.0);
+                sin_acc += s * angle.sin();
+                cos_acc += s * angle.cos();
+            }
+            2.0 * sin_acc.hypot(cos_acc) / (window_frames as f64)
+        };
+        assert!((tone_amp(0, 500.0) - 0.25).abs() < 2e-4);
+        assert!((tone_amp(1, 500.0) - 0.25).abs() < 2e-4);
+        assert!((tone_amp(0, 1000.0) - 0.25).abs() < 1e-5);
+        assert!(tone_amp(1, 1000.0) < 1e-5);
+        assert!(tone_amp(0, 1500.0) < 1e-5);
+        assert!((tone_amp(1, 1500.0) - 0.25).abs() < 1e-5);
+        Ok(())
+    }
+
+    #[test]
+    fn unified_manager_enforces_on_format_change_fail_strict_no_resample_and_single_target_mixer_routing()
+    -> Result<(), CapabilityError> {
+        let fmt_48k = Arc::new(
+            Format::new(
+                SampleType::F32,
+                ByteOrder::Little,
+                48_000,
+                2,
+                Layout::Known(Arc::from([Channel::FrontLeft, Channel::FrontRight])),
+            )
+            .unwrap(),
+        );
+        let fmt_44k = Arc::new(
+            Format::new(
+                SampleType::F32,
+                ByteOrder::Little,
+                44_100,
+                2,
+                Layout::Known(Arc::from([Channel::FrontLeft, Channel::FrontRight])),
+            )
+            .unwrap(),
+        );
+        let budget = StorageBudget::new(8, 16 * 1024 * 1024).unwrap();
+
+        let gain_target = CaptureTarget::device("synth-gain")
+            .unwrap()
+            .with_gain(0.5)
+            .unwrap();
+        let gain_stream = PlatformStream::from_synthetic_packets(
+            NativeFormat {
+                target: gain_target.clone(),
+                native_mix_known: true,
+                endpoint: "synth-gain".into(),
+                pcm: fmt_48k.clone(),
+                buffer_frames: 4800,
+                channel_mask: Some(0x3),
+            },
+            1,
+            make_tone_packets_f32_stereo(48_000, 1000.0, 1000.0, 4, 480),
+            budget.clone(),
+        )?;
+        let gain_mgr = CaptureManager::from_backend(PlatformManager::from_synthetic_streams(
+            CaptureRequest::single(gain_target),
+            vec![gain_stream],
+            budget.clone(),
+        )?);
+        assert!(gain_mgr.is_software_mix());
+        drop(gain_mgr);
+
+        let i16_16k = Format::new(
+            SampleType::I16,
+            ByteOrder::Little,
+            16_000,
+            1,
+            Layout::Known(Arc::from([Channel::Mono])),
+        )
+        .unwrap();
+        let conv_target = CaptureTarget::device("synth-conv").unwrap();
+        let conv_stream = PlatformStream::from_synthetic_packets(
+            NativeFormat {
+                target: conv_target.clone(),
+                native_mix_known: true,
+                endpoint: "synth-conv".into(),
+                pcm: fmt_48k.clone(),
+                buffer_frames: 4800,
+                channel_mask: Some(0x3),
+            },
+            1,
+            make_tone_packets_f32_stereo(48_000, 1000.0, 1000.0, 4, 480),
+            budget.clone(),
+        )?;
+        let mut conv_mgr = CaptureManager::from_backend(PlatformManager::from_synthetic_streams(
+            CaptureRequest::single(conv_target)
+                .with_output_converter(Some(OutputConverterConfig::new(i16_16k, DitherMode::None))),
+            vec![conv_stream],
+            budget.clone(),
+        )?);
+        assert!(conv_mgr.is_software_mix());
+        assert_eq!(conv_mgr.output_format().unwrap().rate(), 16_000);
+        let mut i16_dst = [0u8; 160 * 2];
+        let conv_res = conv_mgr
+            .read_into(&mut i16_dst, 160, Duration::from_millis(40))
+            .unwrap();
+        assert_eq!(conv_res.frames, 160);
+        drop(conv_mgr);
+
+        let follow_out = CaptureTarget::default_output(DefaultDeviceMode::Follow);
+        let pt_s1 = PlatformStream::from_synthetic_packets(
+            NativeFormat {
+                target: follow_out.clone(),
+                native_mix_known: true,
+                endpoint: "out-48k".into(),
+                pcm: fmt_48k.clone(),
+                buffer_frames: 4800,
+                channel_mask: Some(0x3),
+            },
+            1,
+            make_tone_packets_f32_stereo(48_000, 440.0, 440.0, 2, 480),
+            budget.clone(),
+        )?;
+        let pt_s2 = PlatformStream::from_synthetic_packets(
+            NativeFormat {
+                target: follow_out.clone(),
+                native_mix_known: true,
+                endpoint: "out-44k".into(),
+                pcm: fmt_44k.clone(),
+                buffer_frames: 4410,
+                channel_mask: Some(0x3),
+            },
+            1,
+            make_tone_packets_f32_stereo(44_100, 440.0, 440.0, 2, 441),
+            budget.clone(),
+        )?;
+        let mut pt_fail_mgr = PlatformManager::from_synthetic_streams(
+            CaptureRequest::single(follow_out.clone()).with_on_format_change(OnFormatChange::Fail),
+            vec![pt_s1],
+            budget.clone(),
+        )?;
+        assert!(!pt_fail_mgr.is_software_mix());
+        assert_eq!(
+            pt_fail_mgr.apply_opened_default_stream_for_test(TargetKind::DefaultOutput, pt_s2),
+            Err(CapabilityError::FormatChangeRejected)
+        );
+        drop(pt_fail_mgr);
+
+        let mix_s1 = PlatformStream::from_synthetic_packets(
+            NativeFormat {
+                target: follow_out.clone(),
+                native_mix_known: true,
+                endpoint: "out-48k".into(),
+                pcm: fmt_48k.clone(),
+                buffer_frames: 4800,
+                channel_mask: Some(0x3),
+            },
+            1,
+            make_tone_packets_f32_stereo(48_000, 440.0, 440.0, 2, 480),
+            budget.clone(),
+        )?;
+        let mix_s2 = PlatformStream::from_synthetic_packets(
+            NativeFormat {
+                target: follow_out.clone(),
+                native_mix_known: true,
+                endpoint: "out-44k".into(),
+                pcm: fmt_44k.clone(),
+                buffer_frames: 4410,
+                channel_mask: Some(0x3),
+            },
+            1,
+            make_tone_packets_f32_stereo(44_100, 440.0, 440.0, 2, 441),
+            budget.clone(),
+        )?;
+        let mut mix_fail_mgr = PlatformManager::from_synthetic_streams(
+            CaptureRequest::single(follow_out)
+                .with_combine_mode(CombineMode::CspaMixer)
+                .with_on_format_change(OnFormatChange::Fail),
+            vec![mix_s1],
+            budget.clone(),
+        )?;
+        assert!(mix_fail_mgr.is_software_mix());
+        assert_eq!(
+            mix_fail_mgr.apply_opened_default_stream_for_test(TargetKind::DefaultOutput, mix_s2),
+            Err(CapabilityError::FormatChangeRejected)
+        );
+        drop(mix_fail_mgr);
+
+        let strict_a = CaptureTarget::device("strict-48k").unwrap();
+        let strict_b = CaptureTarget::input_device("strict-44k").unwrap();
+        let sa = PlatformStream::from_synthetic_packets(
+            NativeFormat {
+                target: strict_a.clone(),
+                native_mix_known: true,
+                endpoint: "strict-48k".into(),
+                pcm: fmt_48k,
+                buffer_frames: 4800,
+                channel_mask: Some(0x3),
+            },
+            1,
+            make_tone_packets_f32_stereo(48_000, 440.0, 440.0, 2, 480),
+            budget.clone(),
+        )?;
+        let sb = PlatformStream::from_synthetic_packets(
+            NativeFormat {
+                target: strict_b.clone(),
+                native_mix_known: true,
+                endpoint: "strict-44k".into(),
+                pcm: fmt_44k,
+                buffer_frames: 4410,
+                channel_mask: Some(0x3),
+            },
+            2,
+            make_tone_packets_f32_stereo(44_100, 440.0, 440.0, 2, 441),
+            budget.clone(),
+        )?;
+        let strict_res = PlatformManager::from_synthetic_streams(
+            CaptureRequest::new(vec![strict_a, strict_b])
+                .with_input_conversion(InputConversionPolicy::StrictNoResample),
+            vec![sa, sb],
+            budget.clone(),
+        );
+        assert_eq!(strict_res.err(), Some(CapabilityError::UnsupportedFormat));
+
+        let can_a = CaptureTarget::device("cancel-a").unwrap();
+        let can_b = CaptureTarget::input_device("cancel-b").unwrap();
+        let fmt_can = Arc::new(
+            Format::new(
+                SampleType::F32,
+                ByteOrder::Little,
+                48_000,
+                2,
+                Layout::Known(Arc::from([Channel::FrontLeft, Channel::FrontRight])),
+            )
+            .unwrap(),
+        );
+        let sc_a = PlatformStream::from_synthetic_packets(
+            NativeFormat {
+                target: can_a.clone(),
+                native_mix_known: true,
+                endpoint: "cancel-a".into(),
+                pcm: fmt_can.clone(),
+                buffer_frames: 4800,
+                channel_mask: Some(0x3),
+            },
+            1,
+            Vec::new(),
+            budget.clone(),
+        )?;
+        let sc_b = PlatformStream::from_synthetic_packets(
+            NativeFormat {
+                target: can_b.clone(),
+                native_mix_known: true,
+                endpoint: "cancel-b".into(),
+                pcm: fmt_can,
+                buffer_frames: 4800,
+                channel_mask: Some(0x3),
+            },
+            2,
+            Vec::new(),
+            budget,
+        )?;
+        let mut can_mgr = CaptureManager::from_backend(PlatformManager::from_synthetic_streams(
+            CaptureRequest::new(vec![can_a, can_b]),
+            vec![sc_a, sc_b],
+            StorageBudget::new(8, 16 * 1024 * 1024).unwrap(),
+        )?);
+        let cancel = Cancellation::default();
+        cancel.cancel();
+        let mut can_dst = [0u8; 256 * 8];
+        let can_res = can_mgr
+            .read_into_with_cancel(&mut can_dst, 256, Duration::from_secs(2), cancel)
+            .unwrap();
+        assert_eq!(can_res.frames, 0);
+        assert_eq!(can_res.reason, PartialReason::Cancelled);
+        Ok(())
+    }
+}
