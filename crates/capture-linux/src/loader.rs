@@ -884,3 +884,721 @@ mod imp {
             }
         }
 
+        /// Invoke `pw_core_sync` via the `spa_interface` vtable on `core`.
+        ///
+        /// # Safety
+        /// `core` must be a valid connected `pw_core *`.
+        pub unsafe fn core_sync(&self, core: *mut c_void, id: u32, seq: c_int) -> c_int {
+            // SAFETY: `core` starts with `struct spa_interface` whose `cb.funcs` points to `pw_core_methods`.
+            unsafe {
+                let iface = &*(core as *const SpaInterface);
+                let methods = &*(iface.cb.funcs as *const PwCoreMethods);
+                if let Some(func) = methods.sync {
+                    func(iface.cb.data, id, seq)
+                } else {
+                    -95
+                }
+            }
+        }
+
+        /// Invoke `pw_core_get_registry` via the `spa_interface` vtable on `core`.
+        ///
+        /// # Safety
+        /// `core` must be a valid connected `pw_core *`.
+        pub unsafe fn core_get_registry(
+            &self,
+            core: *mut c_void,
+            version: u32,
+            user_data_size: usize,
+        ) -> *mut c_void {
+            // SAFETY: `core` starts with `struct spa_interface` whose `cb.funcs` points to `pw_core_methods`.
+            unsafe {
+                let iface = &*(core as *const SpaInterface);
+                let methods = &*(iface.cb.funcs as *const PwCoreMethods);
+                if let Some(func) = methods.get_registry {
+                    func(iface.cb.data, version, user_data_size)
+                } else {
+                    std::ptr::null_mut()
+                }
+            }
+        }
+
+        /// Invoke `pw_core_create_object` via the `spa_interface` vtable on `core`.
+        ///
+        /// # Safety
+        /// `core`, `factory_name`, `type_name`, and `props` must be valid pointers.
+        pub unsafe fn core_create_object(
+            &self,
+            core: *mut c_void,
+            factory_name: *const c_char,
+            type_name: *const c_char,
+            version: u32,
+            props: *const SpaDict,
+            user_data_size: usize,
+        ) -> *mut c_void {
+            // SAFETY: `core` starts with `struct spa_interface` whose `cb.funcs` points to `pw_core_methods`.
+            unsafe {
+                let iface = &*(core as *const SpaInterface);
+                let methods = &*(iface.cb.funcs as *const PwCoreMethods);
+                if let Some(func) = methods.create_object {
+                    func(
+                        iface.cb.data,
+                        factory_name,
+                        type_name,
+                        version,
+                        props,
+                        user_data_size,
+                    )
+                } else {
+                    std::ptr::null_mut()
+                }
+            }
+        }
+
+        /// Invoke `pw_registry_add_listener` via the `spa_interface` vtable on `registry`.
+        ///
+        /// # Safety
+        /// `registry`, `listener`, `events`, and `data` must be valid pointers.
+        pub unsafe fn registry_add_listener(
+            &self,
+            registry: *mut c_void,
+            listener: *mut SpaHook,
+            events: *const PwRegistryEvents,
+            data: *mut c_void,
+        ) -> c_int {
+            // SAFETY: `registry` starts with `struct spa_interface` whose `cb.funcs` points to `pw_registry_methods`.
+            unsafe {
+                let iface = &*(registry as *const SpaInterface);
+                let methods = &*(iface.cb.funcs as *const PwRegistryMethods);
+                if let Some(func) = methods.add_listener {
+                    func(iface.cb.data, listener, events, data)
+                } else {
+                    -95
+                }
+            }
+        }
+
+        /// Invoke `pw_registry_bind` via the `spa_interface` vtable on `registry`.
+        ///
+        /// # Safety
+        /// `registry` and `type_name` must be valid pointers.
+        pub unsafe fn registry_bind(
+            &self,
+            registry: *mut c_void,
+            id: u32,
+            type_name: *const c_char,
+            version: u32,
+            user_data_size: usize,
+        ) -> *mut c_void {
+            // SAFETY: `registry` starts with `struct spa_interface` whose `cb.funcs` points to `pw_registry_methods`.
+            unsafe {
+                let iface = &*(registry as *const SpaInterface);
+                let methods = &*(iface.cb.funcs as *const PwRegistryMethods);
+                if let Some(func) = methods.bind {
+                    func(iface.cb.data, id, type_name, version, user_data_size)
+                } else {
+                    std::ptr::null_mut()
+                }
+            }
+        }
+    }
+
+    pub struct PulseLibrary {
+        pub version: String,
+        pub pa_get_library_version: unsafe extern "C" fn() -> *const c_char,
+        pub pa_strerror: unsafe extern "C" fn(c_int) -> *const c_char,
+        pub pa_threaded_mainloop_new: unsafe extern "C" fn() -> *mut c_void,
+        pub pa_threaded_mainloop_free: unsafe extern "C" fn(*mut c_void),
+        pub pa_threaded_mainloop_start: unsafe extern "C" fn(*mut c_void) -> c_int,
+        pub pa_threaded_mainloop_stop: unsafe extern "C" fn(*mut c_void),
+        pub pa_threaded_mainloop_lock: unsafe extern "C" fn(*mut c_void),
+        pub pa_threaded_mainloop_unlock: unsafe extern "C" fn(*mut c_void),
+        pub pa_threaded_mainloop_wait: unsafe extern "C" fn(*mut c_void),
+        pub pa_threaded_mainloop_signal: unsafe extern "C" fn(*mut c_void, c_int),
+        pub pa_threaded_mainloop_get_api: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+        pub pa_context_new: unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void,
+        pub pa_context_unref: unsafe extern "C" fn(*mut c_void),
+        pub pa_context_connect:
+            unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *const c_void) -> c_int,
+        pub pa_context_disconnect: unsafe extern "C" fn(*mut c_void),
+        pub pa_context_get_state: unsafe extern "C" fn(*const c_void) -> c_int,
+        pub pa_context_set_state_callback: unsafe extern "C" fn(
+            *mut c_void,
+            Option<unsafe extern "C" fn(*mut c_void, *mut c_void)>,
+            *mut c_void,
+        ),
+        pub pa_context_set_subscribe_callback: unsafe extern "C" fn(
+            *mut c_void,
+            Option<unsafe extern "C" fn(*mut c_void, c_int, u32, *mut c_void)>,
+            *mut c_void,
+        ),
+        pub pa_context_subscribe: unsafe extern "C" fn(
+            *mut c_void,
+            c_int,
+            Option<unsafe extern "C" fn(*mut c_void, c_int, *mut c_void)>,
+            *mut c_void,
+        ) -> *mut c_void,
+        pub pa_context_get_server_info: unsafe extern "C" fn(
+            *mut c_void,
+            Option<unsafe extern "C" fn(*mut c_void, *const PaServerInfo, *mut c_void)>,
+            *mut c_void,
+        ) -> *mut c_void,
+        pub pa_context_get_sink_info_list: unsafe extern "C" fn(
+            *mut c_void,
+            Option<unsafe extern "C" fn(*mut c_void, *const PaSinkInfo, c_int, *mut c_void)>,
+            *mut c_void,
+        ) -> *mut c_void,
+        pub pa_context_get_source_info_list: unsafe extern "C" fn(
+            *mut c_void,
+            Option<unsafe extern "C" fn(*mut c_void, *const PaSourceInfo, c_int, *mut c_void)>,
+            *mut c_void,
+        ) -> *mut c_void,
+        pub pa_context_get_sink_input_info_list: unsafe extern "C" fn(
+            *mut c_void,
+            Option<unsafe extern "C" fn(*mut c_void, *const PaSinkInputInfo, c_int, *mut c_void)>,
+            *mut c_void,
+        ) -> *mut c_void,
+        pub pa_context_get_client_info_list: unsafe extern "C" fn(
+            *mut c_void,
+            Option<unsafe extern "C" fn(*mut c_void, *const PaClientInfo, c_int, *mut c_void)>,
+            *mut c_void,
+        ) -> *mut c_void,
+        pub pa_context_move_sink_input_by_index: unsafe extern "C" fn(
+            *mut c_void,
+            u32,
+            u32,
+            Option<unsafe extern "C" fn(*mut c_void, c_int, *mut c_void)>,
+            *mut c_void,
+        ) -> *mut c_void,
+        pub pa_context_move_sink_input_by_name: unsafe extern "C" fn(
+            *mut c_void,
+            u32,
+            *const c_char,
+            Option<unsafe extern "C" fn(*mut c_void, c_int, *mut c_void)>,
+            *mut c_void,
+        ) -> *mut c_void,
+        pub pa_context_load_module: unsafe extern "C" fn(
+            *mut c_void,
+            *const c_char,
+            *const c_char,
+            Option<unsafe extern "C" fn(*mut c_void, u32, *mut c_void)>,
+            *mut c_void,
+        ) -> *mut c_void,
+        pub pa_context_unload_module: unsafe extern "C" fn(
+            *mut c_void,
+            u32,
+            Option<unsafe extern "C" fn(*mut c_void, c_int, *mut c_void)>,
+            *mut c_void,
+        ) -> *mut c_void,
+        pub pa_operation_unref: unsafe extern "C" fn(*mut c_void),
+        pub pa_operation_get_state: unsafe extern "C" fn(*const c_void) -> c_int,
+        pub pa_proplist_gets: unsafe extern "C" fn(*const c_void, *const c_char) -> *const c_char,
+        pub pa_stream_new: unsafe extern "C" fn(
+            *mut c_void,
+            *const c_char,
+            *const PaSampleSpec,
+            *const PaChannelMap,
+        ) -> *mut c_void,
+        pub pa_stream_unref: unsafe extern "C" fn(*mut c_void),
+        pub pa_stream_get_state: unsafe extern "C" fn(*const c_void) -> c_int,
+        pub pa_stream_set_state_callback: unsafe extern "C" fn(
+            *mut c_void,
+            Option<unsafe extern "C" fn(*mut c_void, *mut c_void)>,
+            *mut c_void,
+        ),
+        pub pa_stream_set_read_callback: unsafe extern "C" fn(
+            *mut c_void,
+            Option<unsafe extern "C" fn(*mut c_void, usize, *mut c_void)>,
+            *mut c_void,
+        ),
+        pub pa_stream_set_monitor_stream: unsafe extern "C" fn(*mut c_void, u32) -> c_int,
+        pub pa_stream_connect_record:
+            unsafe extern "C" fn(*mut c_void, *const c_char, *const PaBufferAttr, c_int) -> c_int,
+        pub pa_stream_disconnect: unsafe extern "C" fn(*mut c_void) -> c_int,
+        pub pa_stream_peek:
+            unsafe extern "C" fn(*mut c_void, *mut *const c_void, *mut usize) -> c_int,
+        pub pa_stream_drop: unsafe extern "C" fn(*mut c_void) -> c_int,
+        pub pa_stream_get_time: unsafe extern "C" fn(*mut c_void, *mut u64) -> c_int,
+        pub pa_stream_get_sample_spec: unsafe extern "C" fn(*mut c_void) -> *const PaSampleSpec,
+        _lib: Library,
+    }
+
+    impl PulseLibrary {
+        pub fn load(paths: &LinuxClientPaths) -> Result<Self, ClientLoadError> {
+            // SAFETY: dynamically loads the requested system PulseAudio shared library and resolves
+            // its C ABI symbols while keeping `Library` alive inside `Self`.
+            unsafe {
+                let lib = Library::new(&paths.pulse_so)
+                    .map_err(|_| ClientLoadError::LibraryAbsent(paths.pulse_so.clone()))?;
+                for &sym in REQUIRED_PULSE_SYMBOLS {
+                    let sym_name = CStr::from_bytes_with_nul(sym)
+                        .ok()
+                        .and_then(|s| s.to_str().ok())
+                        .unwrap_or("unknown");
+                    if lib.get::<*const c_void>(sym).is_err() {
+                        return Err(ClientLoadError::SymbolMissing(sym_name.to_owned()));
+                    }
+                }
+                let pa_get_library_version: unsafe extern "C" fn() -> *const c_char =
+                    *lib.get(b"pa_get_library_version\0").unwrap();
+                let ver_ptr = pa_get_library_version();
+                let version = if ver_ptr.is_null() {
+                    String::new()
+                } else {
+                    CStr::from_ptr(ver_ptr).to_string_lossy().into_owned()
+                };
+                validate_version_floor(&version, paths.pulse_min_version, "15.0.0")?;
+
+                Ok(Self {
+                    version,
+                    pa_get_library_version,
+                    pa_strerror: *lib.get(b"pa_strerror\0").unwrap(),
+                    pa_threaded_mainloop_new: *lib.get(b"pa_threaded_mainloop_new\0").unwrap(),
+                    pa_threaded_mainloop_free: *lib.get(b"pa_threaded_mainloop_free\0").unwrap(),
+                    pa_threaded_mainloop_start: *lib.get(b"pa_threaded_mainloop_start\0").unwrap(),
+                    pa_threaded_mainloop_stop: *lib.get(b"pa_threaded_mainloop_stop\0").unwrap(),
+                    pa_threaded_mainloop_lock: *lib.get(b"pa_threaded_mainloop_lock\0").unwrap(),
+                    pa_threaded_mainloop_unlock: *lib
+                        .get(b"pa_threaded_mainloop_unlock\0")
+                        .unwrap(),
+                    pa_threaded_mainloop_wait: *lib.get(b"pa_threaded_mainloop_wait\0").unwrap(),
+                    pa_threaded_mainloop_signal: *lib
+                        .get(b"pa_threaded_mainloop_signal\0")
+                        .unwrap(),
+                    pa_threaded_mainloop_get_api: *lib
+                        .get(b"pa_threaded_mainloop_get_api\0")
+                        .unwrap(),
+                    pa_context_new: *lib.get(b"pa_context_new\0").unwrap(),
+                    pa_context_unref: *lib.get(b"pa_context_unref\0").unwrap(),
+                    pa_context_connect: *lib.get(b"pa_context_connect\0").unwrap(),
+                    pa_context_disconnect: *lib.get(b"pa_context_disconnect\0").unwrap(),
+                    pa_context_get_state: *lib.get(b"pa_context_get_state\0").unwrap(),
+                    pa_context_set_state_callback: *lib
+                        .get(b"pa_context_set_state_callback\0")
+                        .unwrap(),
+                    pa_context_set_subscribe_callback: *lib
+                        .get(b"pa_context_set_subscribe_callback\0")
+                        .unwrap(),
+                    pa_context_subscribe: *lib.get(b"pa_context_subscribe\0").unwrap(),
+                    pa_context_get_server_info: *lib.get(b"pa_context_get_server_info\0").unwrap(),
+                    pa_context_get_sink_info_list: *lib
+                        .get(b"pa_context_get_sink_info_list\0")
+                        .unwrap(),
+                    pa_context_get_source_info_list: *lib
+                        .get(b"pa_context_get_source_info_list\0")
+                        .unwrap(),
+                    pa_context_get_sink_input_info_list: *lib
+                        .get(b"pa_context_get_sink_input_info_list\0")
+                        .unwrap(),
+                    pa_context_get_client_info_list: *lib
+                        .get(b"pa_context_get_client_info_list\0")
+                        .unwrap(),
+                    pa_context_move_sink_input_by_index: *lib
+                        .get(b"pa_context_move_sink_input_by_index\0")
+                        .unwrap(),
+                    pa_context_move_sink_input_by_name: *lib
+                        .get(b"pa_context_move_sink_input_by_name\0")
+                        .unwrap(),
+                    pa_context_load_module: *lib.get(b"pa_context_load_module\0").unwrap(),
+                    pa_context_unload_module: *lib.get(b"pa_context_unload_module\0").unwrap(),
+                    pa_operation_unref: *lib.get(b"pa_operation_unref\0").unwrap(),
+                    pa_operation_get_state: *lib.get(b"pa_operation_get_state\0").unwrap(),
+                    pa_proplist_gets: *lib.get(b"pa_proplist_gets\0").unwrap(),
+                    pa_stream_new: *lib.get(b"pa_stream_new\0").unwrap(),
+                    pa_stream_unref: *lib.get(b"pa_stream_unref\0").unwrap(),
+                    pa_stream_get_state: *lib.get(b"pa_stream_get_state\0").unwrap(),
+                    pa_stream_set_state_callback: *lib
+                        .get(b"pa_stream_set_state_callback\0")
+                        .unwrap(),
+                    pa_stream_set_read_callback: *lib
+                        .get(b"pa_stream_set_read_callback\0")
+                        .unwrap(),
+                    pa_stream_set_monitor_stream: *lib
+                        .get(b"pa_stream_set_monitor_stream\0")
+                        .unwrap(),
+                    pa_stream_connect_record: *lib.get(b"pa_stream_connect_record\0").unwrap(),
+                    pa_stream_disconnect: *lib.get(b"pa_stream_disconnect\0").unwrap(),
+                    pa_stream_peek: *lib.get(b"pa_stream_peek\0").unwrap(),
+                    pa_stream_drop: *lib.get(b"pa_stream_drop\0").unwrap(),
+                    pa_stream_get_time: *lib.get(b"pa_stream_get_time\0").unwrap(),
+                    pa_stream_get_sample_spec: *lib.get(b"pa_stream_get_sample_spec\0").unwrap(),
+                    _lib: lib,
+                })
+            }
+        }
+
+        /// Lookup a string property in a PulseAudio `pa_proplist *`.
+        ///
+        /// # Safety
+        /// `proplist` must be valid for the call.
+        pub unsafe fn proplist_get(&self, proplist: *const c_void, key: &CStr) -> Option<String> {
+            if proplist.is_null() {
+                return None;
+            }
+            // SAFETY: `proplist` and `key` are valid C pointers.
+            let val_ptr = unsafe { (self.pa_proplist_gets)(proplist, key.as_ptr()) };
+            if val_ptr.is_null() {
+                None
+            } else {
+                // SAFETY: `val_ptr` is a NUL-terminated string owned by `proplist`.
+                Some(
+                    unsafe { CStr::from_ptr(val_ptr) }
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            }
+        }
+    }
+
+    pub fn probe_pipewire_server(
+        paths: &LinuxClientPaths,
+    ) -> Result<PipeWireServerIdentity, CapabilityError> {
+        let lib = PipeWireLibrary::load(paths).map_err(|err| {
+            err.into_capability_error(BackendId::PipeWire, paths.pipewire_min_version)
+        })?;
+        struct ProbeState {
+            loop_ptr: *mut c_void,
+            server_version: String,
+            server_name: String,
+            default_sink: Option<String>,
+            failed: bool,
+            sync_seq: c_int,
+        }
+        unsafe extern "C" fn on_core_info(data: *mut c_void, info: *const PwCoreInfo) {
+            // SAFETY: `data` points to `ProbeState` and `info` is valid during the callback.
+            unsafe {
+                let state = &mut *(data as *mut ProbeState);
+                if !info.is_null() {
+                    let inf = &*info;
+                    if !inf.version.is_null() {
+                        state.server_version =
+                            CStr::from_ptr(inf.version).to_string_lossy().into_owned();
+                    }
+                    if !inf.name.is_null() {
+                        state.server_name = CStr::from_ptr(inf.name).to_string_lossy().into_owned();
+                    }
+                }
+            }
+        }
+        unsafe extern "C" fn on_core_done(data: *mut c_void, id: u32, seq: c_int) {
+            // SAFETY: `data` points to `ProbeState`.
+            unsafe {
+                let state = &mut *(data as *mut ProbeState);
+                if id == 0 && seq == state.sync_seq {
+                    state.sync_seq = -1;
+                }
+            }
+        }
+        unsafe extern "C" fn on_core_error(
+            data: *mut c_void,
+            _id: u32,
+            _seq: c_int,
+            _res: c_int,
+            _msg: *const c_char,
+        ) {
+            // SAFETY: `data` points to `ProbeState`.
+            unsafe {
+                let state = &mut *(data as *mut ProbeState);
+                state.failed = true;
+            }
+        }
+
+        // SAFETY: all PipeWire handles are created, synchronized, and destroyed on this thread.
+        unsafe {
+            let main_loop = (lib.pw_main_loop_new)(std::ptr::null());
+            if main_loop.is_null() {
+                return Err(CapabilityError::ServerUnavailable);
+            }
+            let loop_obj = (lib.pw_main_loop_get_loop)(main_loop);
+            let context = (lib.pw_context_new)(loop_obj, std::ptr::null_mut(), 0);
+            if context.is_null() {
+                (lib.pw_main_loop_destroy)(main_loop);
+                return Err(CapabilityError::ServerUnavailable);
+            }
+            let core = (lib.pw_context_connect)(context, std::ptr::null_mut(), 0);
+            if core.is_null() {
+                (lib.pw_context_destroy)(context);
+                (lib.pw_main_loop_destroy)(main_loop);
+                return Err(CapabilityError::ServerUnavailable);
+            }
+            let mut state = ProbeState {
+                loop_ptr: main_loop,
+                server_version: lib.version.clone(),
+                server_name: "pipewire-0".to_owned(),
+                default_sink: None,
+                failed: false,
+                sync_seq: 0,
+            };
+            let events = PwCoreEvents {
+                version: 0,
+                info: Some(on_core_info),
+                done: Some(on_core_done),
+                ping: None,
+                error: Some(on_core_error),
+                remove_id: None,
+                bound_id: None,
+                add_mem: None,
+                remove_mem: None,
+                bound_props: None,
+            };
+            let mut hook = SpaHook::default();
+            lib.core_add_listener(
+                core,
+                &mut hook,
+                &events,
+                (&mut state as *mut ProbeState).cast(),
+            );
+            state.sync_seq = lib.core_sync(core, 0, 1);
+            let _ = state.loop_ptr;
+            (lib.pw_core_disconnect)(core);
+            (lib.pw_context_destroy)(context);
+            (lib.pw_main_loop_destroy)(main_loop);
+            if state.failed {
+                return Err(CapabilityError::ServerUnavailable);
+            }
+            Ok(PipeWireServerIdentity {
+                library_version: lib.version,
+                server_version: state.server_version,
+                server_name: state.server_name,
+                default_sink_name: state.default_sink,
+                default_source_name: None,
+            })
+        }
+    }
+
+    pub fn probe_pulse_server(
+        paths: &LinuxClientPaths,
+    ) -> Result<PulseServerIdentity, CapabilityError> {
+        let lib = PulseLibrary::load(paths).map_err(|err| {
+            err.into_capability_error(BackendId::PulseAudio, paths.pulse_min_version)
+        })?;
+
+        struct PulseProbeCtx {
+            mainloop: *mut c_void,
+            signal_fn: unsafe extern "C" fn(*mut c_void, c_int),
+            server_name: Option<String>,
+            server_version: Option<String>,
+            default_sink_name: Option<String>,
+            default_source_name: Option<String>,
+            done: std::sync::atomic::AtomicBool,
+        }
+
+        unsafe extern "C" fn on_ctx_state(ctx: *mut c_void, userdata: *mut c_void) {
+            // SAFETY: `userdata` points to `PulseProbeCtx`.
+            unsafe {
+                let _ = ctx;
+                let probe = &*(userdata as *const PulseProbeCtx);
+                (probe.signal_fn)(probe.mainloop, 0);
+            }
+        }
+
+        unsafe extern "C" fn on_server_info(
+            _ctx: *mut c_void,
+            info: *const PaServerInfo,
+            userdata: *mut c_void,
+        ) {
+            // SAFETY: `userdata` points to `PulseProbeCtx` and `info` is valid during the callback.
+            unsafe {
+                let probe = &mut *(userdata as *mut PulseProbeCtx);
+                if !info.is_null() {
+                    let inf = &*info;
+                    if !inf.server_name.is_null() {
+                        probe.server_name = Some(
+                            CStr::from_ptr(inf.server_name)
+                                .to_string_lossy()
+                                .into_owned(),
+                        );
+                    }
+                    if !inf.server_version.is_null() {
+                        probe.server_version = Some(
+                            CStr::from_ptr(inf.server_version)
+                                .to_string_lossy()
+                                .into_owned(),
+                        );
+                    }
+                    if !inf.default_sink_name.is_null() {
+                        probe.default_sink_name = Some(
+                            CStr::from_ptr(inf.default_sink_name)
+                                .to_string_lossy()
+                                .into_owned(),
+                        );
+                    }
+                    if !inf.default_source_name.is_null() {
+                        probe.default_source_name = Some(
+                            CStr::from_ptr(inf.default_source_name)
+                                .to_string_lossy()
+                                .into_owned(),
+                        );
+                    }
+                }
+                probe.done.store(true, std::sync::atomic::Ordering::SeqCst);
+                (probe.signal_fn)(probe.mainloop, 0);
+            }
+        }
+
+        // SAFETY: `pa_threaded_mainloop` and `pa_context` follow standard locking and unref rules.
+        unsafe {
+            let mainloop = (lib.pa_threaded_mainloop_new)();
+            if mainloop.is_null() {
+                return Err(CapabilityError::ServerUnavailable);
+            }
+            let api = (lib.pa_threaded_mainloop_get_api)(mainloop);
+            let ctx = (lib.pa_context_new)(api, c"cspa-probe".as_ptr());
+            if ctx.is_null() {
+                (lib.pa_threaded_mainloop_free)(mainloop);
+                return Err(CapabilityError::ServerUnavailable);
+            }
+            let mut probe = Box::new(PulseProbeCtx {
+                mainloop,
+                signal_fn: lib.pa_threaded_mainloop_signal,
+                server_name: None,
+                server_version: None,
+                default_sink_name: None,
+                default_source_name: None,
+                done: std::sync::atomic::AtomicBool::new(false),
+            });
+            let probe_ptr: *mut c_void = (&mut *probe as *mut PulseProbeCtx).cast();
+            (lib.pa_context_set_state_callback)(ctx, Some(on_ctx_state), probe_ptr);
+            if (lib.pa_context_connect)(
+                ctx,
+                std::ptr::null(),
+                PA_CONTEXT_NOAUTOSPAWN,
+                std::ptr::null(),
+            ) < 0
+            {
+                (lib.pa_context_set_state_callback)(ctx, None, std::ptr::null_mut());
+                (lib.pa_context_unref)(ctx);
+                (lib.pa_threaded_mainloop_free)(mainloop);
+                return Err(CapabilityError::ServerUnavailable);
+            }
+            if (lib.pa_threaded_mainloop_start)(mainloop) < 0 {
+                (lib.pa_context_set_state_callback)(ctx, None, std::ptr::null_mut());
+                (lib.pa_context_disconnect)(ctx);
+                (lib.pa_context_unref)(ctx);
+                (lib.pa_threaded_mainloop_free)(mainloop);
+                return Err(CapabilityError::ServerUnavailable);
+            }
+            (lib.pa_threaded_mainloop_lock)(mainloop);
+            loop {
+                let state = (lib.pa_context_get_state)(ctx);
+                if state == PA_CONTEXT_READY {
+                    break;
+                }
+                if state == PA_CONTEXT_FAILED || state == PA_CONTEXT_TERMINATED {
+                    (lib.pa_context_set_state_callback)(ctx, None, std::ptr::null_mut());
+                    (lib.pa_threaded_mainloop_unlock)(mainloop);
+                    (lib.pa_threaded_mainloop_stop)(mainloop);
+                    (lib.pa_context_disconnect)(ctx);
+                    (lib.pa_context_unref)(ctx);
+                    (lib.pa_threaded_mainloop_free)(mainloop);
+                    return Err(CapabilityError::ServerUnavailable);
+                }
+                (lib.pa_threaded_mainloop_wait)(mainloop);
+            }
+            let op = (lib.pa_context_get_server_info)(ctx, Some(on_server_info), probe_ptr);
+            if !op.is_null() {
+                while !probe.done.load(std::sync::atomic::Ordering::SeqCst) {
+                    (lib.pa_threaded_mainloop_wait)(mainloop);
+                }
+                (lib.pa_operation_unref)(op);
+            }
+            (lib.pa_context_set_state_callback)(ctx, None, std::ptr::null_mut());
+            (lib.pa_context_disconnect)(ctx);
+            (lib.pa_threaded_mainloop_unlock)(mainloop);
+            (lib.pa_threaded_mainloop_stop)(mainloop);
+            (lib.pa_context_unref)(ctx);
+            (lib.pa_threaded_mainloop_free)(mainloop);
+
+            let server_name = probe
+                .server_name
+                .ok_or(CapabilityError::ServerUnavailable)?;
+            let server_version = probe.server_version.unwrap_or_default();
+            let server_kind = PulseServerKind::classify(&server_name);
+            Ok(PulseServerIdentity {
+                library_version: lib.version,
+                server_name,
+                server_version,
+                server_kind,
+                default_sink_name: probe.default_sink_name,
+                default_source_name: probe.default_source_name,
+            })
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub use imp::{PipeWireLibrary, PulseLibrary, probe_pipewire_server, probe_pulse_server};
+
+#[cfg(not(target_os = "linux"))]
+pub fn probe_pipewire_server(
+    paths: &LinuxClientPaths,
+) -> Result<PipeWireServerIdentity, CapabilityError> {
+    Err(ClientLoadError::LibraryAbsent(paths.pipewire_so.clone())
+        .into_capability_error(BackendId::PipeWire, paths.pipewire_min_version))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn probe_pulse_server(
+    paths: &LinuxClientPaths,
+) -> Result<PulseServerIdentity, CapabilityError> {
+    Err(ClientLoadError::LibraryAbsent(paths.pulse_so.clone())
+        .into_capability_error(BackendId::PulseAudio, paths.pulse_min_version))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn semver_floor_and_spa_pod_builder_invariants() {
+        assert_eq!(
+            validate_version_floor("1.6.2", MIN_PIPEWIRE_VERSION, "0.3.65"),
+            Ok((1, 6, 2))
+        );
+        assert_eq!(
+            validate_version_floor("17.0.0", MIN_PULSEAUDIO_VERSION, "15.0.0"),
+            Ok((17, 0, 0))
+        );
+        assert!(validate_version_floor("0.3.20", MIN_PIPEWIRE_VERSION, "0.3.65").is_err());
+        assert!(validate_version_floor("12.0", MIN_PULSEAUDIO_VERSION, "15.0.0").is_err());
+
+        let pod_48k = build_spa_f32_le_stereo_pod(48_000).0;
+        assert_eq!(u32::from_le_bytes(pod_48k[0..4].try_into().unwrap()), 160);
+        assert_eq!(u32::from_le_bytes(pod_48k[4..8].try_into().unwrap()), 15);
+        assert_eq!(
+            u32::from_le_bytes(pod_48k[80..84].try_into().unwrap()),
+            SPA_AUDIO_FORMAT_F32_LE
+        );
+        assert_eq!(
+            u32::from_le_bytes(pod_48k[104..108].try_into().unwrap()),
+            48_000
+        );
+        assert_eq!(u32::from_le_bytes(pod_48k[128..132].try_into().unwrap()), 2);
+
+        let pod_16k_mono_i16 = build_spa_audio_raw_pod(SampleType::I16, 16_000, 1)
+            .unwrap()
+            .0;
+        assert_eq!(
+            u32::from_le_bytes(pod_16k_mono_i16[80..84].try_into().unwrap()),
+            SPA_AUDIO_FORMAT_S16_LE
+        );
+        assert_eq!(
+            u32::from_le_bytes(pod_16k_mono_i16[104..108].try_into().unwrap()),
+            16_000
+        );
+        assert_eq!(
+            u32::from_le_bytes(pod_16k_mono_i16[128..132].try_into().unwrap()),
+            1
+        );
+        assert_eq!(
+            u32::from_le_bytes(pod_16k_mono_i16[144..148].try_into().unwrap()),
+            12
+        );
+        assert_eq!(
+            u32::from_le_bytes(pod_16k_mono_i16[160..164].try_into().unwrap()),
+            SPA_AUDIO_CHANNEL_MONO
+        );
+        assert!(build_spa_audio_raw_pod(SampleType::F32, 48_000, 3).is_err());
+        assert!(build_spa_audio_raw_pod(SampleType::F32, 0, 2).is_err());
+    }
+}
