@@ -1400,3 +1400,1135 @@ mod imp {
                 }
             }
 
+            // SAFETY: manages dedicated `pa_threaded_mainloop` + `pa_context_subscribe` until `stop` is set.
+            unsafe {
+                let mainloop = (lib.pa_threaded_mainloop_new)();
+                if mainloop.is_null() {
+                    return;
+                }
+                let api = (lib.pa_threaded_mainloop_get_api)(mainloop);
+                let ctx = (lib.pa_context_new)(api, c"cspa-sub".as_ptr());
+                if ctx.is_null() {
+                    (lib.pa_threaded_mainloop_free)(mainloop);
+                    return;
+                }
+                let mut st = Box::new(SubState {
+                    mainloop,
+                    signal_fn: lib.pa_threaded_mainloop_signal,
+                    get_server_info: lib.pa_context_get_server_info,
+                    op_unref: lib.pa_operation_unref,
+                    latest_sink,
+                    latest_source,
+                    dirty,
+                    wake,
+                });
+                let st_ptr: *mut c_void = (&mut *st as *mut SubState).cast();
+                (lib.pa_context_set_state_callback)(ctx, Some(on_state), st_ptr);
+                if (lib.pa_context_connect)(
+                    ctx,
+                    std::ptr::null(),
+                    PA_CONTEXT_NOAUTOSPAWN,
+                    std::ptr::null(),
+                ) < 0
+                {
+                    (lib.pa_context_set_state_callback)(ctx, None, std::ptr::null_mut());
+                    (lib.pa_context_unref)(ctx);
+                    (lib.pa_threaded_mainloop_free)(mainloop);
+                    return;
+                }
+                if (lib.pa_threaded_mainloop_start)(mainloop) < 0 {
+                    (lib.pa_context_set_state_callback)(ctx, None, std::ptr::null_mut());
+                    (lib.pa_context_disconnect)(ctx);
+                    (lib.pa_context_unref)(ctx);
+                    (lib.pa_threaded_mainloop_free)(mainloop);
+                    return;
+                }
+                (lib.pa_threaded_mainloop_lock)(mainloop);
+                let mut ready = false;
+                while !stop.load(SeqCst) {
+                    let state = (lib.pa_context_get_state)(ctx);
+                    if state == PA_CONTEXT_READY {
+                        ready = true;
+                        break;
+                    }
+                    if state == PA_CONTEXT_FAILED || state == PA_CONTEXT_TERMINATED {
+                        break;
+                    }
+                    (lib.pa_threaded_mainloop_wait)(mainloop);
+                }
+                if ready {
+                    (lib.pa_context_set_subscribe_callback)(ctx, Some(on_subscribe), st_ptr);
+                    let mask = if include_stream_events {
+                        PA_SUB_MASK_DISCOVERY
+                    } else if watch_sources {
+                        PA_SUB_MASK_SOURCE_AND_SERVER
+                    } else {
+                        PA_SUB_MASK_SINK_AND_SERVER
+                    };
+                    let sub_op = (lib.pa_context_subscribe)(ctx, mask, None, st_ptr);
+                    if !sub_op.is_null() {
+                        (lib.pa_operation_unref)(sub_op);
+                    }
+                    let info_op =
+                        (lib.pa_context_get_server_info)(ctx, Some(on_server_info), st_ptr);
+                    if !info_op.is_null() {
+                        (lib.pa_operation_unref)(info_op);
+                    }
+                }
+                (lib.pa_threaded_mainloop_unlock)(mainloop);
+
+                while !stop.load(SeqCst) {
+                    thread::sleep(Duration::from_millis(20));
+                }
+
+                (lib.pa_threaded_mainloop_lock)(mainloop);
+                (lib.pa_context_set_subscribe_callback)(ctx, None, std::ptr::null_mut());
+                (lib.pa_context_set_state_callback)(ctx, None, std::ptr::null_mut());
+                (lib.pa_context_disconnect)(ctx);
+                (lib.pa_threaded_mainloop_unlock)(mainloop);
+                (lib.pa_threaded_mainloop_stop)(mainloop);
+                (lib.pa_context_unref)(ctx);
+                (lib.pa_threaded_mainloop_free)(mainloop);
+            }
+        }))
+    }
+
+    pub fn spawn_pulse_new_sink_input_watcher(
+        paths: &LinuxClientPaths,
+        dirty: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
+    ) -> Option<JoinHandle<()>> {
+        let lib = PulseLibrary::load(paths).ok()?;
+        Some(thread::spawn(move || {
+            const PA_SUBSCRIPTION_MASK_SINK_INPUT: c_int = 0x0004;
+            const PA_SUBSCRIPTION_EVENT_FACILITY_MASK: c_int = 0x000F;
+            const PA_SUBSCRIPTION_EVENT_SINK_INPUT: c_int = 0x0002;
+            const PA_SUBSCRIPTION_EVENT_TYPE_MASK: c_int = 0x0030;
+            const PA_SUBSCRIPTION_EVENT_NEW: c_int = 0x0000;
+
+            struct NewSiState {
+                mainloop: *mut c_void,
+                signal_fn: unsafe extern "C" fn(*mut c_void, c_int),
+                dirty: Arc<AtomicBool>,
+            }
+
+            unsafe extern "C" fn on_state(_ctx: *mut c_void, userdata: *mut c_void) {
+                if !userdata.is_null() {
+                    // SAFETY: `userdata` points to `NewSiState`.
+                    unsafe {
+                        let st = &*(userdata as *const NewSiState);
+                        (st.signal_fn)(st.mainloop, 0);
+                    }
+                }
+            }
+
+            unsafe extern "C" fn on_subscribe(
+                _ctx: *mut c_void,
+                event_type: c_int,
+                _idx: u32,
+                userdata: *mut c_void,
+            ) {
+                if userdata.is_null() {
+                    return;
+                }
+                if (event_type & PA_SUBSCRIPTION_EVENT_FACILITY_MASK)
+                    == PA_SUBSCRIPTION_EVENT_SINK_INPUT
+                    && (event_type & PA_SUBSCRIPTION_EVENT_TYPE_MASK) == PA_SUBSCRIPTION_EVENT_NEW
+                {
+                    // SAFETY: `userdata` points to `NewSiState`; sets `dirty` only on newly created sink-inputs.
+                    unsafe {
+                        let st = &*(userdata as *const NewSiState);
+                        st.dirty.store(true, SeqCst);
+                    }
+                }
+            }
+
+            // SAFETY: manages dedicated `pa_threaded_mainloop` + `pa_context_subscribe` until `stop` is set.
+            unsafe {
+                let mainloop = (lib.pa_threaded_mainloop_new)();
+                if mainloop.is_null() {
+                    return;
+                }
+                let api = (lib.pa_threaded_mainloop_get_api)(mainloop);
+                let ctx = (lib.pa_context_new)(api, c"cspa-si-watch".as_ptr());
+                if ctx.is_null() {
+                    (lib.pa_threaded_mainloop_free)(mainloop);
+                    return;
+                }
+                let mut st = Box::new(NewSiState {
+                    mainloop,
+                    signal_fn: lib.pa_threaded_mainloop_signal,
+                    dirty,
+                });
+                let st_ptr: *mut c_void = (&mut *st as *mut NewSiState).cast();
+                (lib.pa_context_set_state_callback)(ctx, Some(on_state), st_ptr);
+                if (lib.pa_context_connect)(
+                    ctx,
+                    std::ptr::null(),
+                    PA_CONTEXT_NOAUTOSPAWN,
+                    std::ptr::null(),
+                ) < 0
+                {
+                    (lib.pa_context_set_state_callback)(ctx, None, std::ptr::null_mut());
+                    (lib.pa_context_unref)(ctx);
+                    (lib.pa_threaded_mainloop_free)(mainloop);
+                    return;
+                }
+                if (lib.pa_threaded_mainloop_start)(mainloop) < 0 {
+                    (lib.pa_context_set_state_callback)(ctx, None, std::ptr::null_mut());
+                    (lib.pa_context_disconnect)(ctx);
+                    (lib.pa_context_unref)(ctx);
+                    (lib.pa_threaded_mainloop_free)(mainloop);
+                    return;
+                }
+                (lib.pa_threaded_mainloop_lock)(mainloop);
+                let mut ready = false;
+                while !stop.load(SeqCst) {
+                    let state = (lib.pa_context_get_state)(ctx);
+                    if state == PA_CONTEXT_READY {
+                        ready = true;
+                        break;
+                    }
+                    if state == PA_CONTEXT_FAILED || state == PA_CONTEXT_TERMINATED {
+                        break;
+                    }
+                    (lib.pa_threaded_mainloop_wait)(mainloop);
+                }
+                if ready {
+                    (lib.pa_context_set_subscribe_callback)(ctx, Some(on_subscribe), st_ptr);
+                    let sub_op = (lib.pa_context_subscribe)(
+                        ctx,
+                        PA_SUBSCRIPTION_MASK_SINK_INPUT,
+                        None,
+                        st_ptr,
+                    );
+                    if !sub_op.is_null() {
+                        (lib.pa_operation_unref)(sub_op);
+                    }
+                }
+                (lib.pa_threaded_mainloop_unlock)(mainloop);
+
+                while !stop.load(SeqCst) {
+                    thread::sleep(Duration::from_millis(20));
+                }
+
+                (lib.pa_threaded_mainloop_lock)(mainloop);
+                (lib.pa_context_set_subscribe_callback)(ctx, None, std::ptr::null_mut());
+                (lib.pa_context_set_state_callback)(ctx, None, std::ptr::null_mut());
+                (lib.pa_context_disconnect)(ctx);
+                (lib.pa_threaded_mainloop_unlock)(mainloop);
+                (lib.pa_threaded_mainloop_stop)(mainloop);
+                (lib.pa_context_unref)(ctx);
+                (lib.pa_threaded_mainloop_free)(mainloop);
+            }
+        }))
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub use imp::{
+    collect_pipewire_graph, collect_pulse_full_state, collect_pulse_state,
+    query_pipewire_default_sink_only, query_pipewire_defaults_only,
+    spawn_pulse_new_sink_input_watcher, spawn_pulse_server_event_listener,
+    spawn_pulse_server_event_listener_ext,
+};
+
+#[cfg(not(target_os = "linux"))]
+pub fn spawn_pulse_new_sink_input_watcher(
+    _paths: &LinuxClientPaths,
+    _dirty: Arc<AtomicBool>,
+    _stop: Arc<AtomicBool>,
+) -> Option<JoinHandle<()>> {
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn spawn_pulse_server_event_listener(
+    _paths: &LinuxClientPaths,
+    _latest_sink: Arc<Mutex<Option<String>>>,
+    _dirty: Arc<AtomicBool>,
+    _wake: thread::Thread,
+    _stop: Arc<AtomicBool>,
+    _include_stream_events: bool,
+) -> Option<JoinHandle<()>> {
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_pulse_server_event_listener_ext(
+    _paths: &LinuxClientPaths,
+    _latest_sink: Option<Arc<Mutex<Option<String>>>>,
+    _latest_source: Option<Arc<Mutex<Option<String>>>>,
+    _dirty: Arc<AtomicBool>,
+    _wake: thread::Thread,
+    _stop: Arc<AtomicBool>,
+    _include_stream_events: bool,
+    _watch_sources: bool,
+) -> Option<JoinHandle<()>> {
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn query_pipewire_default_sink_only(
+    paths: &LinuxClientPaths,
+) -> Result<Option<String>, CapabilityError> {
+    Err(
+        crate::loader::ClientLoadError::LibraryAbsent(paths.pipewire_so.clone())
+            .into_capability_error(BackendId::PipeWire, paths.pipewire_min_version),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn query_pipewire_defaults_only(
+    paths: &LinuxClientPaths,
+) -> Result<(Option<String>, Option<String>), CapabilityError> {
+    Err(
+        crate::loader::ClientLoadError::LibraryAbsent(paths.pipewire_so.clone())
+            .into_capability_error(BackendId::PipeWire, paths.pipewire_min_version),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn collect_pipewire_graph(
+    paths: &LinuxClientPaths,
+) -> Result<PipeWireGraphSnapshot, CapabilityError> {
+    Err(
+        crate::loader::ClientLoadError::LibraryAbsent(paths.pipewire_so.clone())
+            .into_capability_error(BackendId::PipeWire, paths.pipewire_min_version),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn collect_pulse_state(
+    paths: &LinuxClientPaths,
+) -> Result<PulseAudioStateSnapshot, CapabilityError> {
+    Err(
+        crate::loader::ClientLoadError::LibraryAbsent(paths.pulse_so.clone())
+            .into_capability_error(BackendId::PulseAudio, paths.pulse_min_version),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn collect_pulse_full_state(
+    paths: &LinuxClientPaths,
+) -> Result<PulseAudioFullStateSnapshot, CapabilityError> {
+    Err(
+        crate::loader::ClientLoadError::LibraryAbsent(paths.pulse_so.clone())
+            .into_capability_error(BackendId::PulseAudio, paths.pulse_min_version),
+    )
+}
+
+fn is_ignored_audio_stream_name(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("cspa-")
+        || matches!(
+            lower.as_str(),
+            "pactl"
+                | "pw-cli"
+                | "pw-cat"
+                | "pw-play"
+                | "pw-record"
+                | "paplay"
+                | "parec"
+                | "pacat"
+                | "playback stream"
+                | "audio stream"
+        )
+        || crate::core::discovery::is_runtime_interpreter_stem(&lower)
+}
+
+/// Collect input devices, output devices, and processes from configured Linux backends.
+pub fn collect_linux_backend_inventory_with_paths(
+    paths: &LinuxClientPaths,
+    backends: &Backends,
+) -> Result<BackendRawInventory, CapabilityError> {
+    let proc_table = collect_proc_table(Path::new("/proc"))?;
+    let mut backend_devices = Vec::new();
+    let mut pid_audio: BTreeMap<u32, bool> = BTreeMap::new();
+    let mut pw_pids: Option<BTreeMap<u32, bool>> = None;
+    let mut pa_pids: Option<BTreeMap<u32, bool>> = None;
+    let mut pid_audio_name: BTreeMap<u32, String> = BTreeMap::new();
+    let mut active_backends_ok = Vec::new();
+    let mut last_err = CapabilityError::InvalidBackend;
+
+    for &backend in backends.for_os(PlatformOs::Linux) {
+        match backend {
+            BackendId::PipeWire => match collect_pipewire_graph(paths) {
+                Ok(graph) => {
+                    active_backends_ok.push(BackendId::PipeWire);
+                    let mut this_pw_pids: BTreeMap<u32, bool> = BTreeMap::new();
+                    for (_id, name, desc) in &graph.sinks {
+                        let is_def = graph.default_sink_name.as_deref() == Some(name.as_str());
+                        let friendly: Arc<str> =
+                            desc.clone().unwrap_or_else(|| name.clone()).into();
+                        backend_devices.push(RawBackendDeviceRecord {
+                            backend: BackendId::PipeWire,
+                            direction: DeviceDirection::Output,
+                            device_id: name.clone().into(),
+                            name: Some(friendly),
+                            is_default: is_def,
+                            is_monitor_sink: false,
+                        });
+                    }
+                    for (_id, name, desc) in &graph.sources {
+                        let is_def = graph.default_source_name.as_deref() == Some(name.as_str());
+                        let friendly: Arc<str> =
+                            desc.clone().unwrap_or_else(|| name.clone()).into();
+                        backend_devices.push(RawBackendDeviceRecord {
+                            backend: BackendId::PipeWire,
+                            direction: DeviceDirection::Input,
+                            device_id: name.clone().into(),
+                            name: Some(friendly),
+                            is_default: is_def,
+                            is_monitor_sink: name.ends_with(".monitor"),
+                        });
+                    }
+                    for node in &graph.output_nodes {
+                        if let Some(pid) = node.pid.filter(|&p| p > 0) {
+                            let entry = pid_audio.entry(pid).or_insert(false);
+                            let pw_entry = this_pw_pids.entry(pid).or_insert(false);
+                            if node.active {
+                                *entry = true;
+                                *pw_entry = true;
+                            }
+                            if let Some(ref n) = node.node_name
+                                && !is_ignored_audio_stream_name(n)
+                            {
+                                pid_audio_name.entry(pid).or_insert_with(|| n.clone());
+                            }
+                        }
+                    }
+                    pw_pids = Some(this_pw_pids);
+                }
+                Err(err) => {
+                    last_err = err;
+                }
+            },
+            BackendId::PulseAudio => match collect_pulse_full_state(paths) {
+                Ok((pa_devs, pa_sources, pa_pid_map, _inputs)) => {
+                    active_backends_ok.push(BackendId::PulseAudio);
+                    for d in &pa_devs {
+                        let friendly: Arc<str> = d
+                            .description
+                            .clone()
+                            .unwrap_or_else(|| d.name.clone())
+                            .into();
+                        backend_devices.push(RawBackendDeviceRecord {
+                            backend: BackendId::PulseAudio,
+                            direction: DeviceDirection::Output,
+                            device_id: d.name.clone().into(),
+                            name: Some(friendly),
+                            is_default: d.is_default,
+                            is_monitor_sink: false,
+                        });
+                    }
+                    for src in &pa_sources {
+                        let friendly: Arc<str> = src
+                            .description
+                            .clone()
+                            .unwrap_or_else(|| src.name.clone())
+                            .into();
+                        backend_devices.push(RawBackendDeviceRecord {
+                            backend: BackendId::PulseAudio,
+                            direction: DeviceDirection::Input,
+                            device_id: src.name.clone().into(),
+                            name: Some(friendly),
+                            is_default: src.is_default,
+                            is_monitor_sink: src.is_monitor,
+                        });
+                    }
+                    for (&pid, &active) in &pa_pid_map {
+                        let entry = pid_audio.entry(pid).or_insert(false);
+                        if active {
+                            *entry = true;
+                        }
+                    }
+                    pa_pids = Some(pa_pid_map);
+                }
+                Err(err) => {
+                    last_err = err;
+                }
+            },
+            _ => {}
+        }
+    }
+
+    if active_backends_ok.is_empty() {
+        return Err(last_err);
+    }
+
+    let mut backend_processes = Vec::new();
+    for (pid, (stat, exe_opt)) in proc_table {
+        let parent_pid = (stat.ppid > 0 && stat.ppid != pid).then_some(stat.ppid);
+        let exe_str = exe_opt.unwrap_or_else(|| stat.comm.clone());
+        let cgroup_app_id = crate::procfs::inspect_process_cgroup_app_id(Path::new("/proc"), pid);
+        let audio_name = pid_audio_name.remove(&pid);
+
+        let comm_lower = stat.comm.to_ascii_lowercase();
+        let display_name = match &audio_name {
+            Some(an)
+                if crate::core::discovery::is_runtime_interpreter_stem(&comm_lower)
+                    || an.to_ascii_lowercase().starts_with(&comm_lower) =>
+            {
+                an.clone()
+            }
+            _ => stat.comm.clone(),
+        };
+
+        let app_id_str = if let Some(cg_id) = cgroup_app_id {
+            cg_id
+        } else if let Some(ref an) = audio_name
+            && an.contains('.')
+            && !an.contains(['/', '\\', ' ', '\t'])
+        {
+            an.clone()
+        } else if display_name.contains('.') && !display_name.contains(['/', '\\', ' ', '\t']) {
+            display_name.clone()
+        } else {
+            exe_str.clone()
+        };
+
+        let name_arc: Arc<str> = display_name.into();
+        let exe_arc: Arc<str> = exe_str.into();
+        let app_id_arc: Arc<str> = app_id_str.into();
+        let active_audio = pid_audio.get(&pid).copied();
+        let base_rec = RawProcessRecord {
+            identity: crate::core::schema::ProcessIdentity {
+                pid,
+                generation: stat.starttime_ticks,
+            },
+            parent_pid,
+            app_id: Some(app_id_arc),
+            name: Some(name_arc),
+            executable_path: Some(exe_arc),
+            active_audio,
+        };
+        for &ok_backend in &active_backends_ok {
+            let mut per_b = base_rec.clone();
+            per_b.active_audio = match ok_backend {
+                BackendId::PipeWire => pw_pids.as_ref().and_then(|m| m.get(&pid).copied()),
+                BackendId::PulseAudio => pa_pids.as_ref().and_then(|m| m.get(&pid).copied()),
+                _ => active_audio,
+            };
+            backend_processes.push(RawBackendProcessRecord {
+                backend: ok_backend,
+                process: per_b,
+            });
+        }
+    }
+
+    Ok(BackendRawInventory {
+        processes: backend_processes,
+        devices: backend_devices,
+    })
+}
+
+struct WatcherWorker {
+    stop: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl WatcherWorker {
+    fn stop_and_join(&mut self) {
+        self.stop.store(true, SeqCst);
+        if let Some(handle) = self.join.take() {
+            handle.thread().unpark();
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for WatcherWorker {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
+/// One-shot calls never spawn background watcher threads.
+#[derive(Clone)]
+pub struct PlatformDiscovery {
+    service: DiscoveryService,
+    paths: LinuxClientPaths,
+    backends: Backends,
+    watcher: Arc<Mutex<Option<WatcherWorker>>>,
+}
+
+impl Default for PlatformDiscovery {
+    fn default() -> Self {
+        <Self as DiscoveryBackend>::new()
+    }
+}
+
+impl PlatformDiscovery {
+    pub(crate) fn from_config(paths: LinuxClientPaths, backends: Backends) -> Self {
+        Self {
+            service: DiscoveryService::new_for_os(PlatformOs::Linux),
+            paths,
+            backends,
+            watcher: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[cfg(any(test, feature = "native-tests"))]
+    pub fn with_config(
+        paths: LinuxClientPaths,
+        backends: Backends,
+    ) -> Result<Self, CapabilityError> {
+        backends.validate()?;
+        Ok(Self::from_config(paths, backends))
+    }
+
+    fn ensure_watcher_started(&self) {
+        let mut guard = self.watcher.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_some() {
+            return;
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_bg = stop.clone();
+        let service = self.service.clone();
+        let paths = self.paths.clone();
+        let backends = self.backends.clone();
+
+        let join = thread::spawn(move || {
+            let dirty = Arc::new(AtomicBool::new(true));
+            let latest_sink = Arc::new(Mutex::new(None));
+            let sub_handle = spawn_pulse_server_event_listener(
+                &paths,
+                latest_sink,
+                dirty.clone(),
+                thread::current(),
+                stop_bg.clone(),
+                true,
+            );
+            let mut last_scan = std::time::Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(std::time::Instant::now);
+
+            let linux_query =
+                DiscoveryQuery::all_for_os(PlatformOs::Linux).with_backends(backends.clone());
+
+            while !stop_bg.load(SeqCst) {
+                if service.active_subscriber_count() == 0 {
+                    stop_bg.store(true, SeqCst);
+                    break;
+                }
+                let is_dirty = dirty.swap(false, SeqCst);
+                if is_dirty || last_scan.elapsed() >= Duration::from_millis(500) {
+                    if let Ok(backend_inv) =
+                        collect_linux_backend_inventory_with_paths(&paths, &backends)
+                    {
+                        let _ = service.ingest_backend_inventory(backend_inv, &linux_query);
+                    }
+                    last_scan = std::time::Instant::now();
+                }
+                if !dirty.load(SeqCst) && !stop_bg.load(SeqCst) {
+                    thread::park_timeout(Duration::from_millis(50));
+                }
+            }
+
+            if let Some(h) = sub_handle {
+                let _ = h.join();
+            }
+        });
+
+        *guard = Some(WatcherWorker {
+            stop,
+            join: Some(join),
+        });
+    }
+
+    pub fn stop_watcher(&self) {
+        if let Some(mut worker) = self
+            .watcher
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            worker.stop_and_join();
+        }
+    }
+}
+
+impl DiscoveryBackend for PlatformDiscovery {
+    fn new() -> Self {
+        Self::from_config(LinuxClientPaths::default(), Backends::default())
+    }
+
+    fn with_backends(backends: Backends) -> Result<Self, CapabilityError> {
+        backends.validate()?;
+        Ok(Self::from_config(LinuxClientPaths::default(), backends))
+    }
+
+    #[inline]
+    fn service(&self) -> &DiscoveryService {
+        &self.service
+    }
+
+    #[inline]
+    fn backends(&self) -> &Backends {
+        &self.backends
+    }
+
+    fn is_watcher_running(&self) -> bool {
+        let mut guard = self.watcher.lock().unwrap_or_else(|e| e.into_inner());
+        if self.service.active_subscriber_count() == 0
+            && let Some(mut worker) = guard.take()
+        {
+            worker.stop_and_join();
+        }
+        guard.is_some()
+    }
+
+    fn refresh_once(&self) -> Result<u64, CapabilityError> {
+        let inv = collect_linux_backend_inventory_with_paths(&self.paths, &self.backends)?;
+        let query =
+            DiscoveryQuery::all_for_os(PlatformOs::Linux).with_backends(self.backends.clone());
+        self.service
+            .update_backend_inventory(inv, &query)
+            .map_err(CapabilityError::from)
+    }
+
+    fn default_output_device_id(&self) -> Result<Option<Arc<str>>, CapabilityError> {
+        if !self.is_watcher_running() {
+            self.refresh_once()?;
+        }
+        Ok(self.service.default_output_device_id())
+    }
+
+    fn default_input_device_id(&self) -> Result<Option<Arc<str>>, CapabilityError> {
+        if !self.is_watcher_running() {
+            self.refresh_once()?;
+        }
+        Ok(self.service.default_input_device_id())
+    }
+
+    fn process(
+        &self,
+        pid: u32,
+        scope: ProcessScope,
+        on_root_exit: OnRootExit,
+    ) -> Result<CaptureTarget, CapabilityError> {
+        let (identity, exe) = inspect_process_executable(pid)?;
+        let name = exe.rsplit('/').next().unwrap_or(exe.as_str()).to_owned();
+        let target = CaptureTarget::process(identity, scope, on_root_exit)?;
+        Ok(target.with_metadata(None, Some(name.into()), Some(exe.into()), None))
+    }
+
+    fn discover_query(&self, query: &DiscoveryQuery) -> Result<TargetCatalog, CapabilityError> {
+        query.backends.validate()?;
+        let inv = collect_linux_backend_inventory_with_paths(&self.paths, &query.backends)?;
+        self.service
+            .update_backend_inventory(inv, query)
+            .map_err(CapabilityError::from)?;
+        self.service
+            .discover_query(query)
+            .map_err(CapabilityError::from)
+    }
+
+    fn subscribe(
+        &self,
+        filter: DiscoveryFilter,
+        max_discovery_queue: usize,
+    ) -> Result<DiscoverySubscription, CapabilityError> {
+        let _ = self.refresh_once();
+        let sub = self.service.subscribe(filter, max_discovery_queue)?;
+        self.ensure_watcher_started();
+        Ok(sub)
+    }
+
+    fn subscribe_query(
+        &self,
+        query: DiscoveryQuery,
+        max_discovery_queue: usize,
+    ) -> Result<DiscoverySubscription, CapabilityError> {
+        query.backends.validate()?;
+        if let Ok(inv) = collect_linux_backend_inventory_with_paths(&self.paths, &query.backends) {
+            let _ = self.service.update_backend_inventory(inv, &query);
+        }
+        let sub = self.service.subscribe_query(query, max_discovery_queue)?;
+        self.ensure_watcher_started();
+        Ok(sub)
+    }
+}
+
+struct DefaultEndpointObserverState {
+    ref_count: usize,
+    latest_pw_endpoint: Arc<Mutex<Option<String>>>,
+    latest_pa_endpoint: Arc<Mutex<Option<String>>>,
+    worker: Option<WatcherWorker>,
+}
+
+static LINUX_DEFAULT_SINK_OBSERVER: OnceLock<Mutex<DefaultEndpointObserverState>> = OnceLock::new();
+static LINUX_DEFAULT_SOURCE_OBSERVER: OnceLock<Mutex<DefaultEndpointObserverState>> =
+    OnceLock::new();
+
+fn linux_observer_state() -> &'static Mutex<DefaultEndpointObserverState> {
+    LINUX_DEFAULT_SINK_OBSERVER.get_or_init(|| {
+        Mutex::new(DefaultEndpointObserverState {
+            ref_count: 0,
+            latest_pw_endpoint: Arc::new(Mutex::new(None)),
+            latest_pa_endpoint: Arc::new(Mutex::new(None)),
+            worker: None,
+        })
+    })
+}
+
+fn linux_source_observer_state() -> &'static Mutex<DefaultEndpointObserverState> {
+    LINUX_DEFAULT_SOURCE_OBSERVER.get_or_init(|| {
+        Mutex::new(DefaultEndpointObserverState {
+            ref_count: 0,
+            latest_pw_endpoint: Arc::new(Mutex::new(None)),
+            latest_pa_endpoint: Arc::new(Mutex::new(None)),
+            worker: None,
+        })
+    })
+}
+
+pub fn query_linux_default_sink_now(
+    backend: BackendId,
+    paths: &LinuxClientPaths,
+) -> Option<String> {
+    match backend {
+        BackendId::PipeWire => query_pipewire_default_sink_only(paths).ok().flatten(),
+        BackendId::PulseAudio => crate::loader::probe_pulse_server(paths)
+            .ok()
+            .and_then(|info| info.default_sink_name),
+        _ => None,
+    }
+}
+
+pub fn query_linux_default_source_now(
+    backend: BackendId,
+    paths: &LinuxClientPaths,
+) -> Option<String> {
+    match backend {
+        BackendId::PipeWire => query_pipewire_defaults_only(paths)
+            .ok()
+            .and_then(|(_, src)| src),
+        BackendId::PulseAudio => crate::loader::probe_pulse_server(paths)
+            .ok()
+            .and_then(|info| info.default_source_name)
+            .filter(|s| !s.ends_with(".monitor")),
+        _ => None,
+    }
+}
+
+/// Shared background observer for default output sink names.
+pub struct PlatformDefaultOutputObserver {
+    backend: Option<BackendId>,
+    latest_pw_sink: Arc<Mutex<Option<String>>>,
+    latest_pa_sink: Arc<Mutex<Option<String>>>,
+}
+
+impl PlatformDefaultOutputObserver {
+    pub(crate) fn acquire_for_backend(backend: Option<BackendId>, paths: LinuxClientPaths) -> Self {
+        let mut guard = linux_observer_state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if guard.ref_count == 0 {
+            let init_pw = query_linux_default_sink_now(BackendId::PipeWire, &paths);
+            let init_pa = query_linux_default_sink_now(BackendId::PulseAudio, &paths);
+            *guard
+                .latest_pw_endpoint
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = init_pw;
+            *guard
+                .latest_pa_endpoint
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = init_pa;
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_bg = stop.clone();
+            let pw_bg = guard.latest_pw_endpoint.clone();
+            let pa_bg = guard.latest_pa_endpoint.clone();
+            let join = thread::spawn(move || {
+                let dirty = Arc::new(AtomicBool::new(false));
+                let sub_handle = spawn_pulse_server_event_listener(
+                    &paths,
+                    pa_bg.clone(),
+                    dirty.clone(),
+                    thread::current(),
+                    stop_bg.clone(),
+                    false,
+                );
+                let has_event_sub = sub_handle.is_some();
+                while !stop_bg.load(SeqCst) {
+                    if dirty.swap(false, SeqCst) || !has_event_sub {
+                        if let Some(pw) = query_linux_default_sink_now(BackendId::PipeWire, &paths)
+                        {
+                            *pw_bg.lock().unwrap_or_else(|e| e.into_inner()) = Some(pw);
+                        }
+                        if !has_event_sub
+                            && let Some(pa) =
+                                query_linux_default_sink_now(BackendId::PulseAudio, &paths)
+                        {
+                            *pa_bg.lock().unwrap_or_else(|e| e.into_inner()) = Some(pa);
+                        }
+                    }
+                    if !dirty.load(SeqCst) && !stop_bg.load(SeqCst) {
+                        thread::park_timeout(Duration::from_millis(500));
+                    }
+                }
+                if let Some(h) = sub_handle {
+                    let _ = h.join();
+                }
+            });
+            guard.worker = Some(WatcherWorker {
+                stop,
+                join: Some(join),
+            });
+        }
+        guard.ref_count += 1;
+        Self {
+            backend,
+            latest_pw_sink: guard.latest_pw_endpoint.clone(),
+            latest_pa_sink: guard.latest_pa_endpoint.clone(),
+        }
+    }
+
+    fn select_cell(&self) -> Option<&Arc<Mutex<Option<String>>>> {
+        match self.backend {
+            Some(BackendId::PipeWire) => Some(&self.latest_pw_sink),
+            Some(BackendId::PulseAudio) => Some(&self.latest_pa_sink),
+            Some(_) => None,
+            None => {
+                if self
+                    .latest_pw_sink
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_some()
+                {
+                    Some(&self.latest_pw_sink)
+                } else {
+                    Some(&self.latest_pa_sink)
+                }
+            }
+        }
+    }
+}
+
+impl DefaultEndpointObserver for PlatformDefaultOutputObserver {
+    fn acquire() -> Self {
+        Self::acquire_for_backend(None, LinuxClientPaths::default())
+    }
+
+    fn latest_endpoint_id(&self) -> Option<String> {
+        let cell = self.select_cell()?;
+        cell.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn changed_from(&self, expected_id: Option<&str>) -> Option<String> {
+        let cell = self.select_cell()?;
+        let guard = cell.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_deref() {
+            Some(name) if Some(name) != expected_id => Some(name.to_owned()),
+            _ => None,
+        }
+    }
+}
+
+impl Drop for PlatformDefaultOutputObserver {
+    fn drop(&mut self) {
+        let mut guard = linux_observer_state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.ref_count = guard.ref_count.saturating_sub(1);
+        if guard.ref_count == 0
+            && let Some(mut worker) = guard.worker.take()
+        {
+            worker.stop_and_join();
+        }
+    }
+}
+
+/// Shared background observer for default input source names.
+pub struct PlatformDefaultInputObserver {
+    backend: Option<BackendId>,
+    latest_pw_source: Arc<Mutex<Option<String>>>,
+    latest_pa_source: Arc<Mutex<Option<String>>>,
+}
+
+impl PlatformDefaultInputObserver {
+    pub(crate) fn acquire_for_backend(backend: Option<BackendId>, paths: LinuxClientPaths) -> Self {
+        let mut guard = linux_source_observer_state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if guard.ref_count == 0 {
+            let init_pw = query_linux_default_source_now(BackendId::PipeWire, &paths);
+            let init_pa = query_linux_default_source_now(BackendId::PulseAudio, &paths);
+            *guard
+                .latest_pw_endpoint
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = init_pw;
+            *guard
+                .latest_pa_endpoint
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = init_pa;
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_bg = stop.clone();
+            let pw_bg = guard.latest_pw_endpoint.clone();
+            let pa_bg = guard.latest_pa_endpoint.clone();
+            let join = thread::spawn(move || {
+                let dirty = Arc::new(AtomicBool::new(false));
+                let sub_handle = spawn_pulse_server_event_listener_ext(
+                    &paths,
+                    None,
+                    Some(pa_bg.clone()),
+                    dirty.clone(),
+                    thread::current(),
+                    stop_bg.clone(),
+                    false,
+                    true,
+                );
+                let has_event_sub = sub_handle.is_some();
+                while !stop_bg.load(SeqCst) {
+                    if dirty.swap(false, SeqCst) || !has_event_sub {
+                        if let Some(pw) =
+                            query_linux_default_source_now(BackendId::PipeWire, &paths)
+                        {
+                            *pw_bg.lock().unwrap_or_else(|e| e.into_inner()) = Some(pw);
+                        }
+                        if !has_event_sub
+                            && let Some(pa) =
+                                query_linux_default_source_now(BackendId::PulseAudio, &paths)
+                        {
+                            *pa_bg.lock().unwrap_or_else(|e| e.into_inner()) = Some(pa);
+                        }
+                    }
+                    if !dirty.load(SeqCst) && !stop_bg.load(SeqCst) {
+                        thread::park_timeout(Duration::from_millis(500));
+                    }
+                }
+                if let Some(h) = sub_handle {
+                    let _ = h.join();
+                }
+            });
+            guard.worker = Some(WatcherWorker {
+                stop,
+                join: Some(join),
+            });
+        }
+        guard.ref_count += 1;
+        Self {
+            backend,
+            latest_pw_source: guard.latest_pw_endpoint.clone(),
+            latest_pa_source: guard.latest_pa_endpoint.clone(),
+        }
+    }
+
+    fn select_cell(&self) -> Option<&Arc<Mutex<Option<String>>>> {
+        match self.backend {
+            Some(BackendId::PipeWire) => Some(&self.latest_pw_source),
+            Some(BackendId::PulseAudio) => Some(&self.latest_pa_source),
+            Some(_) => None,
+            None => {
+                if self
+                    .latest_pw_source
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_some()
+                {
+                    Some(&self.latest_pw_source)
+                } else {
+                    Some(&self.latest_pa_source)
+                }
+            }
+        }
+    }
+}
+
+impl DefaultEndpointObserver for PlatformDefaultInputObserver {
+    fn acquire() -> Self {
+        Self::acquire_for_backend(None, LinuxClientPaths::default())
+    }
+
+    fn latest_endpoint_id(&self) -> Option<String> {
+        let cell = self.select_cell()?;
+        cell.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn changed_from(&self, expected_id: Option<&str>) -> Option<String> {
+        let cell = self.select_cell()?;
+        let guard = cell.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_deref() {
+            Some(name) if Some(name) != expected_id => Some(name.to_owned()),
+            _ => None,
+        }
+    }
+}
+
+impl Drop for PlatformDefaultInputObserver {
+    fn drop(&mut self) {
+        let mut guard = linux_source_observer_state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.ref_count = guard.ref_count.saturating_sub(1);
+        if guard.ref_count == 0
+            && let Some(mut worker) = guard.worker.take()
+        {
+            worker.stop_and_join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_pipewire_pid_uses_application_process_id_and_ignores_sec_pid() {
+        let mut client_app_pids = BTreeMap::new();
+        client_app_pids.insert(55, 22313);
+        let mut client_sec_pids = BTreeMap::new();
+        // Bridged PulseAudio client has pipewire.sec.pid == 2046 (pipewire-pulse daemon)
+        client_sec_pids.insert(55, 2046);
+        client_sec_pids.insert(56, 2046);
+
+        assert_eq!(
+            resolve_pipewire_node_pid(None, Some(55), &client_app_pids, &client_sec_pids),
+            Some(22313)
+        );
+        assert_eq!(
+            resolve_pipewire_node_pid(None, Some(56), &client_app_pids, &client_sec_pids),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_pipewire_default_sink_metadata_handles_spa_json_and_plain_names() {
+        assert_eq!(
+            parse_pipewire_default_sink_metadata(
+                r#"{"name":"alsa_output.pci-0000_00_1f.3.analog-stereo"}"#
+            ),
+            Some("alsa_output.pci-0000_00_1f.3.analog-stereo".to_owned())
+        );
+        assert_eq!(
+            parse_pipewire_default_sink_metadata(
+                r#"{ "name" : "bluez_output.AA_BB_CC_DD_EE_FF.1" }"#
+            ),
+            Some("bluez_output.AA_BB_CC_DD_EE_FF.1".to_owned())
+        );
+        assert_eq!(
+            parse_pipewire_default_sink_metadata("alsa_output.usb-dac-00.analog-stereo"),
+            Some("alsa_output.usb-dac-00.analog-stereo".to_owned())
+        );
+        assert_eq!(parse_pipewire_default_sink_metadata("   "), None);
+        assert_eq!(parse_pipewire_default_sink_metadata("{}"), None);
+    }
+
+    #[test]
+    fn internal_mixer_endpoint_filter_excludes_only_cspa_mix_prefix() {
+        assert!(is_internal_mixer_endpoint_name("cspa-mix-1234-1"));
+        assert!(!is_internal_mixer_endpoint_name("cspa_test_sink"));
+        assert!(!is_internal_mixer_endpoint_name("cspa-user-sink"));
+        assert!(!is_internal_mixer_endpoint_name(
+            "alsa_output.pci-0000_00_1f.3.analog-stereo"
+        ));
+    }
+}
