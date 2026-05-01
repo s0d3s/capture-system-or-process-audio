@@ -975,3 +975,713 @@ mod imp {
                 rt_ctx.producer.close();
                 ready_worker.notify();
 
+                (lib.pw_stream_destroy)(stream);
+                (lib.pw_core_disconnect)(core);
+                (lib.pw_context_destroy)(context);
+                (lib.pw_thread_loop_destroy)(tloop);
+            }
+        });
+
+        match init_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(())) => {
+                let control = reader.control_handle();
+                Ok(PipeWireStream {
+                    format,
+                    trace,
+                    reads: ReadStream::new(reader),
+                    control,
+                    default_cancel: Cancellation::default(),
+                    armed,
+                    stop,
+                    ready,
+                    ended,
+                    worker: Mutex::new(Some(worker)),
+                    _reservation: retained_reservation,
+                })
+            }
+            Ok(Err(err)) => {
+                stop.store(true, SeqCst);
+                let _ = worker.join();
+                Err(err)
+            }
+            Err(_) => {
+                stop.store(true, SeqCst);
+                let cleanup = StartupCleanup::new(stop, worker);
+                let _ = cleanup.wait(Duration::from_millis(500));
+                Err(CapabilityError::ServerUnavailable)
+            }
+        }
+    }
+
+    /// Start a `Manager`-owned `PlatformTopologyController` that creates a virtual
+    /// `support.null-audio-sink` and maintains passive non-lingering `FL`/`FR` port links
+    /// for all eligible nodes matching `targets` (`scope = "tree" | "exact"`).
+    pub fn start_pipewire_topology_controller(
+        paths: &LinuxClientPaths,
+        targets: Vec<CaptureTarget>,
+        max_links: usize,
+    ) -> Result<PlatformTopologyController, CapabilityError> {
+        if targets.is_empty() {
+            return Err(CapabilityError::InvalidTarget);
+        }
+        for target in &targets {
+            if matches!(target.kind(), TargetKind::Process | TargetKind::Application) {
+                let pid = target.pid().ok_or(CapabilityError::InvalidTarget)?;
+                let expected_gen = target
+                    .process_start_time()
+                    .ok_or(CapabilityError::InvalidTarget)?;
+                let (stat, _) = inspect_process_in_proc_root(Path::new("/proc"), pid)?;
+                if expected_gen != 0 && stat.starttime_ticks != expected_gen {
+                    return Err(CapabilityError::PidReused);
+                }
+            }
+        }
+
+        let lib = Arc::new(PipeWireLibrary::load(paths).map_err(|err| {
+            err.into_capability_error(BackendId::PipeWire, paths.pipewire_min_version)
+        })?);
+        let seq = MIX_SINK_COUNTER.fetch_add(1, SeqCst);
+        let sink_name = format!("cspa-mix-{}-{seq}", std::process::id());
+        let topology = Arc::new(Mutex::new(
+            NativeTreeMixTopology::new(max_links.clamp(1, 256))
+                .map_err(|_| CapabilityError::CapacityExceeded)?,
+        ));
+        let dirty = Arc::new(AtomicBool::new(true));
+        let stop = Arc::new(AtomicBool::new(false));
+        let created_links_count = Arc::new(AtomicU64::new(0));
+        let active_links_count = Arc::new(AtomicU64::new(0));
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(), CapabilityError>>(1);
+        let sink_name_worker = sink_name.clone();
+        let shared_targets: Arc<Mutex<Vec<Option<CaptureTarget>>>> =
+            Arc::new(Mutex::new(targets.iter().cloned().map(Some).collect()));
+        let targets_worker = shared_targets.clone();
+        let topology_worker = topology.clone();
+        let dirty_worker = dirty.clone();
+        let stop_worker = stop.clone();
+        let created_worker = created_links_count.clone();
+        let active_worker = active_links_count.clone();
+
+        let worker = thread::spawn(move || {
+            struct BoundObj {
+                proxy: *mut c_void,
+                _hook: Box<SpaHook>,
+            }
+
+            struct GraphState<'a> {
+                lib: &'a PipeWireLibrary,
+                registry: *mut c_void,
+                sink_name: String,
+                sink_node_id: Option<u32>,
+                sink_in_fl: Option<u32>,
+                sink_in_fr: Option<u32>,
+                client_app_pids: BTreeMap<u32, u32>,
+                client_sec_pids: BTreeMap<u32, u32>,
+                output_nodes: BTreeMap<u32, (Option<u32>, Option<u32>)>,
+                output_ports: BTreeMap<u32, (u32, usize)>,
+                bound_objs: BTreeMap<u32, BoundObj>,
+                dirty: Arc<AtomicBool>,
+            }
+
+            static NODE_EVENTS: PwNodeEvents = PwNodeEvents {
+                version: 0,
+                info: Some(on_node_info),
+                param: None,
+            };
+
+            static CLIENT_EVENTS: PwClientEvents = PwClientEvents {
+                version: 0,
+                info: Some(on_client_info),
+                permissions: None,
+            };
+
+            unsafe extern "C" fn on_node_info(data: *mut c_void, info: *const PwNodeInfo) {
+                // SAFETY: `data` points to `GraphState` and `info` is valid during callback.
+                unsafe {
+                    if info.is_null() {
+                        return;
+                    }
+                    let st = &mut *(data as *mut GraphState<'_>);
+                    let inf = &*info;
+                    if inf.props.is_null() {
+                        return;
+                    }
+                    let app_pid = SpaDict::lookup(inf.props, "application.process.id")
+                        .and_then(|s| s.trim().parse::<u32>().ok());
+                    let client_id = SpaDict::lookup(inf.props, "client.id")
+                        .and_then(|s| s.trim().parse::<u32>().ok());
+                    let entry = st.output_nodes.entry(inf.id).or_insert((None, None));
+                    if client_id.is_some() {
+                        entry.0 = client_id;
+                    }
+                    if app_pid.is_some() {
+                        entry.1 = app_pid;
+                    }
+                    st.dirty.store(true, SeqCst);
+                }
+            }
+
+            unsafe extern "C" fn on_client_info(data: *mut c_void, info: *const PwClientInfo) {
+                // SAFETY: `data` points to `GraphState` and `info` is valid during callback.
+                unsafe {
+                    if info.is_null() {
+                        return;
+                    }
+                    let st = &mut *(data as *mut GraphState<'_>);
+                    let inf = &*info;
+                    if inf.props.is_null() {
+                        return;
+                    }
+                    if let Some(pid_txt) = SpaDict::lookup(inf.props, "application.process.id")
+                        && let Ok(pid) = pid_txt.trim().parse::<u32>()
+                    {
+                        st.client_app_pids.insert(inf.id, pid);
+                    }
+                    if let Some(sec_txt) = SpaDict::lookup(inf.props, "pipewire.sec.pid")
+                        && let Ok(sec_pid) = sec_txt.trim().parse::<u32>()
+                    {
+                        st.client_sec_pids.insert(inf.id, sec_pid);
+                    }
+                    st.dirty.store(true, SeqCst);
+                }
+            }
+
+            unsafe extern "C" fn on_global(
+                data: *mut c_void,
+                id: u32,
+                _permissions: u32,
+                type_ptr: *const c_char,
+                _version: u32,
+                props: *const SpaDict,
+            ) {
+                // SAFETY: `data` points to `GraphState`.
+                unsafe {
+                    if type_ptr.is_null() || props.is_null() {
+                        return;
+                    }
+                    let st = &mut *(data as *mut GraphState<'_>);
+                    let Ok(type_str) = CStr::from_ptr(type_ptr).to_str() else {
+                        return;
+                    };
+                    match type_str {
+                        "PipeWire:Interface:Client" => {
+                            if let Some(pid_txt) = SpaDict::lookup(props, "application.process.id")
+                                && let Ok(pid) = pid_txt.trim().parse::<u32>()
+                            {
+                                st.client_app_pids.insert(id, pid);
+                            }
+                            if let Some(sec_txt) = SpaDict::lookup(props, "pipewire.sec.pid")
+                                && let Ok(sec_pid) = sec_txt.trim().parse::<u32>()
+                            {
+                                st.client_sec_pids.insert(id, sec_pid);
+                            }
+                            let proxy = st.lib.registry_bind(
+                                st.registry,
+                                id,
+                                c"PipeWire:Interface:Client".as_ptr(),
+                                3,
+                                0,
+                            );
+                            if !proxy.is_null() {
+                                let mut hook = Box::new(SpaHook::default());
+                                (st.lib.pw_proxy_add_object_listener)(
+                                    proxy,
+                                    &mut *hook,
+                                    (&CLIENT_EVENTS as *const PwClientEvents).cast(),
+                                    data,
+                                );
+                                st.bound_objs.insert(id, BoundObj { proxy, _hook: hook });
+                            }
+                            st.dirty.store(true, SeqCst);
+                        }
+                        "PipeWire:Interface:Node" => {
+                            let name = SpaDict::lookup(props, "node.name").unwrap_or_default();
+                            if name == st.sink_name {
+                                st.sink_node_id = Some(id);
+                                st.dirty.store(true, SeqCst);
+                                return;
+                            }
+                            let media_class =
+                                SpaDict::lookup(props, "media.class").unwrap_or_default();
+                            if media_class == "Stream/Output/Audio" {
+                                let client_id = SpaDict::lookup(props, "client.id")
+                                    .and_then(|s| s.trim().parse::<u32>().ok());
+                                let app_pid = SpaDict::lookup(props, "application.process.id")
+                                    .and_then(|s| s.trim().parse::<u32>().ok());
+                                st.output_nodes.insert(id, (client_id, app_pid));
+                                let proxy = st.lib.registry_bind(
+                                    st.registry,
+                                    id,
+                                    c"PipeWire:Interface:Node".as_ptr(),
+                                    3,
+                                    0,
+                                );
+                                if !proxy.is_null() {
+                                    let mut hook = Box::new(SpaHook::default());
+                                    (st.lib.pw_proxy_add_object_listener)(
+                                        proxy,
+                                        &mut *hook,
+                                        (&NODE_EVENTS as *const PwNodeEvents).cast(),
+                                        data,
+                                    );
+                                    st.bound_objs.insert(id, BoundObj { proxy, _hook: hook });
+                                }
+                                st.dirty.store(true, SeqCst);
+                            }
+                        }
+                        "PipeWire:Interface:Port" => {
+                            let Some(node_id) = SpaDict::lookup(props, "node.id")
+                                .and_then(|s| s.trim().parse::<u32>().ok())
+                            else {
+                                return;
+                            };
+                            let direction =
+                                SpaDict::lookup(props, "port.direction").unwrap_or_default();
+                            let channel =
+                                SpaDict::lookup(props, "audio.channel").unwrap_or_default();
+                            let ch_idx = if channel == "FL" || channel == "MONO" {
+                                Some(0)
+                            } else if channel == "FR" {
+                                Some(1)
+                            } else {
+                                None
+                            };
+                            let Some(ch) = ch_idx else {
+                                return;
+                            };
+                            if Some(node_id) == st.sink_node_id && direction == "in" {
+                                if ch == 0 {
+                                    st.sink_in_fl = Some(id);
+                                } else {
+                                    st.sink_in_fr = Some(id);
+                                }
+                                st.dirty.store(true, SeqCst);
+                            } else if direction == "out" {
+                                st.output_ports.insert(id, (node_id, ch));
+                                st.dirty.store(true, SeqCst);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            unsafe extern "C" fn on_global_remove(data: *mut c_void, id: u32) {
+                // SAFETY: `data` points to `GraphState`.
+                unsafe {
+                    let st = &mut *(data as *mut GraphState<'_>);
+                    st.output_nodes.remove(&id);
+                    st.output_ports.remove(&id);
+                    st.client_app_pids.remove(&id);
+                    if let Some(bound) = st.bound_objs.remove(&id)
+                        && !bound.proxy.is_null()
+                    {
+                        (st.lib.pw_proxy_destroy)(bound.proxy);
+                    }
+                    st.dirty.store(true, SeqCst);
+                }
+            }
+
+            // SAFETY: owns `pw_thread_loop`, `pw_context`, `pw_core`, `registry`, `sink`, and `link` proxies.
+            unsafe {
+                let tloop = (lib.pw_thread_loop_new)(c"cspa-pw-topo".as_ptr(), std::ptr::null());
+                if tloop.is_null() {
+                    let _ = ready_tx.send(Err(CapabilityError::ServerUnavailable));
+                    return;
+                }
+                let loop_obj = (lib.pw_thread_loop_get_loop)(tloop);
+                let context = (lib.pw_context_new)(loop_obj, std::ptr::null_mut(), 0);
+                if context.is_null() || (lib.pw_thread_loop_start)(tloop) < 0 {
+                    if !context.is_null() {
+                        (lib.pw_context_destroy)(context);
+                    }
+                    (lib.pw_thread_loop_destroy)(tloop);
+                    let _ = ready_tx.send(Err(CapabilityError::ServerUnavailable));
+                    return;
+                }
+
+                (lib.pw_thread_loop_lock)(tloop);
+                let core = (lib.pw_context_connect)(context, std::ptr::null_mut(), 0);
+                if core.is_null() {
+                    (lib.pw_thread_loop_unlock)(tloop);
+                    (lib.pw_thread_loop_stop)(tloop);
+                    (lib.pw_context_destroy)(context);
+                    (lib.pw_thread_loop_destroy)(tloop);
+                    let _ = ready_tx.send(Err(CapabilityError::ServerUnavailable));
+                    return;
+                }
+                let registry = lib.core_get_registry(core, 3, 0);
+                let mut cb_state = Box::new(GraphState {
+                    lib: &lib,
+                    registry,
+                    sink_name: sink_name_worker.clone(),
+                    sink_node_id: None,
+                    sink_in_fl: None,
+                    sink_in_fr: None,
+                    client_app_pids: BTreeMap::new(),
+                    client_sec_pids: BTreeMap::new(),
+                    output_nodes: BTreeMap::new(),
+                    output_ports: BTreeMap::new(),
+                    bound_objs: BTreeMap::new(),
+                    dirty: dirty_worker.clone(),
+                });
+                let reg_events = PwRegistryEvents {
+                    version: 0,
+                    global: Some(on_global),
+                    global_remove: Some(on_global_remove),
+                };
+                let mut reg_hook = SpaHook::default();
+                lib.registry_add_listener(
+                    registry,
+                    &mut reg_hook,
+                    &reg_events,
+                    (&mut *cb_state as *mut GraphState<'_>).cast(),
+                );
+
+                let sink_props = lib.new_properties(&[
+                    ("factory.name", "support.null-audio-sink"),
+                    ("node.name", sink_name_worker.as_str()),
+                    ("media.class", "Stream/Input/Audio"),
+                    ("node.virtual", "true"),
+                    ("object.linger", "false"),
+                    ("audio.channels", "2"),
+                    ("audio.position", "[ FL FR ]"),
+                ]);
+                let sink_proxy = lib.core_create_object(
+                    core,
+                    c"adapter".as_ptr(),
+                    c"PipeWire:Interface:Node".as_ptr(),
+                    3,
+                    &(*sink_props).dict,
+                    0,
+                );
+                (lib.pw_properties_free)(sink_props);
+                let _ = lib.core_sync(core, 0, 1);
+                (lib.pw_thread_loop_unlock)(tloop);
+
+                if sink_proxy.is_null() {
+                    (lib.pw_thread_loop_stop)(tloop);
+                    (lib.pw_proxy_destroy)(registry);
+                    (lib.pw_core_disconnect)(core);
+                    (lib.pw_context_destroy)(context);
+                    (lib.pw_thread_loop_destroy)(tloop);
+                    let _ = ready_tx.send(Err(CapabilityError::ServerUnavailable));
+                    return;
+                }
+
+                let mut link_proxies: BTreeMap<Arc<str>, *mut c_void> = BTreeMap::new();
+
+                let mut reconcile_once = || {
+                    let Ok(proc_map) = collect_proc_stat_table(Path::new("/proc")) else {
+                        return;
+                    };
+
+                    (lib.pw_thread_loop_lock)(tloop);
+                    let (Some(in_fl), Some(in_fr)) = (cb_state.sink_in_fl, cb_state.sink_in_fr)
+                    else {
+                        cb_state.dirty.store(true, SeqCst);
+                        (lib.pw_thread_loop_unlock)(tloop);
+                        return;
+                    };
+                    let sink_inputs = [in_fl, in_fr];
+                    let mut changed = false;
+
+                    {
+                        let active_set: std::collections::BTreeSet<Arc<str>> = topology_worker
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .active_sources()
+                            .into_iter()
+                            .collect();
+                        let mut to_remove = Vec::new();
+                        for key in link_proxies.keys() {
+                            if !active_set.contains(key) {
+                                to_remove.push(key.clone());
+                            }
+                        }
+                        for key in to_remove {
+                            if let Some(proxy) = link_proxies.remove(&key)
+                                && !proxy.is_null()
+                            {
+                                (lib.pw_proxy_destroy)(proxy);
+                                changed = true;
+                            }
+                        }
+                    }
+
+                    for (&out_port_id, &(out_node_id, ch)) in &cb_state.output_ports {
+                        let Some(&(client_id, node_app_pid)) =
+                            cb_state.output_nodes.get(&out_node_id)
+                        else {
+                            continue;
+                        };
+                        let Some(node_pid) = crate::discovery::resolve_pipewire_node_pid(
+                            node_app_pid,
+                            client_id,
+                            &cb_state.client_app_pids,
+                            &cb_state.client_sec_pids,
+                        ) else {
+                            continue;
+                        };
+
+                        let current_targets = targets_worker
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone();
+                        let mut matching_targets = Vec::new();
+                        for (t_idx, target_opt) in current_targets.iter().enumerate() {
+                            let Some(target) = target_opt else {
+                                continue;
+                            };
+                            if let Some(root_pid) = target.pid() {
+                                let root_id = ProcessIdentity {
+                                    pid: root_pid,
+                                    generation: target.process_start_time().unwrap_or(0),
+                                };
+                                let exact_only = target.scope() == ProcessScope::Exact;
+                                if pid_belongs_to_target(&proc_map, root_id, exact_only, node_pid)
+                                    == Ok(true)
+                                {
+                                    matching_targets.push(t_idx);
+                                }
+                            }
+                        }
+                        if matching_targets.is_empty() {
+                            continue;
+                        }
+
+                        let in_port_id = sink_inputs[ch];
+                        let link_key: Arc<str> =
+                            format!("{out_node_id}:{out_port_id}->{in_port_id}").into();
+                        let mut created_in_topo = false;
+                        {
+                            let mut topo =
+                                topology_worker.lock().unwrap_or_else(|e| e.into_inner());
+                            for &t_idx in &matching_targets {
+                                if let Ok(is_new) = topo.attach_source(t_idx, link_key.clone())
+                                    && is_new
+                                {
+                                    created_in_topo = true;
+                                }
+                            }
+                            active_worker.store(topo.active_link_count() as u64, SeqCst);
+                        }
+
+                        if created_in_topo && !link_proxies.contains_key(&link_key) {
+                            let out_node_s = out_node_id.to_string();
+                            let out_port_s = out_port_id.to_string();
+                            let in_node_s = cb_state.sink_node_id.unwrap_or(0).to_string();
+                            let in_port_s = in_port_id.to_string();
+                            let lprops = lib.new_properties(&[
+                                ("object.linger", "false"),
+                                ("link.output.node", out_node_s.as_str()),
+                                ("link.output.port", out_port_s.as_str()),
+                                ("link.input.node", in_node_s.as_str()),
+                                ("link.input.port", in_port_s.as_str()),
+                            ]);
+                            let lproxy = lib.core_create_object(
+                                core,
+                                c"link-factory".as_ptr(),
+                                c"PipeWire:Interface:Link".as_ptr(),
+                                3,
+                                &(*lprops).dict,
+                                0,
+                            );
+                            (lib.pw_properties_free)(lprops);
+                            if !lproxy.is_null() {
+                                link_proxies.insert(link_key, lproxy);
+                                created_worker.fetch_add(1, SeqCst);
+                                changed = true;
+                            }
+                        }
+                    }
+                    if changed {
+                        let _ = lib.core_sync(core, 0, 2);
+                    }
+                    (lib.pw_thread_loop_unlock)(tloop);
+                };
+
+                // Wait up to 500ms for virtual sink FL/FR input ports and initial node links.
+                let wait_start = Instant::now();
+                loop {
+                    let _ = dirty_worker.swap(false, SeqCst);
+                    reconcile_once();
+                    let linked = active_worker.load(SeqCst);
+                    if linked > 0 || wait_start.elapsed() >= Duration::from_millis(500) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                let _ = ready_tx.send(Ok(()));
+
+                while !stop_worker.load(SeqCst) {
+                    if dirty_worker.swap(false, SeqCst) {
+                        reconcile_once();
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+
+                (lib.pw_thread_loop_lock)(tloop);
+                for (_k, proxy) in link_proxies {
+                    if !proxy.is_null() {
+                        (lib.pw_proxy_destroy)(proxy);
+                    }
+                }
+                for (_id, bound) in std::mem::take(&mut cb_state.bound_objs) {
+                    if !bound.proxy.is_null() {
+                        (lib.pw_proxy_destroy)(bound.proxy);
+                    }
+                }
+                (lib.pw_proxy_destroy)(sink_proxy);
+                (lib.pw_proxy_destroy)(registry);
+                (lib.pw_core_disconnect)(core);
+                (lib.pw_thread_loop_unlock)(tloop);
+                (lib.pw_thread_loop_stop)(tloop);
+                (lib.pw_context_destroy)(context);
+                (lib.pw_thread_loop_destroy)(tloop);
+            }
+        });
+
+        match ready_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(())) => Ok(PlatformTopologyController {
+                sink_name,
+                targets,
+                shared_targets,
+                topology,
+                dirty,
+                stop,
+                worker: Mutex::new(Some(worker)),
+                created_links_count,
+                active_links_count,
+            }),
+            Ok(Err(err)) => {
+                stop.store(true, SeqCst);
+                let _ = worker.join();
+                Err(err)
+            }
+            Err(_) => {
+                stop.store(true, SeqCst);
+                let _ = worker.join();
+                Err(CapabilityError::ServerUnavailable)
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub use imp::{
+    open_pipewire_point, open_pipewire_source_point, start_pipewire_topology_controller,
+};
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+pub fn open_pipewire_point_with_format(
+    paths: &LinuxClientPaths,
+    _target_object: Option<&str>,
+    _capture_sink: bool,
+    _format: Format,
+    _clock_domain: u64,
+    _overflow: Overflow,
+    _timing: TimingRequirement,
+    _budget: &StorageBudget,
+    _observed: bool,
+) -> Result<PipeWireStream, CapabilityError> {
+    let _ = linux_endpoint_clock_domain("stub");
+    Err(
+        crate::loader::ClientLoadError::LibraryAbsent(paths.pipewire_so.clone())
+            .into_capability_error(BackendId::PipeWire, paths.pipewire_min_version),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn open_pipewire_source_point(
+    paths: &LinuxClientPaths,
+    _source_name: Option<&str>,
+    _format_override: Option<Format>,
+    _overflow: Overflow,
+    _timing: TimingRequirement,
+    _budget: &StorageBudget,
+    _observed: bool,
+) -> Result<PipeWireStream, CapabilityError> {
+    Err(
+        crate::loader::ClientLoadError::LibraryAbsent(paths.pipewire_so.clone())
+            .into_capability_error(BackendId::PipeWire, paths.pipewire_min_version),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn open_pipewire_point(
+    paths: &LinuxClientPaths,
+    _target_object: Option<&str>,
+    _capture_sink: bool,
+    _overflow: Overflow,
+    _timing: TimingRequirement,
+    _budget: &StorageBudget,
+    _observed: bool,
+) -> Result<PipeWireStream, CapabilityError> {
+    let _ = (
+        POOL_SLOTS,
+        QUEUE_SLOTS,
+        MAX_FRAMES_PER_SLOT,
+        SESSION_METADATA_BYTES,
+        &MIX_SINK_COUNTER,
+        StartupCleanup::new,
+        publish_linux_packet
+            as fn(
+                &mut Producer,
+                &[u8],
+                bool,
+                bool,
+                usize,
+                Option<u64>,
+                u64,
+                &mut u64,
+                &mut u64,
+                &mut u64,
+                Overflow,
+                Option<Instant>,
+            ),
+    );
+    let _ = (
+        collect_proc_stat_table,
+        inspect_process_in_proc_root,
+        pid_belongs_to_target,
+    );
+    let _ = (
+        std::mem::size_of::<BTreeMap<u32, u32>>(),
+        Path::new(""),
+        ProcessIdentity {
+            pid: 1,
+            generation: 1,
+        },
+        ProcessScope::Tree,
+        TargetKind::Process,
+        Format::new(
+            SampleType::F32,
+            ByteOrder::Little,
+            48_000,
+            2,
+            Layout::Unknown,
+        ),
+        StorageLimits::new(8, 4096, 8, 262_144),
+        Pool::new_reserved,
+        ordering::channel,
+        ReadStream::new,
+    );
+    Err(
+        crate::loader::ClientLoadError::LibraryAbsent(paths.pipewire_so.clone())
+            .into_capability_error(BackendId::PipeWire, paths.pipewire_min_version),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn start_pipewire_topology_controller(
+    paths: &LinuxClientPaths,
+    _targets: Vec<CaptureTarget>,
+    _max_links: usize,
+) -> Result<PlatformTopologyController, CapabilityError> {
+    Err(
+        crate::loader::ClientLoadError::LibraryAbsent(paths.pipewire_so.clone())
+            .into_capability_error(BackendId::PipeWire, paths.pipewire_min_version),
+    )
+}
