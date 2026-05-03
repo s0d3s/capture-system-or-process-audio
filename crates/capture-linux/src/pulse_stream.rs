@@ -631,3 +631,437 @@ mod imp {
                         .map_or(std::ptr::null(), |c| c.as_ptr())
                 };
 
+                if (lib.pa_stream_connect_record)(stream, dev_ptr, &attr, PA_STREAM_ADJUST_LATENCY)
+                    < 0
+                {
+                    (lib.pa_stream_set_state_callback)(stream, None, std::ptr::null_mut());
+                    (lib.pa_stream_set_read_callback)(stream, None, std::ptr::null_mut());
+                    (lib.pa_stream_unref)(stream);
+                    (lib.pa_context_set_state_callback)(context, None, std::ptr::null_mut());
+                    (lib.pa_context_disconnect)(context);
+                    (lib.pa_threaded_mainloop_unlock)(mainloop);
+                    (lib.pa_threaded_mainloop_stop)(mainloop);
+                    (lib.pa_context_unref)(context);
+                    (lib.pa_threaded_mainloop_free)(mainloop);
+                    let _ = ready_tx.send(Err(CapabilityError::ServerUnavailable));
+                    return;
+                }
+
+                loop {
+                    let st = (lib.pa_stream_get_state)(stream);
+                    if st == PA_STREAM_READY {
+                        break;
+                    }
+                    if st == PA_STREAM_FAILED || st == PA_STREAM_TERMINATED {
+                        (lib.pa_stream_set_state_callback)(stream, None, std::ptr::null_mut());
+                        (lib.pa_stream_set_read_callback)(stream, None, std::ptr::null_mut());
+                        (lib.pa_stream_unref)(stream);
+                        (lib.pa_context_set_state_callback)(context, None, std::ptr::null_mut());
+                        (lib.pa_context_disconnect)(context);
+                        (lib.pa_threaded_mainloop_unlock)(mainloop);
+                        (lib.pa_threaded_mainloop_stop)(mainloop);
+                        (lib.pa_context_unref)(context);
+                        (lib.pa_threaded_mainloop_free)(mainloop);
+                        let _ = ready_tx.send(Err(CapabilityError::ServerUnavailable));
+                        return;
+                    }
+                    (lib.pa_threaded_mainloop_wait)(mainloop);
+                }
+                loop {
+                    let mut data_ptr: *const c_void = std::ptr::null();
+                    let mut nbytes: usize = 0;
+                    if (lib.pa_stream_peek)(stream, &mut data_ptr, &mut nbytes) < 0 || nbytes == 0 {
+                        break;
+                    }
+                    let _ = (lib.pa_stream_drop)(stream);
+                }
+                (lib.pa_threaded_mainloop_unlock)(mainloop);
+
+                let _ = ready_tx.send(Ok(()));
+
+                while !stop_worker.load(SeqCst)
+                    && !read_ctx.producer.control_handle().stopping()
+                    && !read_ctx.failed.load(SeqCst)
+                {
+                    thread::sleep(Duration::from_millis(5));
+                }
+
+                (lib.pa_threaded_mainloop_lock)(mainloop);
+                (lib.pa_stream_set_read_callback)(stream, None, std::ptr::null_mut());
+                (lib.pa_stream_set_state_callback)(stream, None, std::ptr::null_mut());
+                let _ = (lib.pa_stream_disconnect)(stream);
+                (lib.pa_stream_unref)(stream);
+                (lib.pa_context_set_state_callback)(context, None, std::ptr::null_mut());
+                (lib.pa_context_disconnect)(context);
+                (lib.pa_threaded_mainloop_unlock)(mainloop);
+                (lib.pa_threaded_mainloop_stop)(mainloop);
+                (lib.pa_context_unref)(context);
+                (lib.pa_threaded_mainloop_free)(mainloop);
+
+                if read_ctx.failed.load(SeqCst) {
+                    let _ = ended_worker.compare_exchange(0, 3, SeqCst, SeqCst);
+                    read_ctx.producer.fail_capture(Failure::Backend);
+                } else {
+                    let _ = ended_worker.compare_exchange(0, 1, SeqCst, SeqCst);
+                }
+                read_ctx.producer.close();
+                ready_worker.notify();
+            }
+        });
+
+        match ready_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(())) => {
+                let control = reader.control_handle();
+                Ok(PulseStream {
+                    format,
+                    trace,
+                    reads: ReadStream::new(reader),
+                    control,
+                    default_cancel: Cancellation::default(),
+                    armed,
+                    stop,
+                    ready,
+                    ended,
+                    server_kind,
+                    worker: Mutex::new(Some(worker)),
+                    _reservation: retained_reservation,
+                })
+            }
+            Ok(Err(err)) => {
+                stop.store(true, SeqCst);
+                let _ = worker.join();
+                Err(err)
+            }
+            Err(_) => {
+                stop.store(true, SeqCst);
+                let _ = worker.join();
+                Err(CapabilityError::ServerUnavailable)
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub use imp::{open_pulse_point, open_pulse_source_point};
+
+#[cfg(not(target_os = "linux"))]
+pub fn open_pulse_source_point(
+    paths: &LinuxClientPaths,
+    _source_name: Option<&str>,
+    _format_override: Option<Format>,
+    _overflow: Overflow,
+    _timing: TimingRequirement,
+    _budget: &StorageBudget,
+    _observed: bool,
+) -> Result<PulseStream, CapabilityError> {
+    let _ = (
+        collect_pulse_full_state,
+        probe_pulse_server,
+        linux_endpoint_clock_domain("stub"),
+    );
+    Err(
+        crate::loader::ClientLoadError::LibraryAbsent(paths.pulse_so.clone())
+            .into_capability_error(BackendId::PulseAudio, paths.pulse_min_version),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn open_pulse_point(
+    paths: &LinuxClientPaths,
+    _monitor_source: Option<&str>,
+    _monitor_sink_input_index: Option<u32>,
+    _overflow: Overflow,
+    _timing: TimingRequirement,
+    _budget: &StorageBudget,
+    _observed: bool,
+) -> Result<PulseStream, CapabilityError> {
+    let _ = (
+        POOL_SLOTS,
+        QUEUE_SLOTS,
+        MAX_FRAMES_PER_SLOT,
+        SESSION_METADATA_BYTES,
+        PulseServerKind::StandalonePulseAudio,
+        Channel::FrontLeft,
+        ByteOrder::Little,
+        Layout::Unknown,
+        SampleType::F32,
+        StorageLimits::new(8, 4096, 8, 262_144),
+        Pool::new_reserved,
+        ordering::channel,
+        ReadStream::new,
+        publish_linux_packet
+            as fn(
+                &mut Producer,
+                &[u8],
+                bool,
+                bool,
+                usize,
+                Option<u64>,
+                u64,
+                &mut u64,
+                &mut u64,
+                &mut u64,
+                Overflow,
+                Option<Instant>,
+            ),
+    );
+    Err(
+        crate::loader::ClientLoadError::LibraryAbsent(paths.pulse_so.clone())
+            .into_capability_error(BackendId::PulseAudio, paths.pulse_min_version),
+    )
+}
+
+/// Single-session stream backed by PipeWire or PulseAudio.
+pub enum PlatformStream {
+    PipeWire(PipeWireStream),
+    Pulse(PulseStream),
+}
+
+impl PlatformStream {
+    pub fn open(target: &CaptureTarget, overflow: Overflow) -> Result<Self, CapabilityError> {
+        Self::open_with_options(
+            target,
+            ProcessTreeRange::default(),
+            &Backends::default(),
+            overflow,
+            TimingRequirement::Raw,
+        )
+    }
+
+    pub fn open_with_options(
+        target: &CaptureTarget,
+        tree_range: ProcessTreeRange,
+        backends: &Backends,
+        overflow: Overflow,
+        timing: TimingRequirement,
+    ) -> Result<Self, CapabilityError> {
+        Self::open_with_permission_policy(
+            target,
+            tree_range,
+            backends,
+            overflow,
+            timing,
+            crate::core::schema::PermissionPolicy::AutoRequest,
+        )
+    }
+
+    pub fn open_with_permission_policy(
+        target: &CaptureTarget,
+        tree_range: ProcessTreeRange,
+        backends: &Backends,
+        overflow: Overflow,
+        timing: TimingRequirement,
+        _permission_policy: crate::core::schema::PermissionPolicy,
+    ) -> Result<Self, CapabilityError> {
+        target.validate()?;
+        tree_range.validate()?;
+        backends.validate()?;
+        if timing == TimingRequirement::Precise {
+            return Err(CapabilityError::PreciseTimingUnqualified);
+        }
+        if matches!(target.kind(), TargetKind::Process | TargetKind::Application) {
+            return Err(CapabilityError::NotImplemented);
+        }
+
+        let linux_backends = backends.for_os(PlatformOs::Linux);
+        if linux_backends.is_empty() {
+            return Err(CapabilityError::InvalidBackend);
+        }
+        let pinned_slice;
+        let candidates: &[BackendId] = match target.backend() {
+            Some(b @ (BackendId::PipeWire | BackendId::PulseAudio)) => {
+                pinned_slice = [b];
+                &pinned_slice
+            }
+            Some(_) => return Err(CapabilityError::InvalidBackend),
+            None => linux_backends,
+        };
+
+        let paths = LinuxClientPaths::default();
+        crate::permissions::ensure_linux_socket_permissions(backends, &paths)?;
+        let budget = StorageBudget::new(2, AggregateManagerBudgets::default().max_total_pcm_memory)
+            .map_err(|_| CapabilityError::CapacityExceeded)?;
+        let clean_id = target.clean_device_id();
+        let mut first_err: Option<CapabilityError> = None;
+
+        for &backend in candidates {
+            let res = match (backend, target.kind()) {
+                (BackendId::PipeWire, TargetKind::Device | TargetKind::DefaultOutput) => {
+                    let dev = clean_id
+                        .map(str::to_owned)
+                        .or_else(|| query_linux_default_sink_now(BackendId::PipeWire, &paths));
+                    open_pipewire_point(
+                        &paths,
+                        dev.as_deref(),
+                        true,
+                        overflow,
+                        timing,
+                        &budget,
+                        false,
+                    )
+                    .map(Self::PipeWire)
+                }
+                (BackendId::PipeWire, TargetKind::InputDevice | TargetKind::DefaultInput) => {
+                    open_pipewire_source_point(
+                        &paths, clean_id, None, overflow, timing, &budget, false,
+                    )
+                    .map(Self::PipeWire)
+                }
+                (BackendId::PulseAudio, TargetKind::Device | TargetKind::DefaultOutput) => {
+                    open_pulse_point(&paths, clean_id, None, overflow, timing, &budget, false)
+                        .map(Self::Pulse)
+                }
+                (BackendId::PulseAudio, TargetKind::InputDevice | TargetKind::DefaultInput) => {
+                    open_pulse_source_point(
+                        &paths, clean_id, None, overflow, timing, &budget, false,
+                    )
+                    .map(Self::Pulse)
+                }
+                _ => Err(CapabilityError::NotImplemented),
+            };
+            match res {
+                Ok(stream) => return Ok(stream),
+                Err(err) => {
+                    let allow_fb = err.allows_cross_backend_fallback();
+                    if first_err.is_none() {
+                        first_err = Some(err.clone());
+                    }
+                    if !allow_fb {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        Err(first_err.unwrap_or(CapabilityError::NotImplemented))
+    }
+
+    pub(crate) fn arm(&self) {
+        match self {
+            Self::PipeWire(s) => s.arm(),
+            Self::Pulse(s) => s.arm(),
+        }
+    }
+
+    #[cfg(any(test, feature = "native-tests"))]
+    pub fn pulse_server_kind(&self) -> Option<PulseServerKind> {
+        match self {
+            Self::PipeWire(_) => None,
+            Self::Pulse(s) => Some(s.server_kind()),
+        }
+    }
+}
+
+impl AudioStreamBackend for PlatformStream {
+    #[inline]
+    fn format(&self) -> &Arc<Format> {
+        match self {
+            Self::PipeWire(s) => s.format(),
+            Self::Pulse(s) => s.format(),
+        }
+    }
+
+    #[inline]
+    fn trace(&self) -> Option<&Arc<Trace>> {
+        match self {
+            Self::PipeWire(s) => s.trace(),
+            Self::Pulse(s) => s.trace(),
+        }
+    }
+
+    #[inline]
+    fn control_handle(&self) -> ControlHandle {
+        match self {
+            Self::PipeWire(s) => s.control_handle(),
+            Self::Pulse(s) => s.control_handle(),
+        }
+    }
+
+    #[inline]
+    fn default_cancel(&self) -> Cancellation {
+        match self {
+            Self::PipeWire(s) => s.default_cancel(),
+            Self::Pulse(s) => s.default_cancel(),
+        }
+    }
+
+    #[inline]
+    fn end_reason(&self) -> Option<EndReason> {
+        match self {
+            Self::PipeWire(s) => s.end_reason(),
+            Self::Pulse(s) => s.end_reason(),
+        }
+    }
+
+    #[inline]
+    fn read_with_cancel(
+        &mut self,
+        frames: usize,
+        timeout: Duration,
+        cancel: Cancellation,
+    ) -> Result<ReadResult, ReadError> {
+        match self {
+            Self::PipeWire(s) => s.read_with_cancel(frames, timeout, cancel),
+            Self::Pulse(s) => s.read_with_cancel(frames, timeout, cancel),
+        }
+    }
+
+    #[inline]
+    fn read_into_with_cancel(
+        &mut self,
+        destination: &mut [u8],
+        frames: usize,
+        timeout: Duration,
+        cancel: Cancellation,
+    ) -> Result<ReadResult, ReadError> {
+        match self {
+            Self::PipeWire(s) => s.read_into_with_cancel(destination, frames, timeout, cancel),
+            Self::Pulse(s) => s.read_into_with_cancel(destination, frames, timeout, cancel),
+        }
+    }
+
+    #[inline]
+    fn stop(&self, mode: Stop) {
+        match self {
+            Self::PipeWire(s) => s.stop(mode),
+            Self::Pulse(s) => s.stop(mode),
+        }
+    }
+
+    #[inline]
+    fn resources_done(&self) -> bool {
+        match self {
+            Self::PipeWire(s) => s.resources_done(),
+            Self::Pulse(s) => s.resources_done(),
+        }
+    }
+
+    #[inline]
+    fn wait_cleanup(&self, timeout: Duration) -> bool {
+        match self {
+            Self::PipeWire(s) => s.wait_cleanup(timeout),
+            Self::Pulse(s) => s.wait_cleanup(timeout),
+        }
+    }
+}
+
+impl OpenableStreamBackend for PlatformStream {
+    #[inline]
+    fn open_with_permission_policy(
+        target: &CaptureTarget,
+        tree_range: ProcessTreeRange,
+        backends: &Backends,
+        overflow: Overflow,
+        timing: TimingRequirement,
+        permission_policy: crate::core::schema::PermissionPolicy,
+    ) -> Result<Self, CapabilityError> {
+        Self::open_with_permission_policy(
+            target,
+            tree_range,
+            backends,
+            overflow,
+            timing,
+            permission_policy,
+        )
+    }
+}
