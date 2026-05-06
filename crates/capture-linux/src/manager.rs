@@ -1884,3 +1884,1273 @@ impl PlatformManager {
         }
     }
 
+    fn drain_software_mix_inputs(&mut self, timeout: Duration, cancel: &Cancellation) -> u64 {
+        let req_ref = &self.request;
+        let plan_ref = &self.plan;
+        let paths_ref = &self.paths;
+        let policy = self.policy;
+        let timing = self.timing;
+        let PlatformExecutionEngine::SoftwareMix {
+            block_frames,
+            multi,
+            inputs,
+            opened_sink_inputs,
+            pa_sub_watch,
+            last_sink_input_scan,
+            started_at,
+            in_bytes_scratch,
+            pulse_sub_f32,
+            pulse_sum_f32,
+            pulse_sum_bytes,
+            drained_blocks,
+            ..
+        } = &mut self.engine
+        else {
+            return 0;
+        };
+
+        for inp in inputs.iter() {
+            inp.stream.arm();
+        }
+
+        let should_scan_pa = match pa_sub_watch.as_ref() {
+            Some(watch) if watch.join.is_some() => watch.dirty.swap(false, SeqCst),
+            Some(_) => last_sink_input_scan.elapsed() >= Duration::from_millis(150),
+            None => false,
+        };
+        if should_scan_pa {
+            *last_sink_input_scan = Instant::now();
+            if let Ok((_devs, _pids, sink_inputs)) = collect_pulse_state(paths_ref)
+                && let Ok(proc_map) = collect_proc_stat_table(Path::new("/proc"))
+            {
+                for (t_idx, target) in req_ref.targets().iter().enumerate() {
+                    if plan_ref.target_plans[t_idx].resolved_backend == BackendId::PulseAudio
+                        && matches!(target.kind(), TargetKind::Process | TargetKind::Application)
+                        && let Some(root_pid) = target.pid()
+                    {
+                        let root_id = ProcessIdentity {
+                            pid: root_pid,
+                            generation: target.process_start_time().unwrap_or(0),
+                        };
+                        let exact_only = target.scope() == ProcessScope::Exact;
+                        for si in &sink_inputs {
+                            if !opened_sink_inputs.contains(&(t_idx, si.index))
+                                && let Some(si_pid) = si.pid
+                                && pid_belongs_to_target(&proc_map, root_id, exact_only, si_pid)
+                                    == Ok(true)
+                                && let Ok(stream) = open_pulse_point(
+                                    paths_ref,
+                                    None,
+                                    Some(si.index),
+                                    policy,
+                                    timing,
+                                    multi.storage_budget(),
+                                    false,
+                                )
+                                && let Ok(inp) = SoftwareMixInput::new_pulse_substream(
+                                    t_idx,
+                                    BackendId::PulseAudio,
+                                    PlatformStream::Pulse(stream),
+                                )
+                            {
+                                opened_sink_inputs.insert((t_idx, si.index));
+                                let _ = multi.set_input_state(t_idx, ParticipationState::Active);
+                                inputs.push(inp);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let working_rate = u64::from(multi.working_format().rate().max(1));
+        let mix_quantum = *block_frames;
+        let align_wait = Duration::from_nanos(req_ref.mixer_config().alignment_window_ns)
+            .min(Duration::from_millis(20));
+        let call_started = Instant::now();
+
+        loop {
+            let any_recently_active = inputs.iter().any(|inp| {
+                !inp.eof
+                    && inp
+                        .last_active
+                        .is_some_and(|t| t.elapsed() < Duration::from_millis(250))
+            });
+            let mut waited_on_idle_leader = false;
+            let mut pushed_any = false;
+
+            for t_idx in 0..req_ref.targets().len() {
+                let already_queued = multi
+                    .input_handles()
+                    .get(t_idx)
+                    .and_then(|h| h.snapshot())
+                    .map_or(0, |s| s.queued_packets);
+                if already_queued > 0 {
+                    pushed_any = true;
+                    continue;
+                }
+
+                let is_pa_proc_target = plan_ref.target_plans[t_idx].resolved_backend
+                    == BackendId::PulseAudio
+                    && matches!(
+                        req_ref.targets()[t_idx].kind(),
+                        TargetKind::Process | TargetKind::Application
+                    );
+
+                if !is_pa_proc_target {
+                    let Some(inp) = inputs
+                        .iter_mut()
+                        .find(|inp| inp.target_idx == t_idx && !inp.eof)
+                    else {
+                        let _ = multi.set_input_state(t_idx, ParticipationState::Idle);
+                        continue;
+                    };
+                    let bpf = inp.stream.format().bytes_per_frame();
+                    let stream_rate = u64::from(inp.stream.format().rate().max(1));
+                    let is_resampled = stream_rate != working_rate;
+                    let in_quantum = ((stream_rate * mix_quantum as u64).div_ceil(working_rate)
+                        as usize)
+                        .clamp(1, MAX_FRAMES_PER_SLOT);
+                    let dst_bytes = in_quantum * bpf;
+                    if in_bytes_scratch.len() < dst_bytes {
+                        in_bytes_scratch.resize(dst_bytes, 0);
+                    }
+                    let max_passes = if is_resampled { 3 } else { 2 };
+
+                    for pass in 0..max_passes {
+                        let is_this_active = inp
+                            .last_active
+                            .is_some_and(|t| t.elapsed() < Duration::from_millis(250));
+                        let stream_timeout = if pass > 0 {
+                            timeout.min(Duration::from_millis(12))
+                        } else if is_this_active {
+                            timeout.min(Duration::from_millis(25))
+                        } else if !any_recently_active && !pushed_any && !waited_on_idle_leader {
+                            waited_on_idle_leader = true;
+                            timeout.min(Duration::from_millis(10))
+                        } else {
+                            Duration::ZERO
+                        };
+
+                        let mut got_res = None;
+                        for _attempt in 0..16 {
+                            if let Ok(res) = inp.stream.read_into_with_cancel(
+                                &mut in_bytes_scratch[..dst_bytes],
+                                in_quantum,
+                                stream_timeout,
+                                cancel.clone(),
+                            ) {
+                                if res.frames > 0 || res.reason != PartialReason::Boundary {
+                                    got_res = Some(res);
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        if let Some(res) = got_res {
+                            if res.frames > 0 {
+                                inp.last_active = Some(Instant::now());
+                                let now_ns = started_at.elapsed().as_nanos() as u64;
+                                let stamp = res.first_packet.and_then(|a| a.header.timestamp);
+                                let _ = multi.push_raw_input_bytes(
+                                    t_idx,
+                                    &in_bytes_scratch[..res.frames * bpf],
+                                    stamp,
+                                    now_ns,
+                                );
+                                if res.reason == PartialReason::Eof {
+                                    inp.eof = true;
+                                }
+                                let now_queued = multi
+                                    .input_handles()
+                                    .get(t_idx)
+                                    .and_then(|h| h.snapshot())
+                                    .map_or(0, |s| s.queued_packets);
+                                if now_queued > 0 {
+                                    pushed_any = true;
+                                    break;
+                                }
+                            } else {
+                                if res.reason == PartialReason::Eof {
+                                    inp.eof = true;
+                                }
+                                if pass == 0
+                                    && (inp.eof
+                                        || inp.last_active.is_none_or(|t| {
+                                            t.elapsed() >= Duration::from_millis(500)
+                                        }))
+                                {
+                                    let _ = multi.set_input_state(t_idx, ParticipationState::Idle);
+                                }
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                } else {
+                    let live_count = inputs
+                        .iter()
+                        .filter(|inp| {
+                            inp.target_idx == t_idx
+                                && (!inp.eof
+                                    || inp
+                                        .sub_reblocker
+                                        .as_ref()
+                                        .is_some_and(|r| r.buffered_frames() > 0))
+                        })
+                        .count();
+                    if live_count == 0 {
+                        let _ = multi.set_input_state(t_idx, ParticipationState::Idle);
+                        continue;
+                    }
+
+                    for inp in inputs.iter_mut() {
+                        if inp.target_idx != t_idx || inp.eof {
+                            continue;
+                        }
+                        let buffered = inp
+                            .sub_reblocker
+                            .as_ref()
+                            .map_or(0, FrameReblocker::buffered_frames);
+                        if buffered >= PA_PROC_QUANTUM_FRAMES {
+                            continue;
+                        }
+                        let is_this_active = inp
+                            .last_active
+                            .is_some_and(|t| t.elapsed() < Duration::from_millis(250));
+                        let mut rem_wait = if is_this_active {
+                            timeout.min(Duration::from_millis(25))
+                        } else if !any_recently_active && !pushed_any && !waited_on_idle_leader {
+                            waited_on_idle_leader = true;
+                            timeout.min(Duration::from_millis(10))
+                        } else {
+                            Duration::ZERO
+                        };
+
+                        while !inp.eof {
+                            let cur_buf = inp
+                                .sub_reblocker
+                                .as_ref()
+                                .map_or(0, FrameReblocker::buffered_frames);
+                            if cur_buf >= PA_PROC_QUANTUM_FRAMES {
+                                break;
+                            }
+                            let need = PA_PROC_QUANTUM_FRAMES - cur_buf;
+                            let step_start = Instant::now();
+                            let mut got_res = None;
+                            for _attempt in 0..16 {
+                                if let Ok(res) = inp.stream.read_into_with_cancel(
+                                    &mut in_bytes_scratch[..need * 8],
+                                    need,
+                                    rem_wait,
+                                    cancel.clone(),
+                                ) {
+                                    if res.frames > 0 || res.reason != PartialReason::Boundary {
+                                        got_res = Some(res);
+                                        break;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                            rem_wait = rem_wait.saturating_sub(step_start.elapsed());
+                            if let Some(res) = got_res {
+                                if res.frames > 0 {
+                                    inp.last_active = Some(Instant::now());
+                                    if let Some(ts) =
+                                        res.first_packet.and_then(|a| a.header.timestamp)
+                                    {
+                                        inp.last_stamp = Some(ts);
+                                    }
+                                    let samp_cnt = res.frames * 2;
+                                    for (k, b) in in_bytes_scratch[..res.frames * 8]
+                                        .chunks_exact(4)
+                                        .enumerate()
+                                    {
+                                        pulse_sub_f32[k] =
+                                            f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                                    }
+                                    if let Some(reblocker) = inp.sub_reblocker.as_mut() {
+                                        let _ = reblocker.push_samples(&pulse_sub_f32[..samp_cnt]);
+                                    }
+                                    if res.reason == PartialReason::Eof {
+                                        inp.eof = true;
+                                        break;
+                                    }
+                                    if rem_wait.is_zero() {
+                                        break;
+                                    }
+                                } else {
+                                    if res.reason == PartialReason::Eof {
+                                        inp.eof = true;
+                                    }
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+
+                    // Bound peer alignment when a substream has a full quantum.
+                    let any_ready = inputs.iter().any(|inp| {
+                        inp.target_idx == t_idx
+                            && inp
+                                .sub_reblocker
+                                .as_ref()
+                                .is_some_and(|r| r.buffered_frames() >= PA_PROC_QUANTUM_FRAMES)
+                    });
+                    if any_ready && live_count > 1 {
+                        let align_started = Instant::now();
+                        for inp in inputs.iter_mut() {
+                            if inp.target_idx != t_idx || inp.eof {
+                                continue;
+                            }
+                            let allow_bounded_wait = *drained_blocks == 0
+                                || inp
+                                    .last_active
+                                    .is_none_or(|t| t.elapsed() < Duration::from_millis(500));
+                            while !inp.eof {
+                                let cur_buf = inp
+                                    .sub_reblocker
+                                    .as_ref()
+                                    .map_or(0, FrameReblocker::buffered_frames);
+                                if cur_buf >= PA_PROC_QUANTUM_FRAMES {
+                                    break;
+                                }
+                                let rem = if allow_bounded_wait {
+                                    align_wait.saturating_sub(align_started.elapsed())
+                                } else {
+                                    Duration::ZERO
+                                };
+                                let need = PA_PROC_QUANTUM_FRAMES - cur_buf;
+                                let mut got_res = None;
+                                for _attempt in 0..16 {
+                                    if let Ok(res) = inp.stream.read_into_with_cancel(
+                                        &mut in_bytes_scratch[..need * 8],
+                                        need,
+                                        rem,
+                                        cancel.clone(),
+                                    ) {
+                                        if res.frames > 0 || res.reason != PartialReason::Boundary {
+                                            got_res = Some(res);
+                                            break;
+                                        }
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                if let Some(res) = got_res {
+                                    if res.frames > 0 {
+                                        inp.last_active = Some(Instant::now());
+                                        if let Some(ts) =
+                                            res.first_packet.and_then(|a| a.header.timestamp)
+                                        {
+                                            inp.last_stamp = Some(ts);
+                                        }
+                                        let samp_cnt = res.frames * 2;
+                                        for (k, b) in in_bytes_scratch[..res.frames * 8]
+                                            .chunks_exact(4)
+                                            .enumerate()
+                                        {
+                                            pulse_sub_f32[k] =
+                                                f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                                        }
+                                        if let Some(reblocker) = inp.sub_reblocker.as_mut() {
+                                            let _ =
+                                                reblocker.push_samples(&pulse_sub_f32[..samp_cnt]);
+                                        }
+                                        if res.reason == PartialReason::Eof {
+                                            inp.eof = true;
+                                            break;
+                                        }
+                                        if rem.is_zero() {
+                                            break;
+                                        }
+                                    } else {
+                                        if res.reason == PartialReason::Eof {
+                                            inp.eof = true;
+                                        }
+                                        break;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    let any_quantum_ready = inputs.iter().any(|inp| {
+                        inp.target_idx == t_idx
+                            && inp
+                                .sub_reblocker
+                                .as_ref()
+                                .is_some_and(|r| r.buffered_frames() >= PA_PROC_QUANTUM_FRAMES)
+                    });
+                    let max_eof_tail = if !any_quantum_ready {
+                        inputs
+                            .iter()
+                            .filter(|inp| inp.target_idx == t_idx && inp.eof)
+                            .filter_map(|inp| {
+                                inp.sub_reblocker.as_ref().map(|r| r.buffered_frames())
+                            })
+                            .max()
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    let emit_frames = if any_quantum_ready {
+                        PA_PROC_QUANTUM_FRAMES
+                    } else {
+                        max_eof_tail
+                    };
+
+                    if emit_frames > 0 {
+                        let emit_samples = emit_frames * 2;
+                        pulse_sum_f32[..emit_samples].fill(0.0);
+                        let mut group_stamp = None;
+                        for inp in inputs.iter_mut() {
+                            if inp.target_idx != t_idx {
+                                continue;
+                            }
+                            let Some(reblocker) = inp.sub_reblocker.as_mut() else {
+                                continue;
+                            };
+                            if any_quantum_ready
+                                && reblocker.buffered_frames() >= PA_PROC_QUANTUM_FRAMES
+                            {
+                                if reblocker
+                                    .pop_block_into(&mut pulse_sub_f32[..emit_samples])
+                                    .unwrap_or(false)
+                                {
+                                    if group_stamp.is_none() {
+                                        group_stamp = inp.last_stamp;
+                                    }
+                                    for k in 0..emit_samples {
+                                        let val = pulse_sub_f32[k];
+                                        if val.is_finite() {
+                                            pulse_sum_f32[k] += val;
+                                        } else {
+                                            pulse_sum_f32[k] = f32::NAN;
+                                        }
+                                    }
+                                }
+                            } else if inp.eof && reblocker.buffered_frames() > 0 {
+                                let tail_frames = reblocker.buffered_frames().min(emit_frames);
+                                let tail_samples = tail_frames * 2;
+                                if reblocker
+                                    .peek_into(0, &mut pulse_sub_f32[..tail_samples])
+                                    .unwrap_or(false)
+                                {
+                                    reblocker.clear();
+                                    if group_stamp.is_none() {
+                                        group_stamp = inp.last_stamp;
+                                    }
+                                    for k in 0..tail_samples {
+                                        let val = pulse_sub_f32[k];
+                                        if val.is_finite() {
+                                            pulse_sum_f32[k] += val;
+                                        } else {
+                                            pulse_sum_f32[k] = f32::NAN;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        for (k, &s) in pulse_sum_f32[..emit_samples].iter().enumerate() {
+                            pulse_sum_bytes[k * 4..k * 4 + 4].copy_from_slice(&s.to_le_bytes());
+                        }
+                        let now_ns = started_at.elapsed().as_nanos() as u64;
+                        let _ = multi.push_raw_input_bytes(
+                            t_idx,
+                            &pulse_sum_bytes[..emit_samples * 4],
+                            group_stamp,
+                            now_ns,
+                        );
+                        *drained_blocks = drained_blocks.saturating_add(1);
+                        pushed_any = true;
+                    } else {
+                        let all_idle =
+                            inputs
+                                .iter()
+                                .filter(|inp| inp.target_idx == t_idx)
+                                .all(|inp| {
+                                    inp.eof
+                                        || inp.last_active.is_none_or(|t| {
+                                            t.elapsed() >= Duration::from_millis(500)
+                                        })
+                                });
+                        if all_idle {
+                            let _ = multi.set_input_state(t_idx, ParticipationState::Idle);
+                        }
+                    }
+                }
+            }
+
+            if pushed_any
+                || req_ref.mixer_config().silence_on_idle
+                || timeout.is_zero()
+                || call_started.elapsed() >= timeout
+                || cancel.is_cancelled()
+            {
+                break;
+            }
+            thread::park_timeout(
+                Duration::from_millis(5).min(timeout.saturating_sub(call_started.elapsed())),
+            );
+        }
+
+        started_at.elapsed().as_nanos() as u64
+    }
+}
+
+impl CaptureManagerBackend for PlatformManager {
+    fn open_with_options(
+        request: CaptureRequest,
+        overflow: Overflow,
+        timing: TimingRequirement,
+    ) -> Result<Self, CapabilityError> {
+        Self::open_impl(
+            request,
+            LinuxClientPaths::default(),
+            overflow,
+            timing,
+            false,
+        )
+    }
+
+    #[inline]
+    fn plan(&self) -> &CapturePlanReport {
+        &self.plan
+    }
+
+    fn selected_backend(&self) -> BackendId {
+        self.plan.selected_backend.unwrap_or_else(|| {
+            self.plan
+                .target_plans
+                .first()
+                .map_or(BackendId::PipeWire, |p| p.resolved_backend)
+        })
+    }
+
+    #[inline]
+    fn is_software_mix(&self) -> bool {
+        matches!(self.engine, PlatformExecutionEngine::SoftwareMix { .. })
+    }
+
+    fn working_format(&self) -> Option<&Arc<Format>> {
+        match &self.engine {
+            PlatformExecutionEngine::PassThrough { stream, .. } => {
+                stream.as_ref().map(AudioStreamBackend::format)
+            }
+            PlatformExecutionEngine::SoftwareMix { multi, .. } => Some(multi.working_format()),
+        }
+    }
+
+    fn output_format(&self) -> Option<&Arc<Format>> {
+        match &self.engine {
+            PlatformExecutionEngine::PassThrough { stream, .. } => {
+                stream.as_ref().map(AudioStreamBackend::format)
+            }
+            PlatformExecutionEngine::SoftwareMix { multi, .. } => Some(multi.output_format()),
+        }
+    }
+
+    #[inline]
+    fn targets(&self) -> &[CaptureTarget] {
+        self.request.targets()
+    }
+
+    fn input_handles(&self) -> &[InputStatusHandle] {
+        match &self.engine {
+            PlatformExecutionEngine::SoftwareMix { multi, .. } => multi.input_handles(),
+            PlatformExecutionEngine::PassThrough { .. } => &[],
+        }
+    }
+
+    fn membership_descriptor(&self) -> Option<MembershipDescriptor> {
+        match &self.engine {
+            PlatformExecutionEngine::SoftwareMix { multi, .. } => {
+                Some(multi.membership_descriptor())
+            }
+            PlatformExecutionEngine::PassThrough { .. } => None,
+        }
+    }
+
+    #[inline]
+    fn last_block_metadata(&self) -> Option<MixedBlockMetadata> {
+        self.last_metadata
+    }
+
+    #[inline]
+    fn session_id(&self) -> u64 {
+        self.session_counter
+    }
+
+    #[inline]
+    fn segment_id(&self) -> u64 {
+        self.segment_counter
+    }
+
+    #[inline]
+    fn on_format_change(&self) -> OnFormatChange {
+        self.request.on_format_change()
+    }
+
+    #[inline]
+    fn route_guard(&self) -> Option<&RouteRollbackGuard> {
+        Some(&self.route_guard)
+    }
+
+    fn update_targets(&mut self, new_targets: Vec<CaptureTarget>) -> Result<u64, CapabilityError> {
+        self.update_targets_impl(new_targets)
+    }
+
+    fn notify_default_device_changed(
+        &mut self,
+        new_device_id: Option<&str>,
+    ) -> Result<bool, CapabilityError> {
+        self.notify_default_flow_changed(TargetKind::DefaultOutput, new_device_id)
+    }
+
+    fn notify_default_input_changed(
+        &mut self,
+        new_device_id: Option<&str>,
+    ) -> Result<bool, CapabilityError> {
+        self.notify_default_flow_changed(TargetKind::DefaultInput, new_device_id)
+    }
+
+    fn reopen_relaunched_target(
+        &mut self,
+        target_index: usize,
+        new_pid: u32,
+    ) -> Result<(), CapabilityError> {
+        self.reopen_relaunched_target_impl(target_index, new_pid)
+    }
+
+    #[inline]
+    fn default_cancel(&self) -> Cancellation {
+        self.default_cancel.clone()
+    }
+
+    fn read_with_cancel(
+        &mut self,
+        frames: usize,
+        timeout: Duration,
+        cancel: Cancellation,
+    ) -> Result<ReadResult, ReadError> {
+        if frames == 0 {
+            return Err(ReadError::InvalidRequest);
+        }
+        self.poll_default_device_follow();
+        let _guard = self.read_lock.try_lock().map_err(|err| match err {
+            TryLockError::WouldBlock => ReadError::AlreadyPending,
+            TryLockError::Poisoned(_) => ReadError::Poisoned,
+        })?;
+
+        if let Some(boundary) = self.pending_boundary.take() {
+            return Ok(ReadResult {
+                frames: 0,
+                chunks: Vec::new(),
+                first_packet: None,
+                last_packet: None,
+                reason: PartialReason::Boundary,
+                control: Some(ordering::Control {
+                    sequence: 0,
+                    generation: boundary.session,
+                    segment: boundary.segment,
+                    format: boundary.format,
+                    kind: ordering::ControlKind::Recovered,
+                    losses: ordering::Losses::default(),
+                    records: 1,
+                }),
+                copies: Default::default(),
+            });
+        }
+        if self.stopped {
+            return Ok(ReadResult {
+                frames: 0,
+                chunks: Vec::new(),
+                first_packet: None,
+                last_packet: None,
+                reason: PartialReason::Eof,
+                control: None,
+                copies: Default::default(),
+            });
+        }
+        if self.terminal_error.is_some() {
+            return Ok(ReadResult {
+                frames: 0,
+                chunks: Vec::new(),
+                first_packet: None,
+                last_packet: None,
+                reason: PartialReason::Failure(Failure::Backend),
+                control: None,
+                copies: Default::default(),
+            });
+        }
+        if cancel.is_cancelled() {
+            return Ok(ReadResult {
+                frames: 0,
+                chunks: Vec::new(),
+                first_packet: None,
+                last_packet: None,
+                reason: PartialReason::Cancelled,
+                control: None,
+                copies: Default::default(),
+            });
+        }
+        drop(_guard);
+
+        match &mut self.engine {
+            PlatformExecutionEngine::PassThrough { stream, .. } => {
+                let Some(active) = stream.as_mut() else {
+                    return Ok(ReadResult {
+                        frames: 0,
+                        chunks: Vec::new(),
+                        first_packet: None,
+                        last_packet: None,
+                        reason: PartialReason::Eof,
+                        control: None,
+                        copies: Default::default(),
+                    });
+                };
+                let res = active.read_with_cancel(frames, timeout, cancel)?;
+                if res.frames > 0 {
+                    self.last_metadata = Some(MixedBlockMetadata {
+                        membership_version: self.segment_counter,
+                        contributing_mask: 1,
+                        late_inputs: 0,
+                        failed_inputs: 0,
+                        nonfinite_inputs: 0,
+                        synthesized_silence: false,
+                        clipped_samples: 0,
+                        nonfinite_samples: 0,
+                        drift_slips: 0,
+                        skew_estimate_ns: Some(0),
+                        skew_uncertainty_ns: Some(0),
+                    });
+                }
+                Ok(res)
+            }
+            PlatformExecutionEngine::SoftwareMix { multi, .. } => {
+                if let Some((res, meta)) = multi.try_pop_pending_owned(frames)? {
+                    self.last_metadata = Some(meta);
+                    return Ok(res);
+                }
+                let now_ns = self.drain_software_mix_inputs(timeout, &cancel);
+                if cancel.is_cancelled() {
+                    return Ok(ReadResult {
+                        frames: 0,
+                        chunks: Vec::new(),
+                        first_packet: None,
+                        last_packet: None,
+                        reason: PartialReason::Cancelled,
+                        control: None,
+                        copies: Default::default(),
+                    });
+                }
+                let align_ns = self.request.mixer_config().alignment_window_ns;
+                let PlatformExecutionEngine::SoftwareMix { multi, .. } = &self.engine else {
+                    unreachable!()
+                };
+                let (res, meta) = multi.read_mixed_owned(frames, now_ns, align_ns)?;
+                self.last_metadata = Some(meta);
+                Ok(res)
+            }
+        }
+    }
+
+    fn read_into_with_cancel(
+        &mut self,
+        destination: &mut [u8],
+        frames: usize,
+        timeout: Duration,
+        cancel: Cancellation,
+    ) -> Result<ReadResult, ReadError> {
+        if frames == 0 {
+            return Err(ReadError::InvalidRequest);
+        }
+        self.poll_default_device_follow();
+        let _guard = self.read_lock.try_lock().map_err(|err| match err {
+            TryLockError::WouldBlock => ReadError::AlreadyPending,
+            TryLockError::Poisoned(_) => ReadError::Poisoned,
+        })?;
+
+        if let Some(boundary) = self.pending_boundary.take() {
+            return Ok(ReadResult {
+                frames: 0,
+                chunks: Vec::new(),
+                first_packet: None,
+                last_packet: None,
+                reason: PartialReason::Boundary,
+                control: Some(ordering::Control {
+                    sequence: 0,
+                    generation: boundary.session,
+                    segment: boundary.segment,
+                    format: boundary.format,
+                    kind: ordering::ControlKind::Recovered,
+                    losses: ordering::Losses::default(),
+                    records: 1,
+                }),
+                copies: Default::default(),
+            });
+        }
+        if self.stopped {
+            return Ok(ReadResult {
+                frames: 0,
+                chunks: Vec::new(),
+                first_packet: None,
+                last_packet: None,
+                reason: PartialReason::Eof,
+                control: None,
+                copies: Default::default(),
+            });
+        }
+        if self.terminal_error.is_some() {
+            return Ok(ReadResult {
+                frames: 0,
+                chunks: Vec::new(),
+                first_packet: None,
+                last_packet: None,
+                reason: PartialReason::Failure(Failure::Backend),
+                control: None,
+                copies: Default::default(),
+            });
+        }
+        if cancel.is_cancelled() {
+            return Ok(ReadResult {
+                frames: 0,
+                chunks: Vec::new(),
+                first_packet: None,
+                last_packet: None,
+                reason: PartialReason::Cancelled,
+                control: None,
+                copies: Default::default(),
+            });
+        }
+        drop(_guard);
+
+        match &mut self.engine {
+            PlatformExecutionEngine::PassThrough { stream, .. } => {
+                let Some(active) = stream.as_mut() else {
+                    return Ok(ReadResult {
+                        frames: 0,
+                        chunks: Vec::new(),
+                        first_packet: None,
+                        last_packet: None,
+                        reason: PartialReason::Eof,
+                        control: None,
+                        copies: Default::default(),
+                    });
+                };
+                let res = active.read_into_with_cancel(destination, frames, timeout, cancel)?;
+                if res.frames > 0 {
+                    self.last_metadata = Some(MixedBlockMetadata {
+                        membership_version: self.segment_counter,
+                        contributing_mask: 1,
+                        late_inputs: 0,
+                        failed_inputs: 0,
+                        nonfinite_inputs: 0,
+                        synthesized_silence: false,
+                        clipped_samples: 0,
+                        nonfinite_samples: 0,
+                        drift_slips: 0,
+                        skew_estimate_ns: Some(0),
+                        skew_uncertainty_ns: Some(0),
+                    });
+                }
+                Ok(res)
+            }
+            PlatformExecutionEngine::SoftwareMix { multi, .. } => {
+                let out_stride = multi.output_format().bytes_per_frame();
+                if destination.len() < frames.saturating_mul(out_stride) {
+                    return Err(ReadError::InvalidDestination);
+                }
+                if let Some((res, meta)) = multi.try_pop_pending_into(destination, frames)? {
+                    self.last_metadata = Some(meta);
+                    return Ok(res);
+                }
+                let now_ns = self.drain_software_mix_inputs(timeout, &cancel);
+                if cancel.is_cancelled() {
+                    return Ok(ReadResult {
+                        frames: 0,
+                        chunks: Vec::new(),
+                        first_packet: None,
+                        last_packet: None,
+                        reason: PartialReason::Cancelled,
+                        control: None,
+                        copies: Default::default(),
+                    });
+                }
+                let align_ns = self.request.mixer_config().alignment_window_ns;
+                let PlatformExecutionEngine::SoftwareMix { multi, .. } = &self.engine else {
+                    unreachable!()
+                };
+                let (res, meta) = multi.read_mixed_into(destination, frames, now_ns, align_ns)?;
+                self.last_metadata = Some(meta);
+                Ok(res)
+            }
+        }
+    }
+
+    fn stop(&mut self, mode: Stop) {
+        self.stopped = true;
+        self.default_observer = None;
+        self.default_source_observer = None;
+        if mode == Stop::Abort {
+            self.pending_boundary = None;
+        }
+        match &mut self.engine {
+            PlatformExecutionEngine::PassThrough { stream, topology } => {
+                if let Some(active) = stream.as_ref() {
+                    active.stop(mode);
+                }
+                if let Some(topo) = topology {
+                    topo.shutdown();
+                }
+            }
+            PlatformExecutionEngine::SoftwareMix {
+                multi,
+                inputs,
+                sub_topologies,
+                pa_sub_watch,
+                ..
+            } => {
+                if mode == Stop::Abort {
+                    multi.clear_pending_output();
+                }
+                if let Some(mut watch) = pa_sub_watch.take() {
+                    watch.stop_and_join();
+                }
+                for inp in inputs {
+                    inp.stream.stop(mode);
+                }
+                for (_, topo) in sub_topologies {
+                    topo.shutdown();
+                }
+            }
+        }
+    }
+
+    fn wait_cleanup(&mut self, timeout: Duration) -> bool {
+        let started = Instant::now();
+        match &mut self.engine {
+            PlatformExecutionEngine::PassThrough { stream, topology } => {
+                if let Some(topo) = topology {
+                    topo.shutdown();
+                }
+                if let Some(active) = stream.as_ref() {
+                    let rem = timeout.saturating_sub(started.elapsed());
+                    let _ = active.wait_cleanup(rem);
+                }
+            }
+            PlatformExecutionEngine::SoftwareMix {
+                inputs,
+                sub_topologies,
+                pa_sub_watch,
+                ..
+            } => {
+                if let Some(mut watch) = pa_sub_watch.take() {
+                    watch.stop_and_join();
+                }
+                for (_, topo) in sub_topologies {
+                    topo.shutdown();
+                }
+                for inp in inputs {
+                    let rem = timeout.saturating_sub(started.elapsed());
+                    let _ = inp.stream.wait_cleanup(rem);
+                }
+            }
+        }
+        self.resources_done()
+    }
+
+    fn resources_done(&self) -> bool {
+        match &self.engine {
+            PlatformExecutionEngine::PassThrough { stream, topology } => {
+                stream
+                    .as_ref()
+                    .is_none_or(AudioStreamBackend::resources_done)
+                    && topology
+                        .as_ref()
+                        .is_none_or(PlatformTopologyController::is_finished)
+            }
+            PlatformExecutionEngine::SoftwareMix {
+                inputs,
+                sub_topologies,
+                pa_sub_watch,
+                ..
+            } => {
+                pa_sub_watch.is_none()
+                    && inputs
+                        .iter()
+                        .all(|inp| AudioStreamBackend::resources_done(&inp.stream))
+                    && sub_topologies.iter().all(|(_, topo)| topo.is_finished())
+            }
+        }
+    }
+}
+
+impl Drop for PlatformManager {
+    fn drop(&mut self) {
+        self.stop(Stop::Abort);
+        let _ = self.wait_cleanup(self.cleanup_timeout.min(Duration::from_millis(500)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        CaptureManager,
+        core::schema::{CombineMode, InputConversionPolicy},
+        pipewire_stream::PipeWireStream,
+    };
+
+    fn make_tone_packets_i16_mono(
+        rate_hz: u32,
+        freq: f64,
+        packets: usize,
+        frames_per_pkt: usize,
+    ) -> Vec<(Vec<u8>, usize, u64)> {
+        let mut out = Vec::with_capacity(packets);
+        let step_ns = ((frames_per_pkt as u64) * 1_000_000_000) / u64::from(rate_hz);
+        for p in 0..packets {
+            let mut bytes = Vec::with_capacity(frames_per_pkt * 2);
+            for n in 0..frames_per_pkt {
+                let idx = p * frames_per_pkt + n;
+                let t = idx as f64 / f64::from(rate_hz);
+                let s =
+                    (0.25 * (2.0 * std::f64::consts::PI * freq * t).sin() * 32767.0).round() as i16;
+                bytes.extend_from_slice(&s.to_le_bytes());
+            }
+            out.push((bytes, frames_per_pkt, 10_000_000 + (p as u64) * step_ns));
+        }
+        out
+    }
+
+    fn make_tone_packets_f32_stereo(
+        rate_hz: u32,
+        freq_l: f64,
+        freq_r: f64,
+        packets: usize,
+        frames_per_pkt: usize,
+    ) -> Vec<(Vec<u8>, usize, u64)> {
+        let mut out = Vec::with_capacity(packets);
+        let step_ns = ((frames_per_pkt as u64) * 1_000_000_000) / u64::from(rate_hz);
+        for p in 0..packets {
+            let mut bytes = Vec::with_capacity(frames_per_pkt * 8);
+            for n in 0..frames_per_pkt {
+                let idx = p * frames_per_pkt + n;
+                let t = idx as f64 / f64::from(rate_hz);
+                let l = (0.25 * (2.0 * std::f64::consts::PI * freq_l * t).sin()) as f32;
+                let r = (0.25 * (2.0 * std::f64::consts::PI * freq_r * t).sin()) as f32;
+                bytes.extend_from_slice(&l.to_le_bytes());
+                bytes.extend_from_slice(&r.to_le_bytes());
+            }
+            out.push((bytes, frames_per_pkt, 10_000_000 + (p as u64) * step_ns));
+        }
+        out
+    }
+
+    fn read_into_via_generic_manager<B: CaptureManagerBackend>(
+        mgr: &mut crate::core::traits::CaptureManager<B>,
+        dst: &mut [u8],
+        frames: usize,
+        timeout: Duration,
+    ) -> Result<ReadResult, ReadError> {
+        mgr.read_into(dst, frames, timeout)
+    }
+
+    #[test]
+    fn platform_manager_shared_out_pool_zero_steady_allocations_and_format_gates()
+    -> Result<(), CapabilityError> {
+        let fmt_16k = Arc::new(
+            Format::new(
+                SampleType::I16,
+                ByteOrder::Little,
+                16_000,
+                1,
+                Layout::Known(Arc::from([Channel::Mono])),
+            )
+            .unwrap(),
+        );
+        let fmt_48k = Arc::new(
+            Format::new(
+                SampleType::F32,
+                ByteOrder::Little,
+                48_000,
+                2,
+                Layout::Known(Arc::from([Channel::FrontLeft, Channel::FrontRight])),
+            )
+            .unwrap(),
+        );
+
+        let budget = StorageBudget::new(8, 32 * 1024 * 1024).unwrap();
+        let sys_t = CaptureTarget::device("pw-sys-0")
+            .unwrap()
+            .with_backend(BackendId::PipeWire);
+        let mic_t = CaptureTarget::input_device("pa-mic-0")
+            .unwrap()
+            .with_backend(BackendId::PulseAudio);
+        let s_sys = PlatformStream::PipeWire(PipeWireStream::from_synthetic_packets(
+            fmt_48k.clone(),
+            1,
+            make_tone_packets_f32_stereo(48_000, 1000.0, 1500.0, 50, 480),
+            &budget,
+        )?);
+        let s_mic = PlatformStream::PipeWire(PipeWireStream::from_synthetic_packets(
+            fmt_16k.clone(),
+            5,
+            make_tone_packets_i16_mono(16_000, 500.0, 50, 160),
+            &budget,
+        )?);
+        let stream_only_bytes = budget.reserved_bytes();
+        let stream_only_sessions = budget.resident_sessions();
+        assert_eq!(stream_only_sessions, 2);
+
+        let mut mgr = CaptureManager::from_backend(PlatformManager::from_synthetic_streams(
+            CaptureRequest::new(vec![sys_t, mic_t]),
+            vec![(BackendId::PipeWire, s_sys), (BackendId::PulseAudio, s_mic)],
+            budget.clone(),
+        )?);
+        // The output pool charges the shared budget without consuming a stream session slot.
+        assert_eq!(budget.resident_sessions(), 2);
+        assert!(budget.reserved_bytes() > stream_only_bytes);
+        assert!(mgr.is_software_mix());
+        assert_eq!(mgr.working_format().unwrap().rate(), 48_000);
+        assert!(mgr.route_guard().is_some_and(|g| !g.allow_reroute()));
+
+        let mut dst = [0u8; 256 * 8];
+        for _ in 0..2 {
+            let _ =
+                read_into_via_generic_manager(&mut mgr, &mut dst, 256, Duration::from_millis(40))
+                    .unwrap();
+        }
+        let mut measured_reads = 0usize;
+        let allocs = allocation_counter::measure(|| {
+            for _ in 0..64 {
+                let res = read_into_via_generic_manager(
+                    &mut mgr,
+                    &mut dst,
+                    256,
+                    Duration::from_millis(40),
+                )
+                .unwrap();
+                if res.frames > 0 {
+                    measured_reads += 1;
+                }
+            }
+        });
+        assert!(measured_reads >= 40);
+        assert_eq!(
+            allocs.count_total, 0,
+            "CaptureManager<PlatformManager>::read_into allocated {} times in steady state",
+            allocs.count_total
+        );
+        mgr.stop(Stop::Abort);
+        assert!(mgr.wait_cleanup(Duration::from_secs(2)));
+
+        let follow_in = CaptureTarget::microphone(DefaultDeviceMode::Follow);
+        let pt_s1 = PlatformStream::PipeWire(PipeWireStream::from_synthetic_packets(
+            fmt_16k.clone(),
+            2,
+            make_tone_packets_i16_mono(16_000, 440.0, 2, 160),
+            &budget,
+        )?);
+        let pt_s2 = PlatformStream::PipeWire(PipeWireStream::from_synthetic_packets(
+            fmt_48k.clone(),
+            3,
+            make_tone_packets_f32_stereo(48_000, 440.0, 440.0, 2, 480),
+            &budget,
+        )?);
+        let mut pt_fail = PlatformManager::from_synthetic_streams(
+            CaptureRequest::single(follow_in.clone()).with_on_format_change(OnFormatChange::Fail),
+            vec![(BackendId::PipeWire, pt_s1)],
+            budget.clone(),
+        )?;
+        assert_eq!(
+            pt_fail.apply_opened_default_stream_for_test(TargetKind::DefaultInput, pt_s2),
+            Err(CapabilityError::FormatChangeRejected)
+        );
+        drop(pt_fail);
+
+        let mix_s1 = PlatformStream::PipeWire(PipeWireStream::from_synthetic_packets(
+            fmt_16k.clone(),
+            2,
+            make_tone_packets_i16_mono(16_000, 440.0, 2, 160),
+            &budget,
+        )?);
+        let mix_s2 = PlatformStream::PipeWire(PipeWireStream::from_synthetic_packets(
+            fmt_48k.clone(),
+            3,
+            make_tone_packets_f32_stereo(48_000, 440.0, 440.0, 2, 480),
+            &budget,
+        )?);
+        let mut mix_fail = PlatformManager::from_synthetic_streams(
+            CaptureRequest::single(follow_in.clone())
+                .with_combine_mode(CombineMode::CspaMixer)
+                .with_on_format_change(OnFormatChange::Fail),
+            vec![(BackendId::PipeWire, mix_s1)],
+            budget.clone(),
+        )?;
+        assert_eq!(
+            mix_fail.apply_opened_default_stream_for_test(TargetKind::DefaultInput, mix_s2),
+            Err(CapabilityError::FormatChangeRejected)
+        );
+        drop(mix_fail);
+
+        let adapt_s1 = PlatformStream::PipeWire(PipeWireStream::from_synthetic_packets(
+            fmt_16k.clone(),
+            2,
+            make_tone_packets_i16_mono(16_000, 440.0, 4, 160),
+            &budget,
+        )?);
+        let adapt_s2 = PlatformStream::PipeWire(PipeWireStream::from_synthetic_packets(
+            fmt_48k.clone(),
+            3,
+            make_tone_packets_f32_stereo(48_000, 440.0, 440.0, 4, 480),
+            &budget,
+        )?);
+        let mut mix_adapt = PlatformManager::from_synthetic_streams(
+            CaptureRequest::single(follow_in).with_combine_mode(CombineMode::CspaMixer),
+            vec![(BackendId::PipeWire, adapt_s1)],
+            budget.clone(),
+        )?;
+        assert_eq!(mix_adapt.working_format().unwrap().rate(), 16_000);
+        assert_eq!(
+            mix_adapt.apply_opened_default_stream_for_test(TargetKind::DefaultInput, adapt_s2),
+            Ok(true)
+        );
+        assert_eq!(mix_adapt.working_format().unwrap().rate(), 48_000);
+        drop(mix_adapt);
+
+        let strict_a = CaptureTarget::input_device("strict-16k").unwrap();
+        let strict_b = CaptureTarget::device("strict-48k").unwrap();
+        let sa = PlatformStream::PipeWire(PipeWireStream::from_synthetic_packets(
+            fmt_16k,
+            2,
+            make_tone_packets_i16_mono(16_000, 440.0, 2, 160),
+            &budget,
+        )?);
+        let sb = PlatformStream::PipeWire(PipeWireStream::from_synthetic_packets(
+            fmt_48k,
+            1,
+            make_tone_packets_f32_stereo(48_000, 440.0, 440.0, 2, 480),
+            &budget,
+        )?);
+        let strict_err = PlatformManager::from_synthetic_streams(
+            CaptureRequest::new(vec![strict_a, strict_b])
+                .with_input_conversion(InputConversionPolicy::StrictNoResample),
+            vec![(BackendId::PipeWire, sa), (BackendId::PipeWire, sb)],
+            budget,
+        )
+        .err();
+        assert_eq!(strict_err, Some(CapabilityError::UnsupportedFormat));
+        Ok(())
+    }
+}
