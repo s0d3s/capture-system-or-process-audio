@@ -750,3 +750,426 @@ int cspa_mac_open_coreaudio_tap(const uint32_t *process_objects,
             desc.privateTap = YES;
             desc.muteBehavior = mute_tap ? CATapMuted : CATapUnmuted;
 
+            AudioObjectID tap = 0;
+            OSStatus st = AudioHardwareCreateProcessTap(desc, &tap);
+            if (cspa_is_tcc_denied_osstatus(st)) return -13;
+            if (st != noErr || tap == 0) return -3;
+
+            AudioStreamBasicDescription tap_fmt = {0};
+            UInt32 fmt_size = sizeof(tap_fmt);
+            if (cspa_get_prop(tap, kAudioTapPropertyFormat, kAudioObjectPropertyScopeGlobal, &fmt_size, &tap_fmt) != noErr) {
+                AudioHardwareDestroyProcessTap(tap);
+                return -4;
+            }
+            if (out_rate_hz) *out_rate_hz = (uint32_t)(tap_fmt.mSampleRate > 0 ? tap_fmt.mSampleRate : 48000);
+            if (out_channels) *out_channels = (uint32_t)(tap_fmt.mChannelsPerFrame > 0 ? tap_fmt.mChannelsPerFrame : 2);
+
+            NSString *agg_uid = [NSString stringWithFormat:@"cspa-private-agg-%@", [[NSUUID UUID] UUIDString]];
+            NSDictionary *agg_props = @{
+                @kAudioAggregateDeviceNameKey: @"CSPA Private Aggregate",
+                @kAudioAggregateDeviceUIDKey: agg_uid,
+                @kAudioAggregateDeviceIsPrivateKey: @YES,
+                @kAudioAggregateDeviceTapAutoStartKey: @YES,
+                @kAudioAggregateDeviceTapListKey: @[@{
+                    @kAudioSubTapUIDKey: [desc.UUID UUIDString],
+                    @kAudioSubTapDriftCompensationKey: @NO
+                }]
+            };
+            AudioObjectID aggregate = 0;
+            st = AudioHardwareCreateAggregateDevice((__bridge CFDictionaryRef)agg_props, &aggregate);
+            if (st != noErr || aggregate == 0) {
+                AudioHardwareDestroyProcessTap(tap);
+                return -5;
+            }
+
+            CspaCoreAudioTapSession *sess = (CspaCoreAudioTapSession *)calloc(1, sizeof(CspaCoreAudioTapSession));
+            sess->tap = tap;
+            sess->aggregate = aggregate;
+            sess->is_process_tap = (is_process_tap != 0 || process_count > 0);
+            sess->active_process_count = process_count;
+            sess->callback = callback;
+            sess->user_data = user_data;
+
+            st = AudioDeviceCreateIOProcID(aggregate, cspa_tap_io_proc, sess, &sess->io_proc);
+            if (st != noErr || !sess->io_proc) {
+                AudioHardwareDestroyAggregateDevice(aggregate);
+                AudioHardwareDestroyProcessTap(tap);
+                free(sess);
+                return -6;
+            }
+            st = AudioDeviceStart(aggregate, sess->io_proc);
+            if (st != noErr) {
+                AudioDeviceDestroyIOProcID(aggregate, sess->io_proc);
+                AudioHardwareDestroyAggregateDevice(aggregate);
+                AudioHardwareDestroyProcessTap(tap);
+                free(sess);
+                return -7;
+            }
+            sess->started = true;
+            *out_handle = sess;
+            return 0;
+        }
+        return -12;
+    }
+}
+
+int cspa_mac_update_coreaudio_tap_processes(void *handle, const uint32_t *process_objects, uint32_t process_count) {
+    @autoreleasepool {
+        if (!handle) return -1;
+        if (@available(macOS 14.2, *)) {
+            CspaCoreAudioTapSession *sess = (CspaCoreAudioTapSession *)handle;
+            sess->is_process_tap = true;
+            __atomic_store_n(&sess->active_process_count, process_count, __ATOMIC_SEQ_CST);
+            if (process_count == 0) {
+                return 0;
+            }
+            CATapDescription *desc = nil;
+            UInt32 size = sizeof(desc);
+            OSStatus st = cspa_get_prop(sess->tap, kAudioTapPropertyDescription, kAudioObjectPropertyScopeGlobal, &size, &desc);
+            if (st != noErr || !desc) return -2;
+
+            NSMutableArray<NSNumber *> *proc_array = [NSMutableArray arrayWithCapacity:process_count];
+            for (uint32_t i = 0; i < process_count; ++i) {
+                [proc_array addObject:@(process_objects[i])];
+            }
+            desc.exclusive = NO;
+            desc.processes = proc_array;
+            AudioObjectPropertyAddress addr = {
+                kAudioTapPropertyDescription,
+                kAudioObjectPropertyScopeGlobal,
+                kAudioObjectPropertyElementMain
+            };
+            st = AudioObjectSetPropertyData(sess->tap, &addr, 0, NULL, sizeof(desc), &desc);
+            if (cspa_is_tcc_denied_osstatus(st)) return -13;
+            return st == noErr ? 0 : -3;
+        }
+        return -12;
+    }
+}
+
+int cspa_mac_close_coreaudio_tap(void *handle) {
+    @autoreleasepool {
+        if (!handle) return 0;
+        CspaCoreAudioTapSession *sess = (CspaCoreAudioTapSession *)handle;
+        int rc = 0;
+        if (sess->started && sess->aggregate && sess->io_proc) {
+            if (AudioDeviceStop(sess->aggregate, sess->io_proc) != noErr) rc = -1;
+            sess->started = false;
+        }
+        if (sess->aggregate && sess->io_proc) {
+            if (AudioDeviceDestroyIOProcID(sess->aggregate, sess->io_proc) != noErr) rc = -2;
+            sess->io_proc = NULL;
+        }
+        if (sess->aggregate) {
+            if (AudioHardwareDestroyAggregateDevice(sess->aggregate) != noErr) rc = -3;
+            sess->aggregate = 0;
+        }
+        if (sess->tap) {
+            if (@available(macOS 14.2, *)) {
+                if (AudioHardwareDestroyProcessTap(sess->tap) != noErr) rc = -4;
+            }
+            sess->tap = 0;
+        }
+        free(sess);
+        return rc;
+    }
+}
+
+@interface CspaSckOutputDelegate : NSObject <SCStreamOutput, SCStreamDelegate> {
+@public
+    CspaAudioPacketCallback callback;
+    void *user_data;
+}
+@end
+
+@implementation CspaSckOutputDelegate
+- (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
+    (void)stream; (void)error;
+}
+- (void)stream:(SCStream *)stream didOutputSampleBuffer:(CMSampleBufferRef)sample ofType:(SCStreamOutputType)type {
+    (void)stream;
+    if (type != SCStreamOutputTypeAudio || !CMSampleBufferDataIsReady(sample) || !self->callback) return;
+    CMItemCount frames = CMSampleBufferGetNumSamples(sample);
+    if (frames <= 0) return;
+
+    struct { AudioBufferList list; AudioBuffer extra; } storage;
+    memset(&storage, 0, sizeof(storage));
+    CMBlockBufferRef retained = NULL;
+    OSStatus st = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+        sample, NULL, &storage.list, sizeof(storage),
+        kCFAllocatorDefault, kCFAllocatorDefault, 0, &retained);
+    if (st != noErr) {
+        return;
+    }
+
+    uint32_t num_bufs = storage.list.mNumberBuffers;
+    if (num_bufs == 0 || num_bufs > 2) {
+        if (retained) CFRelease(retained);
+        return;
+    }
+    const float *ptrs[8] = {0};
+    uint32_t chans[8] = {0};
+    bool valid = true;
+    for (uint32_t i = 0; i < num_bufs; ++i) {
+        AudioBuffer b = storage.list.mBuffers[i];
+        if (!b.mData || b.mNumberChannels == 0 ||
+            b.mDataByteSize != (uint32_t)frames * sizeof(float) * b.mNumberChannels) {
+            valid = false;
+            break;
+        }
+        ptrs[i] = (const float *)b.mData;
+        chans[i] = b.mNumberChannels;
+    }
+    if (valid) {
+        CMTime pts = CMSampleBufferGetPresentationTimeStamp(sample);
+        uint32_t ts_valid = CMTIME_IS_NUMERIC(pts) ? 1u : 0u;
+        uint64_t ts_ns = ts_valid ? (uint64_t)(CMTimeGetSeconds(pts) * 1000000000.0) : 0ULL;
+        self->callback(self->user_data, num_bufs, ptrs, chans, (uint32_t)frames, ts_ns, ts_valid);
+    }
+    if (retained) CFRelease(retained);
+}
+@end
+
+typedef struct {
+    void *stream_ref;
+    void *delegate_ref;
+    dispatch_queue_t queue;
+} CspaSckStreamSession;
+
+int cspa_mac_open_sck_app_stream(uint32_t target_pid,
+                                 int exclude_current_process,
+                                 CspaAudioPacketCallback callback,
+                                 void *user_data,
+                                 uint32_t *out_rate_hz,
+                                 uint32_t *out_channels,
+                                 void **out_handle) {
+    @autoreleasepool {
+        if (!callback || !out_handle) return -1;
+        *out_handle = NULL;
+        if (!CGPreflightScreenCaptureAccess()) return -1;
+
+        dispatch_semaphore_t sema = dispatch_semaphore_create(0);
+        __block SCShareableContent *content = nil;
+        __block NSError *err = nil;
+        [SCShareableContent getShareableContentExcludingDesktopWindows:YES
+                                                   onScreenWindowsOnly:NO
+                                                     completionHandler:^(SCShareableContent *val, NSError *error) {
+            content = val;
+            err = error;
+            dispatch_semaphore_signal(sema);
+        }];
+        if (!cspa_wait_sema(sema, 5.0) || err || !content || content.displays.count == 0) return -2;
+
+        SCRunningApplication *selected = nil;
+        for (SCRunningApplication *app in content.applications) {
+            if ((uint32_t)app.processID == target_pid) {
+                selected = app;
+                break;
+            }
+        }
+        if (!selected) return -6;
+
+        SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:content.displays[0]
+                                                     includingApplications:@[selected]
+                                                          exceptingWindows:@[]];
+        SCStreamConfiguration *cfg = [[SCStreamConfiguration alloc] init];
+        cfg.capturesAudio = YES;
+        cfg.excludesCurrentProcessAudio = exclude_current_process ? YES : NO;
+        cfg.sampleRate = 48000;
+        cfg.channelCount = 2;
+        cfg.width = 2;
+        cfg.height = 2;
+        cfg.minimumFrameInterval = CMTimeMake(1, 1);
+
+        CspaSckOutputDelegate *delegate = [[CspaSckOutputDelegate alloc] init];
+        delegate->callback = callback;
+        delegate->user_data = user_data;
+        dispatch_queue_t queue = dispatch_queue_create("cspa.macos.sck.audio", DISPATCH_QUEUE_SERIAL);
+        SCStream *stream = [[SCStream alloc] initWithFilter:filter configuration:cfg delegate:delegate];
+        NSError *add_err = nil;
+        if (![stream addStreamOutput:delegate type:SCStreamOutputTypeAudio sampleHandlerQueue:queue error:&add_err]) {
+            return -3;
+        }
+        sema = dispatch_semaphore_create(0);
+        __block NSError *start_err = nil;
+        [stream startCaptureWithCompletionHandler:^(NSError *value) {
+            start_err = value;
+            dispatch_semaphore_signal(sema);
+        }];
+        if (!cspa_wait_sema(sema, 5.0) || start_err) {
+            return -4;
+        }
+
+        if (out_rate_hz) *out_rate_hz = 48000;
+        if (out_channels) *out_channels = 2;
+
+        CspaSckStreamSession *sess = (CspaSckStreamSession *)calloc(1, sizeof(CspaSckStreamSession));
+        sess->stream_ref = (__bridge_retained void *)stream;
+        sess->delegate_ref = (__bridge_retained void *)delegate;
+        sess->queue = queue;
+        *out_handle = sess;
+        return 0;
+    }
+}
+
+int cspa_mac_close_sck_app_stream(void *handle) {
+    @autoreleasepool {
+        if (!handle) return 0;
+        CspaSckStreamSession *sess = (CspaSckStreamSession *)handle;
+        SCStream *stream = (__bridge_transfer SCStream *)sess->stream_ref;
+        CspaSckOutputDelegate *delegate = (__bridge_transfer CspaSckOutputDelegate *)sess->delegate_ref;
+        sess->stream_ref = NULL;
+        sess->delegate_ref = NULL;
+        int rc = 0;
+        if (stream) {
+            dispatch_semaphore_t sema = dispatch_semaphore_create(0);
+            __block NSError *stop_err = nil;
+            [stream stopCaptureWithCompletionHandler:^(NSError *value) {
+                stop_err = value;
+                dispatch_semaphore_signal(sema);
+            }];
+            if (!cspa_wait_sema(sema, 5.0) || stop_err) {
+                rc = -5;
+            }
+        }
+        if (sess->queue) {
+            dispatch_sync(sess->queue, ^{});
+            sess->queue = nil;
+        }
+        if (delegate) {
+            delegate->callback = NULL;
+            delegate->user_data = NULL;
+        }
+        free(sess);
+        return rc;
+    }
+}
+
+typedef struct {
+    AudioObjectID device;
+    AudioDeviceIOProcID io_proc;
+    bool started;
+    CspaAudioPacketCallback callback;
+    void *user_data;
+} CspaCoreAudioInputSession;
+
+static OSStatus cspa_input_io_proc(AudioObjectID device,
+                                   const AudioTimeStamp *now,
+                                   const AudioBufferList *input,
+                                   const AudioTimeStamp *input_time,
+                                   AudioBufferList *output,
+                                   const AudioTimeStamp *output_time,
+                                   void *client_data) {
+    (void)device; (void)now; (void)output; (void)output_time;
+    CspaCoreAudioInputSession *sess = (CspaCoreAudioInputSession *)client_data;
+    if (!sess || !sess->callback || !input || input->mNumberBuffers == 0) return noErr;
+
+    uint32_t num_bufs = input->mNumberBuffers;
+    if (num_bufs > 8) num_bufs = 8;
+    const float *ptrs[8] = {0};
+    uint32_t chans[8] = {0};
+    uint32_t frames = 0;
+    for (uint32_t i = 0; i < num_bufs; ++i) {
+        const AudioBuffer *b = &input->mBuffers[i];
+        if (!b->mData || b->mNumberChannels == 0 || b->mDataByteSize == 0) return noErr;
+        uint32_t f = b->mDataByteSize / (sizeof(float) * b->mNumberChannels);
+        if (i == 0) frames = f;
+        else if (f != frames) return noErr;
+        ptrs[i] = (const float *)b->mData;
+        chans[i] = b->mNumberChannels;
+    }
+    if (frames == 0) return noErr;
+
+    uint32_t ts_valid = (input_time && (input_time->mFlags & kAudioTimeStampHostTimeValid)) ? 1u : 0u;
+    uint64_t ts_ns = ts_valid ? cspa_host_ticks_to_ns(input_time->mHostTime) : 0ULL;
+    sess->callback(sess->user_data, num_bufs, ptrs, chans, frames, ts_ns, ts_valid);
+    return noErr;
+}
+
+int cspa_mac_open_coreaudio_input(const char *device_uid,
+                                  int auth_override,
+                                  int allow_prompt,
+                                  CspaAudioPacketCallback callback,
+                                  void *user_data,
+                                  uint32_t *out_rate_hz,
+                                  uint32_t *out_channels,
+                                  char *out_resolved_uid,
+                                  uint32_t resolved_uid_cap,
+                                  void **out_handle) {
+    @autoreleasepool {
+        if (!callback || !out_handle) return -1;
+        *out_handle = NULL;
+        if (auth_override < 0 && cspa_mac_bundle_missing_usage_description("NSMicrophoneUsageDescription")) {
+            return -12;
+        }
+
+        AudioObjectID dev = 0;
+        uint32_t in_ch = 0, out_ch = 0, rate_hz = 48000, transport = 0;
+        NSString *resolved_uid_str = nil;
+
+        if (device_uid && device_uid[0] != '\0') {
+            uint32_t obj_id = 0;
+            if (cspa_mac_classify_device_uid(device_uid, &obj_id, &in_ch, &out_ch, &rate_hz, &transport) != 0 || obj_id == 0) {
+                return -11;
+            }
+            if (in_ch == 0) {
+                return out_ch > 0 ? -10 : -11;
+            }
+            dev = (AudioObjectID)obj_id;
+            resolved_uid_str = [NSString stringWithUTF8String:device_uid];
+        } else {
+            UInt32 dsz = sizeof(dev);
+            if (cspa_get_prop(kAudioObjectSystemObject, kAudioHardwarePropertyDefaultInputDevice,
+                              kAudioObjectPropertyScopeGlobal, &dsz, &dev) != noErr || dev == 0) {
+                return -11;
+            }
+            in_ch = cspa_count_scope_channels(dev, kAudioObjectPropertyScopeInput);
+            if (in_ch == 0) {
+                return -11;
+            }
+            CFStringRef uid_ref = NULL;
+            UInt32 usz = sizeof(uid_ref);
+            if (cspa_get_prop(dev, kAudioDevicePropertyDeviceUID, kAudioObjectPropertyScopeGlobal, &usz, &uid_ref) == noErr && uid_ref) {
+                resolved_uid_str = (__bridge_transfer NSString *)uid_ref;
+            }
+            UInt32 tsz = sizeof(transport);
+            cspa_get_prop(dev, kAudioDevicePropertyTransportType, kAudioObjectPropertyScopeGlobal, &tsz, &transport);
+        }
+
+        bool is_virtual = (transport == kAudioDeviceTransportTypeVirtual ||
+                           transport == kAudioDeviceTransportTypeAggregate);
+        int auth = (auth_override >= 0) ? auth_override : cspa_mac_microphone_auth_status();
+        if (auth == 1 || auth == 2) {
+            return -12;
+        }
+        if (auth == 0 && !is_virtual) {
+            if (allow_prompt == 0 || auth_override >= 0) {
+                return -12;
+            }
+            int req_auth = cspa_mac_request_microphone_access(10.0);
+            if (req_auth != 3) {
+                return (req_auth == 0) ? -13 : -12;
+            }
+        }
+
+        AudioStreamBasicDescription in_fmt = {0};
+        UInt32 fsz = sizeof(in_fmt);
+        if (cspa_get_prop(dev, kAudioDevicePropertyStreamFormat, kAudioObjectPropertyScopeInput, &fsz, &in_fmt) != noErr) {
+            return -2;
+        }
+        if (in_fmt.mFormatID != kAudioFormatLinearPCM ||
+            (in_fmt.mFormatFlags & kAudioFormatFlagIsFloat) == 0 ||
+            in_fmt.mBitsPerChannel != 32 ||
+            in_fmt.mChannelsPerFrame == 0) {
+            return -3;
+        }
+
+        if (out_rate_hz) *out_rate_hz = (uint32_t)(in_fmt.mSampleRate > 0.0 ? in_fmt.mSampleRate : (double)rate_hz);
+        if (out_channels) *out_channels = (uint32_t)in_fmt.mChannelsPerFrame;
+        if (out_resolved_uid && resolved_uid_cap > 0) {
+            memset(out_resolved_uid, 0, resolved_uid_cap);
+            if (resolved_uid_str && resolved_uid_str.UTF8String) {
+                strncpy(out_resolved_uid, resolved_uid_str.UTF8String, resolved_uid_cap - 1);
+            }
+        }
+
