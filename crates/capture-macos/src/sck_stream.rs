@@ -451,3 +451,300 @@ mod imp {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub use imp::open_sck_app_point;
+
+#[cfg(not(target_os = "macos"))]
+pub fn open_sck_app_point(
+    _target_identity: ProcessIdentity,
+    _exclude_current_process: bool,
+    _overflow: Overflow,
+    _timing: TimingRequirement,
+    _budget: &StorageBudget,
+    _observed: bool,
+) -> Result<ScreenCaptureKitStream, CapabilityError> {
+    let _ = (
+        MAX_FRAMES_PER_SLOT,
+        SESSION_METADATA_BYTES,
+        StorageLimits::new(8, 4096, 8, 262_144),
+        Pool::new_reserved,
+        ordering::channel,
+        ReadStream::new,
+        pack_planar_or_interleaved_f32_into_bytes,
+    );
+    Err(CapabilityError::ServerUnavailable)
+}
+
+/// Owns a single backend session without dynamic process/device monitoring.
+pub enum PlatformStream {
+    CoreAudio(CoreAudioTapStream),
+    CoreAudioInput(CoreAudioInputStream),
+    ScreenCaptureKit(ScreenCaptureKitStream),
+}
+
+impl PlatformStream {
+    pub fn open(target: &CaptureTarget, overflow: Overflow) -> Result<Self, CapabilityError> {
+        Self::open_with_options(
+            target,
+            ProcessTreeRange::default(),
+            &Backends::default(),
+            overflow,
+            TimingRequirement::Raw,
+        )
+    }
+
+    pub fn open_with_options(
+        target: &CaptureTarget,
+        tree_range: ProcessTreeRange,
+        backends: &Backends,
+        overflow: Overflow,
+        timing: TimingRequirement,
+    ) -> Result<Self, CapabilityError> {
+        Self::open_with_permission_policy(
+            target,
+            tree_range,
+            backends,
+            overflow,
+            timing,
+            PermissionPolicy::AutoRequest,
+        )
+    }
+
+    pub fn open_with_permission_policy(
+        target: &CaptureTarget,
+        tree_range: ProcessTreeRange,
+        backends: &Backends,
+        overflow: Overflow,
+        timing: TimingRequirement,
+        permission_policy: PermissionPolicy,
+    ) -> Result<Self, CapabilityError> {
+        target.validate()?;
+        tree_range.validate()?;
+        backends.validate()?;
+        if timing == TimingRequirement::Precise {
+            return Err(CapabilityError::PreciseTimingUnqualified);
+        }
+
+        let mac_backends = backends.for_os(PlatformOs::MacOs);
+        let candidates = candidate_backends_for_target(PlatformOs::MacOs, mac_backends, target)
+            .map_err(CapabilityError::from)?;
+
+        #[cfg(target_os = "macos")]
+        let os_ver = crate::native_bridge::os_version();
+        #[cfg(not(target_os = "macos"))]
+        let os_ver = (15, 7, 9);
+
+        let budget = StorageBudget::new(2, AggregateManagerBudgets::default().max_total_pcm_memory)
+            .map_err(|_| CapabilityError::CapacityExceeded)?;
+        let clean_uid = target.clean_device_id().map(str::to_owned);
+        let mut first_err: Option<CapabilityError> = None;
+
+        for backend in candidates {
+            if let Err(floor_err) =
+                check_os_version_floor_for_target(backend, target.kind(), os_ver)
+            {
+                if first_err.is_none() {
+                    first_err = Some(floor_err);
+                }
+                continue;
+            }
+            let res = match (backend, target.kind()) {
+                (BackendId::CoreAudio, TargetKind::Device | TargetKind::DefaultOutput) => {
+                    let uid = clean_uid
+                        .clone()
+                        .or_else(query_macos_default_output_uid_now);
+                    open_coreaudio_tap_point(
+                        Vec::new(),
+                        false,
+                        None,
+                        uid,
+                        false,
+                        overflow,
+                        timing,
+                        &budget,
+                        false,
+                    )
+                    .map(Self::CoreAudio)
+                }
+                (BackendId::CoreAudio, TargetKind::InputDevice | TargetKind::DefaultInput) => {
+                    let uid = clean_uid.clone().or_else(query_macos_default_input_uid_now);
+                    open_coreaudio_input_point_with_auth_override(
+                        uid,
+                        None,
+                        permission_policy.allows_prompt(),
+                        overflow,
+                        timing,
+                        &budget,
+                        false,
+                    )
+                    .map(Self::CoreAudioInput)
+                }
+                (BackendId::ScreenCaptureKit, TargetKind::Application) => {
+                    if target.scope() != ProcessScope::Exact {
+                        Err(CapabilityError::UnsupportedScope)
+                    } else {
+                        let id = target
+                            .process_identity()
+                            .ok_or(CapabilityError::InvalidTarget)?;
+                        let _ = inspect_bsd_process(id.pid)?;
+                        crate::permissions::maybe_auto_request_sck_permission(permission_policy);
+                        open_sck_app_point(id, false, overflow, timing, &budget, false)
+                            .map(Self::ScreenCaptureKit)
+                    }
+                }
+                (BackendId::ScreenCaptureKit, _) => Err(CapabilityError::UnsupportedTargetKind),
+                _ => Err(CapabilityError::NotImplemented),
+            };
+            match res {
+                Ok(stream) => return Ok(stream),
+                Err(err) => {
+                    let allow_fb = err.allows_cross_backend_fallback();
+                    if first_err.is_none() {
+                        first_err = Some(err.clone());
+                    }
+                    if !allow_fb {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        Err(first_err.unwrap_or(CapabilityError::NotImplemented))
+    }
+
+    pub(crate) fn arm(&self) {
+        match self {
+            Self::CoreAudio(s) => s.arm(),
+            Self::CoreAudioInput(s) => s.arm(),
+            Self::ScreenCaptureKit(s) => s.arm(),
+        }
+    }
+}
+
+impl AudioStreamBackend for PlatformStream {
+    #[inline]
+    fn format(&self) -> &Arc<Format> {
+        match self {
+            Self::CoreAudio(s) => s.format(),
+            Self::CoreAudioInput(s) => s.format(),
+            Self::ScreenCaptureKit(s) => s.format(),
+        }
+    }
+
+    #[inline]
+    fn trace(&self) -> Option<&Arc<Trace>> {
+        match self {
+            Self::CoreAudio(s) => s.trace(),
+            Self::CoreAudioInput(s) => s.trace(),
+            Self::ScreenCaptureKit(s) => s.trace(),
+        }
+    }
+
+    #[inline]
+    fn control_handle(&self) -> ControlHandle {
+        match self {
+            Self::CoreAudio(s) => s.control_handle(),
+            Self::CoreAudioInput(s) => s.control_handle(),
+            Self::ScreenCaptureKit(s) => s.control_handle(),
+        }
+    }
+
+    #[inline]
+    fn default_cancel(&self) -> Cancellation {
+        match self {
+            Self::CoreAudio(s) => s.default_cancel(),
+            Self::CoreAudioInput(s) => s.default_cancel(),
+            Self::ScreenCaptureKit(s) => s.default_cancel(),
+        }
+    }
+
+    #[inline]
+    fn end_reason(&self) -> Option<EndReason> {
+        match self {
+            Self::CoreAudio(s) => s.end_reason(),
+            Self::CoreAudioInput(s) => s.end_reason(),
+            Self::ScreenCaptureKit(s) => s.end_reason(),
+        }
+    }
+
+    #[inline]
+    fn read_with_cancel(
+        &mut self,
+        frames: usize,
+        timeout: Duration,
+        cancel: Cancellation,
+    ) -> Result<ReadResult, ReadError> {
+        match self {
+            Self::CoreAudio(s) => s.read_with_cancel(frames, timeout, cancel),
+            Self::CoreAudioInput(s) => s.read_with_cancel(frames, timeout, cancel),
+            Self::ScreenCaptureKit(s) => s.read_with_cancel(frames, timeout, cancel),
+        }
+    }
+
+    #[inline]
+    fn read_into_with_cancel(
+        &mut self,
+        destination: &mut [u8],
+        frames: usize,
+        timeout: Duration,
+        cancel: Cancellation,
+    ) -> Result<ReadResult, ReadError> {
+        match self {
+            Self::CoreAudio(s) => s.read_into_with_cancel(destination, frames, timeout, cancel),
+            Self::CoreAudioInput(s) => {
+                s.read_into_with_cancel(destination, frames, timeout, cancel)
+            }
+            Self::ScreenCaptureKit(s) => {
+                s.read_into_with_cancel(destination, frames, timeout, cancel)
+            }
+        }
+    }
+
+    #[inline]
+    fn stop(&self, mode: Stop) {
+        match self {
+            Self::CoreAudio(s) => s.stop(mode),
+            Self::CoreAudioInput(s) => s.stop(mode),
+            Self::ScreenCaptureKit(s) => s.stop(mode),
+        }
+    }
+
+    #[inline]
+    fn resources_done(&self) -> bool {
+        match self {
+            Self::CoreAudio(s) => s.resources_done(),
+            Self::CoreAudioInput(s) => s.resources_done(),
+            Self::ScreenCaptureKit(s) => s.resources_done(),
+        }
+    }
+
+    #[inline]
+    fn wait_cleanup(&self, timeout: Duration) -> bool {
+        match self {
+            Self::CoreAudio(s) => s.wait_cleanup(timeout),
+            Self::CoreAudioInput(s) => s.wait_cleanup(timeout),
+            Self::ScreenCaptureKit(s) => s.wait_cleanup(timeout),
+        }
+    }
+}
+
+impl OpenableStreamBackend for PlatformStream {
+    #[inline]
+    fn open_with_permission_policy(
+        target: &CaptureTarget,
+        tree_range: ProcessTreeRange,
+        backends: &Backends,
+        overflow: Overflow,
+        timing: TimingRequirement,
+        permission_policy: PermissionPolicy,
+    ) -> Result<Self, CapabilityError> {
+        Self::open_with_permission_policy(
+            target,
+            tree_range,
+            backends,
+            overflow,
+            timing,
+            permission_policy,
+        )
+    }
+}
