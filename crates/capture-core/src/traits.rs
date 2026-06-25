@@ -1149,3 +1149,768 @@ mod tests {
         atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst},
     };
 
+    struct MockStreamBackend {
+        format: Arc<Format>,
+        producer: Producer,
+        reads: ReadStream,
+        ready: ReadySignal,
+        control: ControlHandle,
+        default_cancel: Cancellation,
+        stopped: AtomicBool,
+    }
+
+    impl MockStreamBackend {
+        fn new(format: Arc<Format>) -> Self {
+            let stride = format.bytes_per_frame();
+            let pool = Pool::new(
+                StorageLimits::new(8, 256, stride, 8 * 256 * stride).unwrap(),
+                256,
+                format.clone(),
+            )
+            .unwrap();
+            let (producer, reader) = channel(pool, 4).unwrap();
+            let control = producer.control_handle();
+            Self {
+                format,
+                producer,
+                reads: ReadStream::new(reader),
+                ready: ReadySignal::new(),
+                control,
+                default_cancel: Cancellation::default(),
+                stopped: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl AudioStreamBackend for MockStreamBackend {
+        fn format(&self) -> &Arc<Format> {
+            &self.format
+        }
+        fn trace(&self) -> Option<&Arc<Trace>> {
+            None
+        }
+        fn control_handle(&self) -> ControlHandle {
+            self.control.clone()
+        }
+        fn default_cancel(&self) -> Cancellation {
+            self.default_cancel.clone()
+        }
+        fn end_reason(&self) -> Option<EndReason> {
+            self.stopped.load(SeqCst).then_some(EndReason::Stopped)
+        }
+        fn read_with_cancel(
+            &mut self,
+            frames: usize,
+            timeout: Duration,
+            cancel: Cancellation,
+        ) -> Result<ReadResult, ReadError> {
+            poll_read_stream(
+                StreamReadContext {
+                    reads: &self.reads,
+                    ready: &self.ready,
+                    trace: None,
+                },
+                frames,
+                timeout,
+                cancel,
+            )
+        }
+        fn read_into_with_cancel(
+            &mut self,
+            destination: &mut [u8],
+            frames: usize,
+            timeout: Duration,
+            cancel: Cancellation,
+        ) -> Result<ReadResult, ReadError> {
+            poll_read_stream_into(
+                StreamReadContext {
+                    reads: &self.reads,
+                    ready: &self.ready,
+                    trace: None,
+                },
+                self.format.clone(),
+                destination,
+                frames,
+                timeout,
+                cancel,
+            )
+        }
+        fn stop(&self, mode: Stop) {
+            self.stopped.store(true, SeqCst);
+            self.control.stop(mode);
+            self.ready.notify();
+        }
+        fn resources_done(&self) -> bool {
+            self.stopped.load(SeqCst)
+        }
+        fn wait_cleanup(&self, _timeout: Duration) -> bool {
+            self.stopped.store(true, SeqCst);
+            true
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockDiscoveryBackend {
+        service: DiscoveryService,
+        backends: Backends,
+        refreshes: Arc<AtomicUsize>,
+    }
+
+    impl DiscoveryBackend for MockDiscoveryBackend {
+        fn new() -> Self {
+            Self {
+                service: DiscoveryService::new_for_os(PlatformOs::Linux),
+                backends: Backends::default(),
+                refreshes: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn with_backends(backends: Backends) -> Result<Self, CapabilityError> {
+            backends.validate()?;
+            Ok(Self {
+                service: DiscoveryService::new_for_os(PlatformOs::Linux),
+                backends,
+                refreshes: Arc::new(AtomicUsize::new(0)),
+            })
+        }
+
+        fn service(&self) -> &DiscoveryService {
+            &self.service
+        }
+
+        fn backends(&self) -> &Backends {
+            &self.backends
+        }
+
+        fn is_watcher_running(&self) -> bool {
+            false
+        }
+
+        fn refresh_once(&self) -> Result<u64, CapabilityError> {
+            self.refreshes.fetch_add(1, SeqCst);
+            let inv = BackendRawInventory {
+                processes: vec![
+                    RawBackendProcessRecord {
+                        backend: BackendId::PipeWire,
+                        process: RawProcessRecord {
+                            identity: ProcessIdentity {
+                                pid: 501,
+                                generation: 5010,
+                            },
+                            parent_pid: None,
+                            app_id: Some("org.gnome.Music".into()),
+                            name: Some("GNOME Music".into()),
+                            executable_path: Some("/usr/bin/gnome-music".into()),
+                            active_audio: Some(true),
+                        },
+                    },
+                    RawBackendProcessRecord {
+                        backend: BackendId::PulseAudio,
+                        process: RawProcessRecord {
+                            identity: ProcessIdentity {
+                                pid: 602,
+                                generation: 6020,
+                            },
+                            parent_pid: None,
+                            app_id: Some("org.videolan.VLC".into()),
+                            name: Some("VLC".into()),
+                            executable_path: Some("/usr/bin/vlc".into()),
+                            active_audio: Some(true),
+                        },
+                    },
+                ],
+                devices: vec![
+                    RawBackendDeviceRecord {
+                        backend: BackendId::PipeWire,
+                        direction: DeviceDirection::Output,
+                        device_id: "pw-speakers".into(),
+                        name: Some("PW Speakers".into()),
+                        is_default: true,
+                        is_monitor_sink: false,
+                    },
+                    RawBackendDeviceRecord {
+                        backend: BackendId::PulseAudio,
+                        direction: DeviceDirection::Input,
+                        device_id: "pa-usb-mic".into(),
+                        name: Some("PA USB Mic".into()),
+                        is_default: true,
+                        is_monitor_sink: false,
+                    },
+                ],
+            };
+            let query =
+                DiscoveryQuery::all_for_os(PlatformOs::Linux).with_backends(self.backends.clone());
+            Ok(self.service.update_backend_inventory(inv, &query)?)
+        }
+
+        fn default_output_device_id(&self) -> Result<Option<Arc<str>>, CapabilityError> {
+            self.refresh_once()?;
+            Ok(self.service.default_output_device_id())
+        }
+
+        fn default_input_device_id(&self) -> Result<Option<Arc<str>>, CapabilityError> {
+            self.refresh_once()?;
+            Ok(self.service.default_input_device_id())
+        }
+
+        fn process(
+            &self,
+            pid: u32,
+            scope: ProcessScope,
+            on_root_exit: OnRootExit,
+        ) -> Result<CaptureTarget, CapabilityError> {
+            if pid == 0 {
+                return Err(CapabilityError::NoSuchProcess);
+            }
+            Ok(CaptureTarget::process(
+                ProcessIdentity {
+                    pid,
+                    generation: u64::from(pid) * 10,
+                },
+                scope,
+                on_root_exit,
+            )?)
+        }
+
+        fn discover_query(&self, query: &DiscoveryQuery) -> Result<TargetCatalog, CapabilityError> {
+            self.refresh_once()?;
+            Ok(self.service.discover_query(query)?)
+        }
+
+        fn subscribe(
+            &self,
+            filter: DiscoveryFilter,
+            max_discovery_queue: usize,
+        ) -> Result<DiscoverySubscription, CapabilityError> {
+            self.refresh_once()?;
+            Ok(self.service.subscribe(filter, max_discovery_queue)?)
+        }
+
+        fn subscribe_query(
+            &self,
+            query: DiscoveryQuery,
+            max_discovery_queue: usize,
+        ) -> Result<DiscoverySubscription, CapabilityError> {
+            self.refresh_once()?;
+            Ok(self.service.subscribe_query(query, max_discovery_queue)?)
+        }
+    }
+
+    struct MockManagerBackend {
+        plan: CapturePlanReport,
+        multi: MultiInputManager,
+        route_guard: RouteRollbackGuard,
+        default_cancel: Cancellation,
+        session: u64,
+        segment: u64,
+        on_format_change: OnFormatChange,
+        stopped: bool,
+        feed_pkt: [u8; 64 * 8],
+        now_ns: u64,
+    }
+
+    impl CaptureManagerBackend for MockManagerBackend {
+        fn open_with_options(
+            request: CaptureRequest,
+            _overflow: Overflow,
+            timing: TimingRequirement,
+        ) -> Result<Self, CapabilityError> {
+            if timing == TimingRequirement::Precise {
+                return Err(CapabilityError::PreciseTimingUnqualified);
+            }
+            let plan =
+                request.resolve_plan_for_os_with_capability(PlatformOs::Windows, |_, _| Ok(()))?;
+            let fmt = Arc::new(
+                Format::new(
+                    SampleType::F32,
+                    ByteOrder::Little,
+                    48_000,
+                    2,
+                    Layout::Known(Arc::from([Channel::FrontLeft, Channel::FrontRight])),
+                )
+                .unwrap(),
+            );
+            let per_input = request
+                .targets()
+                .iter()
+                .map(|_| (BackendId::Wasapi, fmt.clone()))
+                .collect();
+            let on_format_change = request.on_format_change();
+            let allow_reroute = request.allow_reroute();
+            let multi = MultiInputManager::new_heterogeneous(
+                request,
+                per_input,
+                default_block_frames_for_rate(48_000, 1024),
+                1024,
+            )?;
+            let mut feed_pkt = [0u8; 64 * 8];
+            for chunk in feed_pkt.chunks_exact_mut(4) {
+                chunk.copy_from_slice(&0.25_f32.to_le_bytes());
+            }
+            Ok(Self {
+                plan,
+                multi,
+                route_guard: RouteRollbackGuard::new(allow_reroute),
+                default_cancel: Cancellation::default(),
+                session: 1,
+                segment: 1,
+                on_format_change,
+                stopped: false,
+                feed_pkt,
+                now_ns: 0,
+            })
+        }
+
+        fn plan(&self) -> &CapturePlanReport {
+            &self.plan
+        }
+        fn selected_backend(&self) -> BackendId {
+            self.plan.selected_backend.unwrap_or(BackendId::Wasapi)
+        }
+        fn is_software_mix(&self) -> bool {
+            true
+        }
+        fn working_format(&self) -> Option<&Arc<Format>> {
+            Some(self.multi.working_format())
+        }
+        fn output_format(&self) -> Option<&Arc<Format>> {
+            Some(self.multi.output_format())
+        }
+        fn targets(&self) -> &[CaptureTarget] {
+            self.multi.targets()
+        }
+        fn input_handles(&self) -> &[InputStatusHandle] {
+            self.multi.input_handles()
+        }
+        fn membership_descriptor(&self) -> Option<MembershipDescriptor> {
+            Some(self.multi.membership_descriptor())
+        }
+        fn last_block_metadata(&self) -> Option<MixedBlockMetadata> {
+            self.multi.last_block_metadata()
+        }
+        fn session_id(&self) -> u64 {
+            self.session
+        }
+        fn segment_id(&self) -> u64 {
+            self.segment
+        }
+        fn on_format_change(&self) -> OnFormatChange {
+            self.on_format_change
+        }
+        fn route_guard(&self) -> Option<&RouteRollbackGuard> {
+            Some(&self.route_guard)
+        }
+        fn update_targets(
+            &mut self,
+            new_targets: Vec<CaptureTarget>,
+        ) -> Result<u64, CapabilityError> {
+            self.multi.reconfigure_targets(new_targets)?;
+            self.segment += 1;
+            Ok(self.segment)
+        }
+        fn notify_default_device_changed(
+            &mut self,
+            _new_device_id: Option<&str>,
+        ) -> Result<bool, CapabilityError> {
+            Ok(false)
+        }
+        fn notify_default_input_changed(
+            &mut self,
+            _new_device_id: Option<&str>,
+        ) -> Result<bool, CapabilityError> {
+            Ok(false)
+        }
+        fn reopen_relaunched_target(
+            &mut self,
+            _target_index: usize,
+            _new_pid: u32,
+        ) -> Result<(), CapabilityError> {
+            Ok(())
+        }
+        fn default_cancel(&self) -> Cancellation {
+            self.default_cancel.clone()
+        }
+        fn read_with_cancel(
+            &mut self,
+            frames: usize,
+            _timeout: Duration,
+            cancel: Cancellation,
+        ) -> Result<ReadResult, ReadError> {
+            if cancel.is_cancelled() {
+                return Ok(ReadResult {
+                    frames: 0,
+                    chunks: Vec::new(),
+                    first_packet: None,
+                    last_packet: None,
+                    reason: PartialReason::Cancelled,
+                    control: None,
+                    copies: Default::default(),
+                });
+            }
+            for _ in 0..8 {
+                self.now_ns += 1_333_333;
+                for idx in 0..self.multi.targets().len() {
+                    let _ = self
+                        .multi
+                        .push_raw_input_bytes(idx, &self.feed_pkt, None, self.now_ns);
+                }
+            }
+            Ok(self.multi.read_mixed_owned(frames, self.now_ns, 0)?.0)
+        }
+        fn read_into_with_cancel(
+            &mut self,
+            destination: &mut [u8],
+            frames: usize,
+            _timeout: Duration,
+            cancel: Cancellation,
+        ) -> Result<ReadResult, ReadError> {
+            if cancel.is_cancelled() {
+                return Ok(ReadResult {
+                    frames: 0,
+                    chunks: Vec::new(),
+                    first_packet: None,
+                    last_packet: None,
+                    reason: PartialReason::Cancelled,
+                    control: None,
+                    copies: Default::default(),
+                });
+            }
+            if let Some((res, _)) = self.multi.try_pop_pending_into(destination, frames)? {
+                return Ok(res);
+            }
+            for _ in 0..8 {
+                self.now_ns += 1_333_333;
+                for idx in 0..self.multi.targets().len() {
+                    let _ = self
+                        .multi
+                        .push_raw_input_bytes(idx, &self.feed_pkt, None, self.now_ns);
+                }
+            }
+            Ok(self
+                .multi
+                .read_mixed_into(destination, frames, self.now_ns, 0)?
+                .0)
+        }
+        fn stop(&mut self, _mode: Stop) {
+            self.stopped = true;
+        }
+        fn wait_cleanup(&mut self, _timeout: Duration) -> bool {
+            self.stopped = true;
+            true
+        }
+        fn resources_done(&self) -> bool {
+            self.stopped
+        }
+    }
+
+    struct MockDefaultObserver {
+        endpoint: Mutex<Option<String>>,
+    }
+
+    impl DefaultEndpointObserver for MockDefaultObserver {
+        fn acquire() -> Self {
+            Self {
+                endpoint: Mutex::new(Some("endpoint-a".to_owned())),
+            }
+        }
+
+        fn latest_endpoint_id(&self) -> Option<String> {
+            self.endpoint.lock().unwrap().clone()
+        }
+
+        fn changed_from(&self, expected_id: Option<&str>) -> Option<String> {
+            let guard = self.endpoint.lock().unwrap();
+            match (guard.as_deref(), expected_id) {
+                (Some(curr), Some(exp)) if curr != exp => Some(curr.to_owned()),
+                (Some(curr), None) => Some(curr.to_owned()),
+                _ => None,
+            }
+        }
+    }
+
+    #[test]
+    fn core_traits_zero_alloc_generic_wrappers_and_backend_aware_discovery() {
+        let fmt = Arc::new(
+            Format::new(
+                SampleType::F32,
+                ByteOrder::Little,
+                48_000,
+                2,
+                Layout::Known(Arc::from([Channel::FrontLeft, Channel::FrontRight])),
+            )
+            .unwrap(),
+        );
+
+        let mut stream = AudioStream::new(MockStreamBackend::new(fmt.clone()));
+        assert_eq!(
+            size_of::<AudioStream<MockStreamBackend>>(),
+            size_of::<MockStreamBackend>()
+        );
+        let pkt = [0u8; 64 * 8];
+        let mut dst = [0u8; 64 * 8];
+        stream.backend_mut().producer.offer(
+            &pkt,
+            Header {
+                sequence: 1,
+                segment: 1,
+                generation: 1,
+                frames: 64,
+                sample_position: Some(0),
+                timestamp: None,
+            },
+            Overflow::DropOldest,
+        );
+        assert_eq!(
+            stream
+                .read_into(&mut dst, 64, Duration::ZERO)
+                .unwrap()
+                .frames,
+            64
+        );
+
+        let stream_allocs = allocation_counter::measure(|| {
+            for seq in 2..=1001u64 {
+                stream.backend_mut().producer.offer(
+                    &pkt,
+                    Header {
+                        sequence: seq,
+                        segment: 1,
+                        generation: 1,
+                        frames: 64,
+                        sample_position: Some(seq * 64),
+                        timestamp: None,
+                    },
+                    Overflow::DropOldest,
+                );
+                let res = stream.read_into(&mut dst, 64, Duration::ZERO).unwrap();
+                assert_eq!(res.frames, 64);
+                assert_eq!(res.reason, PartialReason::Complete);
+            }
+        });
+        assert_eq!(stream_allocs.count_total, 0);
+        stream.stop(Stop::Abort);
+        assert!(stream.wait_cleanup(Duration::from_millis(10)));
+        assert!(stream.resources_done());
+
+        let t1 = CaptureTarget::default_output(DefaultDeviceMode::Follow);
+        let t2 = CaptureTarget::microphone(DefaultDeviceMode::Follow);
+        let mut mgr =
+            CaptureManager::<MockManagerBackend>::open(CaptureRequest::new(vec![t1.clone(), t2]))
+                .unwrap();
+        assert_eq!(
+            size_of::<CaptureManager<MockManagerBackend>>(),
+            size_of::<MockManagerBackend>()
+        );
+        assert_eq!(mgr.targets().len(), 2);
+        assert_eq!(mgr.input_handles().len(), 2);
+        assert!(mgr.route_guard().is_some_and(|g| !g.allow_reroute()));
+
+        let mut mix_dst = [0u8; 240 * 8];
+        let _ = mgr.read_into(&mut mix_dst, 240, Duration::ZERO).unwrap();
+        let _ = mgr.read_into(&mut mix_dst, 240, Duration::ZERO).unwrap();
+
+        let mgr_allocs = allocation_counter::measure(|| {
+            for _ in 0..200 {
+                let r = mgr.read_into(&mut mix_dst, 240, Duration::ZERO).unwrap();
+                assert_eq!(r.frames, 240);
+            }
+        });
+        assert_eq!(mgr_allocs.count_total, 0);
+        assert_eq!(mgr.update_targets(vec![t1]).unwrap(), 2);
+        mgr.stop(Stop::Drain);
+        assert!(mgr.wait_cleanup(Duration::from_millis(10)));
+
+        let pulse_only = Backends::new(None, Some(vec![BackendId::PulseAudio]), None).unwrap();
+        let disc = Discovery::<MockDiscoveryBackend>::with_backends(pulse_only).unwrap();
+        let apps = disc.applications(true, false).unwrap();
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].name().map(|s| s.as_ref()), Some("VLC"));
+        assert!(disc.output_devices().unwrap().is_empty());
+        assert_eq!(disc.input_devices().unwrap().len(), 1);
+        assert_eq!(
+            disc.find_app("vlc", ProcessScope::Tree, OnRootExit::Stop)
+                .unwrap()
+                .pid(),
+            Some(602)
+        );
+        assert_eq!(
+            disc.find_app("gnome-music", ProcessScope::Tree, OnRootExit::Stop),
+            Err(FindAppError::NotFound)
+        );
+
+        let obs = MockDefaultObserver::acquire();
+        assert!(obs.changed_from(Some("endpoint-a")).is_none());
+        let obs_allocs = allocation_counter::measure(|| {
+            for _ in 0..1000 {
+                assert!(obs.changed_from(Some("endpoint-a")).is_none());
+            }
+        });
+        assert_eq!(obs_allocs.count_total, 0);
+        assert_eq!(
+            obs.changed_from(Some("endpoint-b")).as_deref(),
+            Some("endpoint-a")
+        );
+    }
+
+    struct MockPermissionsBackend;
+
+    impl PermissionsBackend for MockPermissionsBackend {
+        fn check_permissions(
+            targets: &[CaptureTarget],
+            backends: &Backends,
+        ) -> Result<PermissionReport, CapabilityError> {
+            let req = crate::planner::required_permission_kinds_for_os(
+                targets,
+                backends,
+                PlatformOs::MacOs,
+            )?;
+            let kinds: Vec<PermissionKind> = req.into_iter().collect();
+            Self::check_permission_kinds(&kinds, backends)
+        }
+
+        fn request_permissions(
+            targets: &[CaptureTarget],
+            backends: &Backends,
+            timeout: Duration,
+            open_settings_if_denied: bool,
+        ) -> Result<PermissionReport, CapabilityError> {
+            let req = crate::planner::required_permission_kinds_for_os(
+                targets,
+                backends,
+                PlatformOs::MacOs,
+            )?;
+            let kinds: Vec<PermissionKind> = req.into_iter().collect();
+            Self::request_permission_kinds(&kinds, backends, timeout, open_settings_if_denied)
+        }
+
+        fn check_permission_kinds(
+            kinds: &[PermissionKind],
+            backends: &Backends,
+        ) -> Result<PermissionReport, CapabilityError> {
+            backends.validate()?;
+            let has_mic = kinds.contains(&PermissionKind::Microphone);
+            let has_sys = kinds.contains(&PermissionKind::SystemAudio);
+            let has_sck = kinds.contains(&PermissionKind::ScreenRecording);
+            Ok(PermissionReport::new(
+                PlatformOs::MacOs,
+                crate::schema::PermissionEntry {
+                    kind: PermissionKind::Microphone,
+                    state: crate::schema::PermissionState::NotDetermined,
+                    required: has_mic,
+                    can_prompt: true,
+                    requires_relaunch: false,
+                },
+                crate::schema::PermissionEntry {
+                    kind: PermissionKind::SystemAudio,
+                    state: crate::schema::PermissionState::Unknown,
+                    required: has_sys,
+                    can_prompt: true,
+                    requires_relaunch: false,
+                },
+                crate::schema::PermissionEntry {
+                    kind: PermissionKind::ScreenRecording,
+                    state: crate::schema::PermissionState::Denied,
+                    required: has_sck,
+                    can_prompt: false,
+                    requires_relaunch: true,
+                },
+            ))
+        }
+
+        fn request_permission_kinds(
+            kinds: &[PermissionKind],
+            backends: &Backends,
+            _timeout: Duration,
+            _open_settings_if_denied: bool,
+        ) -> Result<PermissionReport, CapabilityError> {
+            backends.validate()?;
+            let has_mic = kinds.contains(&PermissionKind::Microphone);
+            let has_sys = kinds.contains(&PermissionKind::SystemAudio);
+            let has_sck = kinds.contains(&PermissionKind::ScreenRecording);
+            Ok(PermissionReport::new(
+                PlatformOs::MacOs,
+                crate::schema::PermissionEntry {
+                    kind: PermissionKind::Microphone,
+                    state: if has_mic {
+                        crate::schema::PermissionState::Granted
+                    } else {
+                        crate::schema::PermissionState::NotDetermined
+                    },
+                    required: has_mic,
+                    can_prompt: !has_mic,
+                    requires_relaunch: false,
+                },
+                crate::schema::PermissionEntry {
+                    kind: PermissionKind::SystemAudio,
+                    state: if has_sys {
+                        crate::schema::PermissionState::Granted
+                    } else {
+                        crate::schema::PermissionState::Unknown
+                    },
+                    required: has_sys,
+                    can_prompt: !has_sys,
+                    requires_relaunch: false,
+                },
+                crate::schema::PermissionEntry {
+                    kind: PermissionKind::ScreenRecording,
+                    state: crate::schema::PermissionState::Denied,
+                    required: has_sck,
+                    can_prompt: false,
+                    requires_relaunch: true,
+                },
+            ))
+        }
+    }
+
+    #[test]
+    fn permissions_backend_trait_reports_honest_states_and_zero_alloc_check() {
+        let mic = CaptureTarget::microphone(DefaultDeviceMode::Follow);
+        let pre = Permissions::<MockPermissionsBackend>::check(
+            std::slice::from_ref(&mic),
+            &Backends::default(),
+        )
+        .unwrap();
+        assert!(!pre.is_granted());
+        assert!(!pre.has_denial());
+        assert!(!pre.requires_relaunch());
+        assert_eq!(
+            pre.microphone().state,
+            crate::schema::PermissionState::NotDetermined
+        );
+        assert!(pre.microphone().required);
+        assert!(!pre.screen_recording().required);
+
+        let kinds = [PermissionKind::Microphone];
+        let backends = Backends::default();
+        let allocs = allocation_counter::measure(|| {
+            for _ in 0..500 {
+                let r =
+                    Permissions::<MockPermissionsBackend>::check_kinds(&kinds, &backends).unwrap();
+                assert!(!r.is_granted());
+            }
+        });
+        assert_eq!(allocs.count_total, 0);
+
+        let post = Permissions::<MockPermissionsBackend>::request(
+            std::slice::from_ref(&mic),
+            &backends,
+            Duration::from_secs(5),
+            false,
+        )
+        .unwrap();
+        assert!(post.is_granted());
+        assert_eq!(
+            post.state_for(PermissionKind::Microphone),
+            crate::schema::PermissionState::Granted
+        );
+
+        let sck_rep = Permissions::<MockPermissionsBackend>::check_kinds(
+            &[PermissionKind::ScreenRecording],
+            &backends,
+        )
+        .unwrap();
+        assert!(!sck_rep.is_granted());
+        assert!(sck_rep.has_denial());
+        assert!(sck_rep.requires_relaunch());
+    }
+}
