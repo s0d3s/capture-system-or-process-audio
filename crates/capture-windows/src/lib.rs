@@ -37,3 +37,23 @@ pub use discovery::{
     PlatformDefaultInputObserver, PlatformDefaultOutputObserver, PlatformDiscovery,
 };
 
+#[cfg(windows)]
+pub use endpoint::{NativeFormat, PlatformStream};
+
+#[cfg(windows)]
+pub use manager::PlatformManager;
+
+#[cfg(windows)]
+pub type AudioStream = core::traits::AudioStream<PlatformStream>;
+
+#[cfg(windows)]
+pub type Discovery = core::traits::Discovery<PlatformDiscovery>;
+
+#[cfg(windows)]
+pub type CaptureManager = core::traits::CaptureManager<PlatformManager>;
+
+#[cfg(all(windows, any(test, feature = "native-tests")))]
+pub use endpoint::RawProcessCapture;
+
+#[cfg(all(windows, any(test, feature = "native-tests")))]
+pub use process::{inspect_process, inspect_process_executable};

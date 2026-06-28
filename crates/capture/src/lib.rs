@@ -165,3 +165,93 @@ pub fn check_permissions(targets: &[CaptureTarget]) -> Result<PermissionReport, 
     Permissions::check(targets, &Backends::default())
 }
 
+/// Non-prompting OS recording permission check for `targets` honoring `backends`.
+#[inline]
+pub fn check_permissions_with_backends(
+    targets: &[CaptureTarget],
+    backends: &Backends,
+) -> Result<PermissionReport, CapabilityError> {
+    Permissions::check(targets, backends)
+}
+
+/// Non-prompting OS recording permission check for a configured `CaptureRequest`.
+#[inline]
+pub fn check_request_permissions(
+    request: &CaptureRequest,
+) -> Result<PermissionReport, CapabilityError> {
+    Permissions::check_request(request)
+}
+
+/// Non-prompting OS recording permission check for explicit `PermissionKind` domains.
+#[inline]
+pub fn check_permission_kinds(
+    kinds: &[PermissionKind],
+    backends: &Backends,
+) -> Result<PermissionReport, CapabilityError> {
+    Permissions::check_kinds(kinds, backends)
+}
+
+/// Request OS recording permissions required by `targets` (empty slice requests all promptable OS domains).
+#[inline]
+pub fn request_permissions(
+    targets: &[CaptureTarget],
+    timeout: Duration,
+) -> Result<PermissionReport, CapabilityError> {
+    Permissions::request(targets, &Backends::default(), timeout, false)
+}
+
+/// Request OS recording permissions required by `targets` with explicit `backends` and optional Settings launch.
+#[inline]
+pub fn request_permissions_with_options(
+    targets: &[CaptureTarget],
+    backends: &Backends,
+    timeout: Duration,
+    open_settings_if_denied: bool,
+) -> Result<PermissionReport, CapabilityError> {
+    Permissions::request(targets, backends, timeout, open_settings_if_denied)
+}
+
+/// Request OS recording permissions required by a configured `CaptureRequest`.
+#[inline]
+pub fn request_for_capture_request(
+    request: &CaptureRequest,
+    timeout: Duration,
+    open_settings_if_denied: bool,
+) -> Result<PermissionReport, CapabilityError> {
+    Permissions::request_for_capture_request(request, timeout, open_settings_if_denied)
+}
+
+/// Request OS recording permissions for explicit `PermissionKind` domains.
+#[inline]
+pub fn request_permission_kinds(
+    kinds: &[PermissionKind],
+    backends: &Backends,
+    timeout: Duration,
+    open_settings_if_denied: bool,
+) -> Result<PermissionReport, CapabilityError> {
+    Permissions::request_kinds(kinds, backends, timeout, open_settings_if_denied)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::size_of;
+
+    #[test]
+    fn transparent_facade_types_have_zero_size_overhead_and_side_effect_free_inspect() {
+        assert_eq!(size_of::<AudioStream>(), size_of::<PlatformStream>());
+        assert_eq!(size_of::<Discovery>(), size_of::<PlatformDiscovery>());
+        assert_eq!(size_of::<CaptureManager>(), size_of::<PlatformManager>());
+        assert_eq!(size_of::<Permissions>(), size_of::<PlatformPermissions>());
+
+        let plan = request(vec![CaptureTarget::default_output(
+            DefaultDeviceMode::Follow,
+        )])
+        .with_permission_policy(PermissionPolicy::CheckOnly)
+        .inspect()
+        .expect("side-effect-free inspect");
+        assert!(!plan.uses_software_mixer);
+        assert_eq!(plan.permission_policy, PermissionPolicy::CheckOnly);
+        assert_eq!(plan.target_plans.len(), 1);
+    }
+}

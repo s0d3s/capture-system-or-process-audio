@@ -26,3 +26,17 @@ pub use pulse_stream::{PlatformStream, PulseStream};
 
 pub type AudioStream = core::traits::AudioStream<PlatformStream>;
 
+pub type Discovery = core::traits::Discovery<PlatformDiscovery>;
+
+pub type CaptureManager = core::traits::CaptureManager<PlatformManager>;
+
+pub type Permissions = core::traits::Permissions<PlatformPermissions>;
+
+#[cfg(any(test, feature = "native-tests"))]
+pub use capabilities::PulseServerKind;
+#[cfg(any(test, feature = "native-tests"))]
+pub use discovery::{collect_pipewire_graph, collect_pulse_state};
+#[cfg(any(test, feature = "native-tests"))]
+pub use loader::{LinuxClientPaths, probe_pipewire_server, probe_pulse_server};
+#[cfg(any(test, feature = "native-tests"))]
+pub use procfs::{current_process_switch_counts, inspect_process, inspect_process_executable};
