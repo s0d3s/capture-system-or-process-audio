@@ -234,3 +234,129 @@ fn resolve_macos_required_kinds(
     Ok(set.into_iter().collect())
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PlatformPermissions;
+
+impl PermissionsBackend for PlatformPermissions {
+    fn check_permissions(
+        targets: &[CaptureTarget],
+        backends: &Backends,
+    ) -> Result<PermissionReport, CapabilityError> {
+        let kinds = resolve_macos_required_kinds(targets, backends)?;
+        Self::check_permission_kinds(&kinds, backends)
+    }
+
+    fn request_permissions(
+        targets: &[CaptureTarget],
+        backends: &Backends,
+        timeout: Duration,
+        open_settings_if_denied: bool,
+    ) -> Result<PermissionReport, CapabilityError> {
+        let kinds = resolve_macos_required_kinds(targets, backends)?;
+        Self::request_permission_kinds(&kinds, backends, timeout, open_settings_if_denied)
+    }
+
+    fn check_permission_kinds(
+        kinds: &[PermissionKind],
+        backends: &Backends,
+    ) -> Result<PermissionReport, CapabilityError> {
+        backends.validate()?;
+        Ok(build_macos_report(kinds, false))
+    }
+
+    fn request_permission_kinds(
+        kinds: &[PermissionKind],
+        backends: &Backends,
+        timeout: Duration,
+        open_settings_if_denied: bool,
+    ) -> Result<PermissionReport, CapabilityError> {
+        backends.validate()?;
+        let mut sck_just_transitioned = false;
+        #[cfg(target_os = "macos")]
+        {
+            let timeout_s = timeout.as_secs_f64().clamp(0.1, 120.0);
+            if kinds.contains(&PermissionKind::Microphone) {
+                let res = crate::native_bridge::request_microphone_access(timeout_s);
+                if open_settings_if_denied && res == 2 {
+                    let _ = crate::native_bridge::open_privacy_settings(0);
+                }
+            }
+            if kinds.contains(&PermissionKind::SystemAudio) {
+                let tap_res = crate::native_bridge::request_system_audio_tap();
+                if tap_res == 3 {
+                    SYSTEM_AUDIO_TAP_CACHE.store(1, SeqCst);
+                } else if tap_res == 2 {
+                    SYSTEM_AUDIO_TAP_CACHE.store(2, SeqCst);
+                    if open_settings_if_denied {
+                        let _ = crate::native_bridge::open_privacy_settings(1);
+                    }
+                }
+            }
+            if kinds.contains(&PermissionKind::ScreenRecording) {
+                let was_granted = crate::native_bridge::sck_preflight_granted();
+                if !was_granted {
+                    SCK_PROMPT_ATTEMPTED.store(true, SeqCst);
+                    let now_granted = crate::native_bridge::sck_request_access();
+                    sck_just_transitioned = !was_granted && now_granted;
+                    if !now_granted && open_settings_if_denied {
+                        let _ = crate::native_bridge::open_privacy_settings(2);
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (timeout, open_settings_if_denied, &mut sck_just_transitioned);
+
+        Ok(build_macos_report(kinds, sck_just_transitioned))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn macos_permission_classifiers_guard_missing_plist_keys_wat_hog_and_sck_relaunch() {
+        let restricted_mic = classify_macos_mic_permission(0, true, true, (15, 7, 9), true);
+        assert_eq!(restricted_mic.state, PermissionState::Restricted);
+        assert!(!restricted_mic.can_prompt);
+
+        let interactive_mic = classify_macos_mic_permission(0, false, true, (15, 7, 9), true);
+        assert_eq!(interactive_mic.state, PermissionState::NotDetermined);
+        assert!(interactive_mic.can_prompt);
+
+        let ssh_mic = classify_macos_mic_permission(0, false, false, (15, 7, 9), true);
+        assert_eq!(ssh_mic.state, PermissionState::Restricted);
+        assert!(!ssh_mic.can_prompt);
+
+        let unprobed_tap = classify_macos_tap_permission(0, 0, true, (15, 7, 9), true);
+        assert_eq!(unprobed_tap.state, PermissionState::Unknown);
+        assert!(unprobed_tap.can_prompt);
+
+        let denied_tap = classify_macos_tap_permission(2, 0, true, (15, 7, 9), true);
+        assert_eq!(denied_tap.state, PermissionState::Denied);
+        assert!(!denied_tap.can_prompt);
+
+        let verified_tap = classify_macos_tap_permission(0, 1, true, (15, 7, 9), true);
+        assert_eq!(verified_tap.state, PermissionState::Granted);
+        assert!(!verified_tap.can_prompt);
+
+        let old_os_tap = classify_macos_tap_permission(0, 0, true, (13, 6, 0), true);
+        assert_eq!(old_os_tap.state, PermissionState::Restricted);
+
+        let unprompted_sck =
+            classify_macos_sck_permission(false, false, false, true, (15, 7, 9), true);
+        assert_eq!(unprompted_sck.state, PermissionState::NotDetermined);
+        assert!(unprompted_sck.can_prompt);
+        assert!(unprompted_sck.requires_relaunch);
+
+        let post_prompt_denied =
+            classify_macos_sck_permission(false, true, false, true, (15, 7, 9), true);
+        assert_eq!(post_prompt_denied.state, PermissionState::Denied);
+        assert!(!post_prompt_denied.can_prompt);
+
+        let granted_sck = classify_macos_sck_permission(true, false, false, true, (15, 7, 9), true);
+        assert_eq!(granted_sck.state, PermissionState::Granted);
+        assert!(!granted_sck.requires_relaunch);
+    }
+}

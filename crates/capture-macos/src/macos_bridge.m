@@ -1173,3 +1173,264 @@ int cspa_mac_open_coreaudio_input(const char *device_uid,
             }
         }
 
+        CspaCoreAudioInputSession *sess =
+            (CspaCoreAudioInputSession *)calloc(1, sizeof(CspaCoreAudioInputSession));
+        if (!sess) return -4;
+        sess->device = dev;
+        sess->callback = callback;
+        sess->user_data = user_data;
+
+        OSStatus st = AudioDeviceCreateIOProcID(dev, cspa_input_io_proc, sess, &sess->io_proc);
+        if (st != noErr || !sess->io_proc) {
+            free(sess);
+            return -5;
+        }
+        st = AudioDeviceStart(dev, sess->io_proc);
+        if (st != noErr) {
+            AudioDeviceDestroyIOProcID(dev, sess->io_proc);
+            free(sess);
+            return -6;
+        }
+        sess->started = true;
+        *out_handle = sess;
+        return 0;
+    }
+}
+
+int cspa_mac_close_coreaudio_input(void *handle) {
+    @autoreleasepool {
+        if (!handle) return 0;
+        CspaCoreAudioInputSession *sess = (CspaCoreAudioInputSession *)handle;
+        int rc = 0;
+        if (sess->started && sess->device && sess->io_proc) {
+            if (AudioDeviceStop(sess->device, sess->io_proc) != noErr) rc = -1;
+            sess->started = false;
+        }
+        if (sess->device && sess->io_proc) {
+            if (AudioDeviceDestroyIOProcID(sess->device, sess->io_proc) != noErr) rc = -2;
+            sess->io_proc = NULL;
+        }
+        free(sess);
+        return rc;
+    }
+}
+
+#if defined(CSPA_NATIVE_TESTS)
+typedef struct {
+    AudioObjectID tap;
+    AudioObjectID aggregate;
+} CspaTestVirtualMic;
+
+int cspa_mac_create_test_virtual_mic(uint32_t target_pid,
+                                     int mono,
+                                     const char *uid_cstr,
+                                     void **out_handle) {
+    @autoreleasepool {
+        if (!uid_cstr || uid_cstr[0] == '\0' || !out_handle || target_pid == 0) return -1;
+        *out_handle = NULL;
+
+        uint32_t proc_obj = 0;
+        if (cspa_mac_translate_pid_to_process_object(target_pid, &proc_obj) != 0 || proc_obj == 0) {
+            return -2;
+        }
+
+        AudioObjectID def_out = 0;
+        UInt32 dsz = sizeof(def_out);
+        NSString *out_uid = nil;
+        if (cspa_get_prop(kAudioObjectSystemObject, kAudioHardwarePropertyDefaultOutputDevice,
+                          kAudioObjectPropertyScopeGlobal, &dsz, &def_out) == noErr && def_out != 0) {
+            CFStringRef uid_ref = NULL;
+            UInt32 usz = sizeof(uid_ref);
+            if (cspa_get_prop(def_out, kAudioDevicePropertyDeviceUID,
+                              kAudioObjectPropertyScopeGlobal, &usz, &uid_ref) == noErr && uid_ref) {
+                out_uid = (__bridge_transfer NSString *)uid_ref;
+            }
+        }
+
+        CATapDescription *desc = nil;
+        if (mono != 0) {
+            desc = [[CATapDescription alloc] initMonoMixdownOfProcesses:@[@(proc_obj)]];
+        } else if (out_uid && out_uid.length > 0) {
+            desc = [[CATapDescription alloc] initWithProcesses:@[@(proc_obj)] andDeviceUID:out_uid withStream:0];
+        } else {
+            desc = [[CATapDescription alloc] initStereoMixdownOfProcesses:@[@(proc_obj)]];
+        }
+        if (!desc) return -3;
+        desc.exclusive = NO;
+        desc.privateTap = NO;
+        desc.muteBehavior = CATapUnmuted;
+        desc.name = @"CSPA Synthetic Virtual Mic Tap";
+
+        AudioObjectID tap = 0;
+        if (AudioHardwareCreateProcessTap(desc, &tap) != noErr || tap == 0) {
+            return -4;
+        }
+
+        NSString *virt_uid = [NSString stringWithUTF8String:uid_cstr];
+        NSDictionary *agg_props = @{
+            @kAudioAggregateDeviceNameKey: [NSString stringWithFormat:@"CSPA Virtual Mic (%@)", virt_uid],
+            @kAudioAggregateDeviceUIDKey: virt_uid,
+            @kAudioAggregateDeviceIsPrivateKey: @NO,
+            @kAudioAggregateDeviceTapAutoStartKey: @YES,
+            @kAudioAggregateDeviceTapListKey: @[@{
+                @kAudioSubTapUIDKey: [desc.UUID UUIDString],
+                @kAudioSubTapDriftCompensationKey: @NO
+            }]
+        };
+        AudioObjectID agg = 0;
+        if (AudioHardwareCreateAggregateDevice((__bridge CFDictionaryRef)agg_props, &agg) != noErr || agg == 0) {
+            AudioHardwareDestroyProcessTap(tap);
+            return -5;
+        }
+
+        CspaTestVirtualMic *vm = (CspaTestVirtualMic *)calloc(1, sizeof(CspaTestVirtualMic));
+        vm->tap = tap;
+        vm->aggregate = agg;
+        *out_handle = vm;
+        return 0;
+    }
+}
+
+int cspa_mac_destroy_test_virtual_mic(void *handle) {
+    @autoreleasepool {
+        if (!handle) return 0;
+        CspaTestVirtualMic *vm = (CspaTestVirtualMic *)handle;
+        int rc = 0;
+        if (vm->aggregate) {
+            if (AudioHardwareDestroyAggregateDevice(vm->aggregate) != noErr) rc = -1;
+            vm->aggregate = 0;
+        }
+        if (vm->tap) {
+            if (AudioHardwareDestroyProcessTap(vm->tap) != noErr) rc = -2;
+            vm->tap = 0;
+        }
+        free(vm);
+        return rc;
+    }
+}
+#endif
+
+typedef void (*CspaMacDeviceChangeCallback)(void *user_data);
+
+typedef struct {
+    CspaMacDeviceChangeCallback callback;
+    void *user_data;
+    uint32_t registered_default;
+    uint32_t registered_default_input;
+    uint32_t registered_devices;
+    uint32_t registered_process_list;
+} CspaMacPropertyListenerSession;
+
+static OSStatus cspa_mac_property_listener_proc(
+    AudioObjectID inObjectID,
+    UInt32 inNumberAddresses,
+    const AudioObjectPropertyAddress *inAddresses,
+    void *inClientData) {
+    (void)inObjectID;
+    (void)inNumberAddresses;
+    (void)inAddresses;
+    CspaMacPropertyListenerSession *sess = (CspaMacPropertyListenerSession *)inClientData;
+    if (sess && sess->callback) {
+        sess->callback(sess->user_data);
+    }
+    return noErr;
+}
+
+int cspa_mac_register_device_listener(CspaMacDeviceChangeCallback callback,
+                                      void *user_data,
+                                      void **out_handle) {
+    if (!callback || !out_handle) return -1;
+    *out_handle = NULL;
+    CspaMacPropertyListenerSession *sess =
+        (CspaMacPropertyListenerSession *)calloc(1, sizeof(CspaMacPropertyListenerSession));
+    if (!sess) return -2;
+    sess->callback = callback;
+    sess->user_data = user_data;
+
+    AudioObjectPropertyAddress def_addr = {
+        kAudioHardwarePropertyDefaultOutputDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    if (AudioObjectAddPropertyListener(kAudioObjectSystemObject, &def_addr,
+                                       cspa_mac_property_listener_proc, sess) == noErr) {
+        sess->registered_default = 1u;
+    }
+
+    AudioObjectPropertyAddress def_in_addr = {
+        kAudioHardwarePropertyDefaultInputDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    if (AudioObjectAddPropertyListener(kAudioObjectSystemObject, &def_in_addr,
+                                       cspa_mac_property_listener_proc, sess) == noErr) {
+        sess->registered_default_input = 1u;
+    }
+
+    AudioObjectPropertyAddress devs_addr = {
+        kAudioHardwarePropertyDevices,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    if (AudioObjectAddPropertyListener(kAudioObjectSystemObject, &devs_addr,
+                                       cspa_mac_property_listener_proc, sess) == noErr) {
+        sess->registered_devices = 1u;
+    }
+
+    AudioObjectPropertyAddress procs_addr = {
+        kAudioHardwarePropertyProcessObjectList,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    if (AudioObjectAddPropertyListener(kAudioObjectSystemObject, &procs_addr,
+                                       cspa_mac_property_listener_proc, sess) == noErr) {
+        sess->registered_process_list = 1u;
+    }
+
+    *out_handle = sess;
+    return 0;
+}
+
+int cspa_mac_unregister_device_listener(void *handle) {
+    if (!handle) return 0;
+    CspaMacPropertyListenerSession *sess = (CspaMacPropertyListenerSession *)handle;
+    sess->callback = NULL;
+    if (sess->registered_default) {
+        AudioObjectPropertyAddress def_addr = {
+            kAudioHardwarePropertyDefaultOutputDevice,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain
+        };
+        AudioObjectRemovePropertyListener(kAudioObjectSystemObject, &def_addr,
+                                          cspa_mac_property_listener_proc, sess);
+    }
+    if (sess->registered_default_input) {
+        AudioObjectPropertyAddress def_in_addr = {
+            kAudioHardwarePropertyDefaultInputDevice,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain
+        };
+        AudioObjectRemovePropertyListener(kAudioObjectSystemObject, &def_in_addr,
+                                          cspa_mac_property_listener_proc, sess);
+    }
+    if (sess->registered_devices) {
+        AudioObjectPropertyAddress devs_addr = {
+            kAudioHardwarePropertyDevices,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain
+        };
+        AudioObjectRemovePropertyListener(kAudioObjectSystemObject, &devs_addr,
+                                          cspa_mac_property_listener_proc, sess);
+    }
+    if (sess->registered_process_list) {
+        AudioObjectPropertyAddress procs_addr = {
+            kAudioHardwarePropertyProcessObjectList,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain
+        };
+        AudioObjectRemovePropertyListener(kAudioObjectSystemObject, &procs_addr,
+                                          cspa_mac_property_listener_proc, sess);
+    }
+    free(sess);
+    return 0;
+}

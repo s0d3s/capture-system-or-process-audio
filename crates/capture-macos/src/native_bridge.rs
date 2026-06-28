@@ -451,3 +451,374 @@ mod imp {
         let mut out = Vec::with_capacity(count as usize);
         for item in buf.iter().take(count as usize) {
             if item.pid == 0 {
+                continue;
+            }
+            // SAFETY: `bundle_id`, `app_name`, and `exe_path` are null-terminated by the bridge.
+            let bundle = unsafe {
+                CStr::from_ptr(item.bundle_id.as_ptr())
+                    .to_string_lossy()
+                    .trim()
+                    .to_owned()
+            };
+            let name = unsafe {
+                CStr::from_ptr(item.app_name.as_ptr())
+                    .to_string_lossy()
+                    .trim()
+                    .to_owned()
+            };
+            let exe = unsafe {
+                CStr::from_ptr(item.exe_path.as_ptr())
+                    .to_string_lossy()
+                    .trim()
+                    .to_owned()
+            };
+            out.push((item.pid, bundle, name, exe));
+        }
+        Ok(out)
+    }
+
+    pub struct NativeCoreAudioTapHandle {
+        raw: *mut c_void,
+        pub rate_hz: u32,
+        pub channels: u32,
+    }
+
+    // SAFETY: `NativeCoreAudioTapHandle` owns a synchronized Objective-C/CoreAudio session handle.
+    unsafe impl Send for NativeCoreAudioTapHandle {}
+    unsafe impl Sync for NativeCoreAudioTapHandle {}
+
+    impl NativeCoreAudioTapHandle {
+        pub fn open(
+            process_objects: &[u32],
+            is_process_tap: bool,
+            device_uid: Option<&str>,
+            mute_tap: bool,
+            callback: CspaAudioPacketCallback,
+            user_data: *mut c_void,
+        ) -> Result<Self, CapabilityError> {
+            let uid_cstr = device_uid.and_then(|s| CString::new(s).ok());
+            let uid_ptr = uid_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+            let mut rate_hz = 48_000u32;
+            let mut channels = 2u32;
+            let mut raw: *mut c_void = std::ptr::null_mut();
+            // SAFETY: `process_objects` and `uid_ptr` are valid during `cspa_mac_open_coreaudio_tap`.
+            let rc = unsafe {
+                cspa_mac_open_coreaudio_tap(
+                    if process_objects.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        process_objects.as_ptr()
+                    },
+                    process_objects.len() as u32,
+                    i32::from(is_process_tap),
+                    uid_ptr,
+                    i32::from(mute_tap),
+                    callback,
+                    user_data,
+                    &mut rate_hz,
+                    &mut channels,
+                    &mut raw,
+                )
+            };
+            match rc {
+                0 if !raw.is_null() => Ok(Self {
+                    raw,
+                    rate_hz,
+                    channels,
+                }),
+                -10 => Err(CapabilityError::InvalidTarget),
+                -11 => Err(CapabilityError::DeviceUnavailable),
+                -13 => Err(CapabilityError::PermissionDenied),
+                _ => Err(CapabilityError::ServerUnavailable),
+            }
+        }
+
+        pub fn update_processes(&self, process_objects: &[u32]) -> Result<(), CapabilityError> {
+            if self.raw.is_null() {
+                return Err(CapabilityError::ServerUnavailable);
+            }
+            // SAFETY: `self.raw` is a live tap handle.
+            let rc = unsafe {
+                cspa_mac_update_coreaudio_tap_processes(
+                    self.raw,
+                    if process_objects.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        process_objects.as_ptr()
+                    },
+                    process_objects.len() as u32,
+                )
+            };
+            if rc == 0 {
+                crate::permissions::record_system_audio_tap_verified_granted();
+                Ok(())
+            } else if rc == -13 {
+                Err(CapabilityError::PermissionDenied)
+            } else {
+                Err(CapabilityError::ServerUnavailable)
+            }
+        }
+
+        pub fn close(&mut self) {
+            if !self.raw.is_null() {
+                // SAFETY: stops IOProc and destroys aggregate device and process tap.
+                unsafe {
+                    let _ = cspa_mac_close_coreaudio_tap(self.raw);
+                }
+                self.raw = std::ptr::null_mut();
+            }
+        }
+    }
+
+    impl Drop for NativeCoreAudioTapHandle {
+        fn drop(&mut self) {
+            self.close();
+        }
+    }
+
+    pub struct NativeCoreAudioInputHandle {
+        raw: *mut c_void,
+        pub rate_hz: u32,
+        pub channels: u32,
+        pub resolved_uid: String,
+    }
+
+    // SAFETY: `NativeCoreAudioInputHandle` owns a synchronized Core Audio HAL input IOProc handle.
+    unsafe impl Send for NativeCoreAudioInputHandle {}
+    unsafe impl Sync for NativeCoreAudioInputHandle {}
+
+    impl NativeCoreAudioInputHandle {
+        pub fn open(
+            device_uid: Option<&str>,
+            auth_override: Option<i32>,
+            allow_prompt: bool,
+            callback: CspaAudioPacketCallback,
+            user_data: *mut c_void,
+        ) -> Result<Self, CapabilityError> {
+            let uid_cstr = match device_uid {
+                Some(s) => Some(CString::new(s).map_err(|_| CapabilityError::InvalidTarget)?),
+                None => None,
+            };
+            let uid_ptr = uid_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+            let mut rate_hz = 48_000u32;
+            let mut channels = 1u32;
+            let mut resolved_buf = [0 as c_char; 256];
+            let mut raw: *mut c_void = std::ptr::null_mut();
+            // SAFETY: passes valid writable pointers and `uid_ptr` for the duration of the call.
+            let rc = unsafe {
+                cspa_mac_open_coreaudio_input(
+                    uid_ptr,
+                    auth_override.unwrap_or(-1),
+                    i32::from(allow_prompt),
+                    callback,
+                    user_data,
+                    &mut rate_hz,
+                    &mut channels,
+                    resolved_buf.as_mut_ptr(),
+                    256,
+                    &mut raw,
+                )
+            };
+            match rc {
+                0 if !raw.is_null() => {
+                    // SAFETY: `resolved_buf` is NUL-terminated by `cspa_mac_open_coreaudio_input`.
+                    let resolved_uid = unsafe {
+                        CStr::from_ptr(resolved_buf.as_ptr())
+                            .to_string_lossy()
+                            .into_owned()
+                    };
+                    Ok(Self {
+                        raw,
+                        rate_hz,
+                        channels,
+                        resolved_uid,
+                    })
+                }
+                -10 => Err(CapabilityError::InvalidTarget),
+                -11 => Err(CapabilityError::DeviceUnavailable),
+                -12 | -13 => Err(CapabilityError::PermissionDenied),
+                _ => Err(CapabilityError::ServerUnavailable),
+            }
+        }
+
+        pub fn close(&mut self) {
+            if !self.raw.is_null() {
+                // SAFETY: stops and destroys the Core Audio HAL input IOProc.
+                unsafe {
+                    let _ = cspa_mac_close_coreaudio_input(self.raw);
+                }
+                self.raw = std::ptr::null_mut();
+            }
+        }
+    }
+
+    impl Drop for NativeCoreAudioInputHandle {
+        fn drop(&mut self) {
+            self.close();
+        }
+    }
+
+    #[cfg(feature = "native-tests")]
+    pub struct NativeTestVirtualMicHandle {
+        raw: *mut c_void,
+        pub uid: String,
+    }
+
+    #[cfg(feature = "native-tests")]
+    // SAFETY: `NativeTestVirtualMicHandle` owns a Core Audio aggregate + process tap test fixture.
+    unsafe impl Send for NativeTestVirtualMicHandle {}
+    #[cfg(feature = "native-tests")]
+    unsafe impl Sync for NativeTestVirtualMicHandle {}
+
+    #[cfg(feature = "native-tests")]
+    impl NativeTestVirtualMicHandle {
+        pub fn create(target_pid: u32, mono: bool, uid: &str) -> Result<Self, CapabilityError> {
+            let uid_c = CString::new(uid).map_err(|_| CapabilityError::InvalidTarget)?;
+            let mut raw: *mut c_void = std::ptr::null_mut();
+            // SAFETY: passes NUL-terminated `uid_c` and valid output pointer.
+            let rc = unsafe {
+                cspa_mac_create_test_virtual_mic(
+                    target_pid,
+                    i32::from(mono),
+                    uid_c.as_ptr(),
+                    &mut raw,
+                )
+            };
+            if rc == 0 && !raw.is_null() {
+                Ok(Self {
+                    raw,
+                    uid: uid.to_owned(),
+                })
+            } else {
+                Err(CapabilityError::ServerUnavailable)
+            }
+        }
+
+        pub fn destroy(&mut self) {
+            if !self.raw.is_null() {
+                // SAFETY: destroys the aggregate device and process tap created by `create`.
+                unsafe {
+                    let _ = cspa_mac_destroy_test_virtual_mic(self.raw);
+                }
+                self.raw = std::ptr::null_mut();
+            }
+        }
+    }
+
+    #[cfg(feature = "native-tests")]
+    impl Drop for NativeTestVirtualMicHandle {
+        fn drop(&mut self) {
+            self.destroy();
+        }
+    }
+
+    pub struct NativeSckStreamHandle {
+        raw: *mut c_void,
+        pub rate_hz: u32,
+        pub channels: u32,
+    }
+
+    // SAFETY: `NativeSckStreamHandle` owns a synchronized SCStream session handle.
+    unsafe impl Send for NativeSckStreamHandle {}
+    unsafe impl Sync for NativeSckStreamHandle {}
+
+    impl NativeSckStreamHandle {
+        pub fn open(
+            target_pid: u32,
+            exclude_current_process: bool,
+            callback: CspaAudioPacketCallback,
+            user_data: *mut c_void,
+        ) -> Result<Self, CapabilityError> {
+            if !sck_preflight_granted() {
+                return Err(CapabilityError::PermissionDenied);
+            }
+            let mut rate_hz = 48_000u32;
+            let mut channels = 2u32;
+            let mut raw: *mut c_void = std::ptr::null_mut();
+            // SAFETY: starts audio-only SCStream for `target_pid`.
+            let rc = unsafe {
+                cspa_mac_open_sck_app_stream(
+                    target_pid,
+                    i32::from(exclude_current_process),
+                    callback,
+                    user_data,
+                    &mut rate_hz,
+                    &mut channels,
+                    &mut raw,
+                )
+            };
+            match rc {
+                0 if !raw.is_null() => Ok(Self {
+                    raw,
+                    rate_hz,
+                    channels,
+                }),
+                -1 => Err(CapabilityError::PermissionDenied),
+                -6 => Err(CapabilityError::TargetNotShareableApplication),
+                _ => Err(CapabilityError::ServerUnavailable),
+            }
+        }
+
+        pub fn close(&mut self) {
+            if !self.raw.is_null() {
+                // SAFETY: stops SCStream and drains sampleHandlerQueue barrier.
+                unsafe {
+                    let _ = cspa_mac_close_sck_app_stream(self.raw);
+                }
+                self.raw = std::ptr::null_mut();
+            }
+        }
+    }
+
+    impl Drop for NativeSckStreamHandle {
+        fn drop(&mut self) {
+            self.close();
+        }
+    }
+
+    pub struct NativeDeviceListenerHandle {
+        raw: *mut c_void,
+    }
+
+    // SAFETY: `NativeDeviceListenerHandle` owns a Core Audio property listener registration.
+    unsafe impl Send for NativeDeviceListenerHandle {}
+    unsafe impl Sync for NativeDeviceListenerHandle {}
+
+    impl NativeDeviceListenerHandle {
+        pub fn register(
+            callback: unsafe extern "C" fn(user_data: *mut c_void),
+            user_data: *mut c_void,
+        ) -> Option<Self> {
+            let mut raw: *mut c_void = std::ptr::null_mut();
+            // SAFETY: registers `AudioObjectAddPropertyListener` for `kAudioHardwarePropertyDefaultOutputDevice`
+            // and `kAudioHardwarePropertyDevices`.
+            let rc = unsafe { cspa_mac_register_device_listener(callback, user_data, &mut raw) };
+            if rc == 0 && !raw.is_null() {
+                Some(Self { raw })
+            } else {
+                None
+            }
+        }
+
+        pub fn close(&mut self) {
+            if !self.raw.is_null() {
+                // SAFETY: unregisters Core Audio property listeners via `AudioObjectRemovePropertyListener`.
+                unsafe {
+                    let _ = cspa_mac_unregister_device_listener(self.raw);
+                }
+                self.raw = std::ptr::null_mut();
+            }
+        }
+    }
+
+    impl Drop for NativeDeviceListenerHandle {
+        fn drop(&mut self) {
+            self.close();
+        }
+    }
+
+    const _: (c_double, c_uint) = (0.0, 0);
+}
+
+#[cfg(target_os = "macos")]
+pub use imp::*;
