@@ -469,3 +469,346 @@ extern "C" {
 
 uint32_t cspa_abi_check(uint32_t abi_major, uint32_t schema_revision);
 
+uint32_t cspa_backends_init(cspa_backends_record *out_backends);
+uint32_t cspa_discovery_query_init(cspa_discovery_query_record *out_query);
+uint32_t cspa_mixer_config_init(cspa_mixer_config_record *out_config);
+uint32_t cspa_aggregate_budgets_init(cspa_aggregate_budgets_record *out_budgets);
+uint32_t cspa_capture_request_init(
+    cspa_capture_request_record *out_request,
+    const cspa_capture_target_record *targets,
+    uint64_t target_count
+);
+
+/* Target factories & pure builders */
+uint32_t cspa_target_process(
+    uint32_t pid,
+    uint64_t start_time,
+    uint32_t scope,
+    uint32_t on_root_exit,
+    uint64_t wait_timeout_ns,
+    float gain,
+    cspa_capture_target_record *out_target
+);
+
+uint32_t cspa_target_application(
+    uint32_t pid,
+    uint64_t start_time,
+    const char *app_id,
+    const char *name,
+    const char *executable_path,
+    uint32_t scope,
+    uint32_t on_root_exit,
+    uint64_t wait_timeout_ns,
+    float gain,
+    cspa_capture_target_record *out_target
+);
+
+uint32_t cspa_target_lower_to_process(
+    const cspa_capture_target_record *app_target,
+    cspa_capture_target_record *out_process_target
+);
+
+uint32_t cspa_target_device(
+    const char *device_id,
+    float gain,
+    cspa_capture_target_record *out_target
+);
+
+uint32_t cspa_target_input_device(
+    const char *device_id,
+    float gain,
+    cspa_capture_target_record *out_target
+);
+
+uint32_t cspa_target_default_output(
+    uint32_t default_device_mode,
+    float gain,
+    cspa_capture_target_record *out_target
+);
+
+uint32_t cspa_target_microphone(
+    uint32_t default_device_mode,
+    float gain,
+    cspa_capture_target_record *out_target
+);
+
+uint32_t cspa_target_with_backend(
+    const cspa_capture_target_record *target,
+    uint32_t backend,
+    cspa_capture_target_record *out_target
+);
+
+uint32_t cspa_target_with_gain(
+    const cspa_capture_target_record *target,
+    float gain,
+    cspa_capture_target_record *out_target
+);
+
+/* Side-effect-free plan inspection */
+uint32_t cspa_request_inspect(
+    const cspa_capture_request_record *request,
+    cspa_plan_report_record *out_report
+);
+
+uint32_t cspa_request_inspect_for_os(
+    uint32_t platform_os,
+    const cspa_capture_request_record *request,
+    cspa_plan_report_record *out_report
+);
+
+/* Recording Permissions check & request */
+uint32_t cspa_permission_report_init(cspa_permission_report_record *out_report);
+
+uint32_t cspa_permissions_check(
+    const cspa_capture_target_record *targets,
+    size_t target_count,
+    const cspa_backends_record *backends,
+    cspa_permission_report_record *out_report
+);
+
+uint32_t cspa_permissions_request(
+    const cspa_capture_target_record *targets,
+    size_t target_count,
+    const cspa_backends_record *backends,
+    uint64_t timeout_ms,
+    uint32_t open_settings_if_denied,
+    cspa_permission_report_record *out_report
+);
+
+uint32_t cspa_request_check_permissions(
+    const cspa_capture_request_record *request,
+    cspa_permission_report_record *out_report
+);
+
+uint32_t cspa_request_request_permissions(
+    const cspa_capture_request_record *request,
+    uint64_t timeout_ms,
+    uint32_t open_settings_if_denied,
+    cspa_permission_report_record *out_report
+);
+
+/* Unified Discovery & DiscoveryQuery */
+uint32_t cspa_discover_query(
+    const cspa_discovery_query_record *query,
+    cspa_capture_target_record *out_targets,
+    size_t capacity,
+    size_t *out_count
+);
+
+uint32_t cspa_discovery_create(cspa_discovery **out_discovery);
+uint32_t cspa_discovery_create_with_backends(
+    const cspa_backends_record *backends,
+    cspa_discovery **out_discovery
+);
+void cspa_discovery_release(cspa_discovery *discovery);
+
+uint32_t cspa_discovery_query(
+    const cspa_discovery *discovery,
+    const cspa_discovery_query_record *query,
+    cspa_capture_target_record *out_targets,
+    size_t capacity,
+    size_t *out_count
+);
+
+uint32_t cspa_discovery_applications(
+    const cspa_discovery *discovery,
+    uint32_t active_only,
+    uint32_t include_non_audio,
+    cspa_capture_target_record *out_targets,
+    size_t capacity,
+    size_t *out_count
+);
+
+uint32_t cspa_discovery_processes(
+    const cspa_discovery *discovery,
+    uint32_t active_only,
+    uint32_t include_non_audio,
+    cspa_capture_target_record *out_targets,
+    size_t capacity,
+    size_t *out_count
+);
+
+uint32_t cspa_discovery_output_devices(
+    const cspa_discovery *discovery,
+    cspa_capture_target_record *out_targets,
+    size_t capacity,
+    size_t *out_count
+);
+
+uint32_t cspa_discovery_input_devices(
+    const cspa_discovery *discovery,
+    cspa_capture_target_record *out_targets,
+    size_t capacity,
+    size_t *out_count
+);
+
+uint32_t cspa_discovery_find_app(
+    const cspa_discovery *discovery,
+    const char *query,
+    uint32_t scope,
+    uint32_t on_root_exit,
+    uint64_t wait_timeout_ns,
+    cspa_capture_target_record *out_target
+);
+
+uint32_t cspa_discovery_subscribe_query(
+    const cspa_discovery *discovery,
+    const cspa_discovery_query_record *query,
+    size_t max_queue,
+    cspa_discovery_subscription **out_subscription
+);
+
+uint32_t cspa_discovery_subscription_is_overflowed(
+    const cspa_discovery_subscription *subscription,
+    uint32_t *out_overflowed
+);
+
+uint32_t cspa_discovery_subscription_poll(
+    const cspa_discovery_subscription *subscription,
+    cspa_discovery_event_record *out_event,
+    uint32_t *out_has_event
+);
+
+uint32_t cspa_discovery_subscription_resnapshot(
+    const cspa_discovery_subscription *subscription,
+    cspa_capture_target_record *out_targets,
+    size_t capacity,
+    uint64_t *out_revision,
+    size_t *out_target_count
+);
+
+void cspa_discovery_subscription_release(cspa_discovery_subscription *subscription);
+
+/* Cancellation & retained block ownership */
+uint32_t cspa_cancel_create(cspa_cancel **out_cancel);
+void cspa_cancel_trigger(cspa_cancel *cancel);
+uint32_t cspa_cancel_is_cancelled(const cspa_cancel *cancel);
+void cspa_cancel_release(cspa_cancel *cancel);
+
+cspa_owner *cspa_owner_retain(cspa_owner *owner);
+void cspa_owner_release(cspa_owner *owner);
+void cspa_block_release(cspa_block_record *block);
+
+/* Single-point AudioStream */
+uint32_t cspa_stream_open(
+    const cspa_capture_target_record *target,
+    uint32_t overflow,
+    cspa_stream **out_stream
+);
+uint32_t cspa_stream_open_with_policy(
+    const cspa_capture_target_record *target,
+    uint32_t overflow,
+    uint32_t permission_policy,
+    cspa_stream **out_stream
+);
+uint32_t cspa_stream_format(
+    const cspa_stream *stream,
+    cspa_pcm_format_record *out_format
+);
+uint32_t cspa_stream_read_into(
+    cspa_stream *stream,
+    uint8_t *destination,
+    size_t destination_bytes,
+    uint64_t requested_frames,
+    uint64_t timeout_ms,
+    cspa_cancel *cancel,
+    cspa_managed_read_outcome_record *out_outcome
+);
+uint32_t cspa_stream_stop(cspa_stream *stream, uint32_t abort_mode);
+uint32_t cspa_stream_wait_cleanup(
+    cspa_stream *stream,
+    uint64_t timeout_ms,
+    uint32_t *out_cleaned
+);
+void cspa_stream_release(cspa_stream *stream);
+
+/* Unified CaptureManager */
+uint32_t cspa_manager_open(
+    const cspa_capture_request_record *request,
+    cspa_manager **out_manager
+);
+
+uint32_t cspa_manager_plan(
+    const cspa_manager *manager,
+    cspa_plan_report_record *out_report
+);
+
+uint32_t cspa_manager_output_format(
+    const cspa_manager *manager,
+    cspa_pcm_format_record *out_format
+);
+
+uint32_t cspa_manager_working_format(
+    const cspa_manager *manager,
+    cspa_pcm_format_record *out_format,
+    uint32_t *out_has_working_format
+);
+
+uint32_t cspa_manager_update_targets(
+    cspa_manager *manager,
+    const cspa_capture_target_record *targets,
+    size_t target_count,
+    uint64_t *out_membership_version
+);
+
+uint32_t cspa_manager_read(
+    cspa_manager *manager,
+    uint64_t requested_frames,
+    uint64_t timeout_ms,
+    cspa_cancel *cancel,
+    cspa_managed_read_outcome_record *out_outcome
+);
+
+uint32_t cspa_manager_read_into(
+    cspa_manager *manager,
+    uint8_t *destination,
+    size_t destination_bytes,
+    uint64_t requested_frames,
+    uint64_t timeout_ms,
+    cspa_cancel *cancel,
+    cspa_managed_read_outcome_record *out_outcome
+);
+
+uint32_t cspa_manager_input_count(
+    const cspa_manager *manager,
+    size_t *out_count
+);
+
+uint32_t cspa_manager_input_status(
+    const cspa_manager *manager,
+    size_t index,
+    cspa_input_status_record *out_status
+);
+
+uint32_t cspa_manager_start_callback(
+    cspa_manager *manager,
+    uint64_t requested_frames,
+    uint64_t timeout_ms,
+    cspa_managed_callback_fn callback,
+    void *user_data,
+    cspa_context_release_fn on_context_release
+);
+
+uint32_t cspa_manager_stop_callback(cspa_manager *manager);
+uint32_t cspa_manager_callback_invocations(const cspa_manager *manager, size_t *out_count);
+uint32_t cspa_manager_stop(cspa_manager *manager, uint32_t abort_mode);
+uint32_t cspa_manager_wait_cleanup(
+    cspa_manager *manager,
+    uint64_t timeout_ms,
+    uint32_t *out_cleaned
+);
+void cspa_manager_release(cspa_manager *manager);
+
+/* Deterministic test boundary & cursor-overflow verification hooks */
+uint32_t cspa_test_simulate_panic_containment(uint32_t should_panic);
+uint32_t cspa_test_discovery_publish_synthetic(
+    const cspa_discovery *discovery,
+    size_t count,
+    uint64_t *out_revision
+);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
