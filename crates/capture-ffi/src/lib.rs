@@ -1710,3 +1710,1238 @@ pub unsafe extern "C" fn cspa_discovery_subscription_release(
     }));
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_cancel_create(out_cancel: *mut *mut CspaCancelHandle) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if out_cancel.is_null() {
+            return CSPA_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: `out_cancel` was checked non-null above.
+        unsafe {
+            *out_cancel = Box::into_raw(Box::new(CspaCancelHandle {
+                inner: Cancellation::default(),
+            }));
+        }
+        CSPA_STATUS_OK
+    }))
+    .unwrap_or(CSPA_STATUS_INTERNAL_ERROR)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_cancel_trigger(cancel: *mut CspaCancelHandle) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if !cancel.is_null() {
+            // SAFETY: `cancel` was checked non-null above.
+            unsafe {
+                (*cancel).inner.cancel();
+            }
+        }
+    }));
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_cancel_is_cancelled(cancel: *const CspaCancelHandle) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if cancel.is_null() {
+            return 0;
+        }
+        // SAFETY: `cancel` was checked non-null above.
+        u32::from(unsafe { (*cancel).inner.is_cancelled() })
+    }))
+    .unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_cancel_release(cancel: *mut CspaCancelHandle) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if !cancel.is_null() {
+            // SAFETY: `cancel` was allocated by `Box::into_raw` in `cspa_cancel_create`.
+            unsafe {
+                drop(Box::from_raw(cancel));
+            }
+        }
+    }));
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_owner_retain(owner: *mut CspaOwnerHandle) -> *mut CspaOwnerHandle {
+    catch_unwind(AssertUnwindSafe(|| {
+        if owner.is_null() {
+            return ptr::null_mut();
+        }
+        // SAFETY: `owner` was checked non-null above.
+        let existing = unsafe { &*owner };
+        Box::into_raw(Box::new(CspaOwnerHandle {
+            block: existing.block.view(),
+            first: existing.first,
+            frames: existing.frames,
+        }))
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_owner_release(owner: *mut CspaOwnerHandle) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if !owner.is_null() {
+            // SAFETY: `owner` was allocated by `Box::into_raw`.
+            unsafe {
+                drop(Box::from_raw(owner));
+            }
+        }
+    }));
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_block_release(block: *mut CspaBlockRecord) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if !block.is_null() {
+            // SAFETY: `block` was checked non-null above.
+            let b = unsafe { &mut *block };
+            if !b.retained_owner.is_null() {
+                // SAFETY: `retained_owner` was allocated by `Box::into_raw`.
+                unsafe {
+                    drop(Box::from_raw(b.retained_owner));
+                }
+                b.retained_owner = ptr::null_mut();
+            }
+            b.bytes = ptr::null();
+            b.byte_length = 0;
+        }
+    }));
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_stream_open(
+    target: *const CaptureTargetRecord,
+    overflow: u32,
+    out_stream: *mut *mut CspaStreamHandle,
+) -> u32 {
+    // SAFETY: Forwards exact caller pointers with default `CSPA_PERMISSION_POLICY_AUTO_REQUEST`.
+    unsafe {
+        cspa_stream_open_with_policy(
+            target,
+            overflow,
+            CSPA_PERMISSION_POLICY_AUTO_REQUEST,
+            out_stream,
+        )
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_stream_open_with_policy(
+    target: *const CaptureTargetRecord,
+    overflow: u32,
+    permission_policy: u32,
+    out_stream: *mut *mut CspaStreamHandle,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if target.is_null() || out_stream.is_null() {
+            return CSPA_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: `target` was checked non-null above.
+        let decoded = match unsafe { (&*target).decode() } {
+            Ok(t) => t,
+            Err(code) => return code,
+        };
+        let overflow_enum = match decode_overflow(overflow) {
+            Ok(o) => o,
+            Err(code) => return code,
+        };
+        let policy_enum = match decode_permission_policy(permission_policy) {
+            Ok(p) => p,
+            Err(code) => return code,
+        };
+        let stream = match AudioStream::open_with_permission_policy(
+            &decoded,
+            ProcessTreeRange::default(),
+            &Backends::default(),
+            overflow_enum,
+            TimingRequirement::Raw,
+            policy_enum,
+        ) {
+            Ok(s) => s,
+            Err(err) => return map_capability_error(err),
+        };
+        let default_cancel = stream.default_cancel();
+        let handle = Box::new(CspaStreamHandle {
+            stream: Mutex::new(stream),
+            default_cancel,
+            active_readers: AtomicUsize::new(0),
+        });
+        // SAFETY: `out_stream` was checked non-null above.
+        unsafe {
+            *out_stream = Box::into_raw(handle);
+        }
+        CSPA_STATUS_OK
+    }))
+    .unwrap_or(CSPA_STATUS_INTERNAL_ERROR)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_stream_format(
+    stream: *const CspaStreamHandle,
+    out_format: *mut CspaPcmFormatRecord,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if stream.is_null() || out_format.is_null() {
+            return CSPA_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: Both pointers were checked non-null above.
+        let (st_handle, fmt_out) = unsafe { (&*stream, &mut *out_format) };
+        if let Err(code) = fmt_out.check_abi() {
+            return code;
+        }
+        let Ok(guard) = st_handle.stream.lock() else {
+            return CSPA_STATUS_INTERNAL_ERROR;
+        };
+        *fmt_out = CspaPcmFormatRecord::from(guard.format().as_ref());
+        CSPA_STATUS_OK
+    }))
+    .unwrap_or(CSPA_STATUS_INTERNAL_ERROR)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_stream_read_into(
+    stream: *mut CspaStreamHandle,
+    destination: *mut u8,
+    destination_bytes: usize,
+    requested_frames: u64,
+    timeout_ms: u64,
+    cancel: *mut CspaCancelHandle,
+    out_outcome: *mut CspaManagedReadOutcomeRecord,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if stream.is_null()
+            || destination.is_null()
+            || destination_bytes == 0
+            || out_outcome.is_null()
+            || requested_frames == 0
+        {
+            return CSPA_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: `stream` and `out_outcome` were checked non-null above.
+        let (st_handle, out_ref) = unsafe { (&*stream, &mut *out_outcome) };
+        if let Err(code) = out_ref.check_abi() {
+            return code;
+        }
+        if st_handle
+            .active_readers
+            .compare_exchange(0, 1, SeqCst, SeqCst)
+            .is_err()
+        {
+            return CSPA_STATUS_ALREADY_PENDING;
+        }
+        let cancel_tok = if cancel.is_null() {
+            st_handle.default_cancel.clone()
+        } else {
+            // SAFETY: `cancel` is non-null.
+            unsafe { (*cancel).inner.clone() }
+        };
+        // SAFETY: `destination` is non-null and caller declared `destination_bytes` writable bytes.
+        let dst_slice = unsafe { std::slice::from_raw_parts_mut(destination, destination_bytes) };
+        let res = st_handle
+            .stream
+            .lock()
+            .map_err(|_| CSPA_STATUS_INTERNAL_ERROR)
+            .and_then(|mut guard| {
+                guard
+                    .read_into_with_cancel(
+                        dst_slice,
+                        requested_frames as usize,
+                        Duration::from_millis(timeout_ms),
+                        cancel_tok,
+                    )
+                    .map_err(map_read_error)
+            });
+        st_handle.active_readers.fetch_sub(1, SeqCst);
+        match res {
+            Ok(read_res) => {
+                populate_into_outcome_record(1, 1, None, read_res, destination, out_ref);
+                CSPA_STATUS_OK
+            }
+            Err(code) => code,
+        }
+    }))
+    .unwrap_or(CSPA_STATUS_INTERNAL_ERROR)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_stream_stop(stream: *mut CspaStreamHandle, abort_mode: u32) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if stream.is_null() || abort_mode > 1 {
+            return CSPA_STATUS_INVALID_ARGUMENT;
+        }
+        let mode = if abort_mode != 0 {
+            Stop::Abort
+        } else {
+            Stop::Drain
+        };
+        // SAFETY: `stream` was checked non-null above.
+        let st_handle = unsafe { &*stream };
+        let Ok(guard) = st_handle.stream.lock() else {
+            return CSPA_STATUS_INTERNAL_ERROR;
+        };
+        guard.stop(mode);
+        CSPA_STATUS_OK
+    }))
+    .unwrap_or(CSPA_STATUS_INTERNAL_ERROR)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_stream_wait_cleanup(
+    stream: *mut CspaStreamHandle,
+    timeout_ms: u64,
+    out_cleaned: *mut u32,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if stream.is_null() || out_cleaned.is_null() {
+            return CSPA_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: Both pointers were checked non-null above.
+        let st_handle = unsafe { &*stream };
+        let Ok(guard) = st_handle.stream.lock() else {
+            return CSPA_STATUS_INTERNAL_ERROR;
+        };
+        let cleaned = guard.wait_cleanup(Duration::from_millis(timeout_ms.max(1)));
+        unsafe {
+            *out_cleaned = u32::from(cleaned);
+        }
+        CSPA_STATUS_OK
+    }))
+    .unwrap_or(CSPA_STATUS_INTERNAL_ERROR)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_stream_release(stream: *mut CspaStreamHandle) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if !stream.is_null() {
+            // SAFETY: `stream` was allocated by `Box::into_raw` in `cspa_stream_open`.
+            unsafe {
+                let handle = Box::from_raw(stream);
+                if let Ok(guard) = handle.stream.lock() {
+                    guard.stop(Stop::Abort);
+                }
+                drop(handle);
+            }
+        }
+    }));
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_manager_open(
+    request: *const CspaCaptureRequestRecord,
+    out_manager: *mut *mut CspaManagerHandle,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if request.is_null() || out_manager.is_null() {
+            return CSPA_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: `request` was checked non-null above; inner pointers are validated inside `decode`.
+        let (decoded_req, overflow) = match unsafe { (&*request).decode() } {
+            Ok(pair) => pair,
+            Err(code) => return code,
+        };
+        let timing = if decoded_req.require_precise_timing() {
+            capture_system_or_process_audio::TimingRequirement::Precise
+        } else {
+            capture_system_or_process_audio::TimingRequirement::Raw
+        };
+        let mgr = match CaptureManager::open_with_options(decoded_req, overflow, timing) {
+            Ok(m) => m,
+            Err(err) => return map_capability_error(err),
+        };
+        // SAFETY: `out_manager` was checked non-null above.
+        unsafe {
+            *out_manager = Box::into_raw(Box::new(CspaManagerHandle::new(mgr)));
+        }
+        CSPA_STATUS_OK
+    }))
+    .unwrap_or(CSPA_STATUS_INTERNAL_ERROR)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_manager_plan(
+    manager: *const CspaManagerHandle,
+    out_report: *mut CspaPlanReportRecord,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if manager.is_null() || out_report.is_null() {
+            return CSPA_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: Both pointers were checked non-null above.
+        let (mgr_handle, report_out) = unsafe { (&*manager, &mut *out_report) };
+        if let Err(code) = report_out.check_abi() {
+            return code;
+        }
+        let Ok(guard) = mgr_handle.manager.lock() else {
+            return CSPA_STATUS_INTERNAL_ERROR;
+        };
+        // SAFETY: `report_out` and its optional `target_plans` buffer are caller-owned.
+        unsafe {
+            report_out.populate_from(guard.plan());
+        }
+        CSPA_STATUS_OK
+    }))
+    .unwrap_or(CSPA_STATUS_INTERNAL_ERROR)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_manager_output_format(
+    manager: *const CspaManagerHandle,
+    out_format: *mut CspaPcmFormatRecord,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if manager.is_null() || out_format.is_null() {
+            return CSPA_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: Both pointers were checked non-null above.
+        let (mgr_handle, fmt_out) = unsafe { (&*manager, &mut *out_format) };
+        if let Err(code) = fmt_out.check_abi() {
+            return code;
+        }
+        let Ok(guard) = mgr_handle.manager.lock() else {
+            return CSPA_STATUS_INTERNAL_ERROR;
+        };
+        let Some(fmt) = guard.output_format() else {
+            return CSPA_STATUS_STOPPED;
+        };
+        *fmt_out = CspaPcmFormatRecord::from(fmt.as_ref());
+        CSPA_STATUS_OK
+    }))
+    .unwrap_or(CSPA_STATUS_INTERNAL_ERROR)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_manager_working_format(
+    manager: *const CspaManagerHandle,
+    out_format: *mut CspaPcmFormatRecord,
+    out_has_working_format: *mut u32,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if manager.is_null() || out_format.is_null() || out_has_working_format.is_null() {
+            return CSPA_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: All pointers were checked non-null above.
+        let (mgr_handle, fmt_out) = unsafe { (&*manager, &mut *out_format) };
+        if let Err(code) = fmt_out.check_abi() {
+            return code;
+        }
+        let Ok(guard) = mgr_handle.manager.lock() else {
+            return CSPA_STATUS_INTERNAL_ERROR;
+        };
+        if let Some(fmt) = guard.working_format() {
+            *fmt_out = CspaPcmFormatRecord::from(fmt.as_ref());
+            // SAFETY: `out_has_working_format` was checked non-null above.
+            unsafe {
+                *out_has_working_format = 1;
+            }
+        } else {
+            // SAFETY: `out_has_working_format` was checked non-null above.
+            unsafe {
+                *out_has_working_format = 0;
+            }
+        }
+        CSPA_STATUS_OK
+    }))
+    .unwrap_or(CSPA_STATUS_INTERNAL_ERROR)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_manager_update_targets(
+    manager: *mut CspaManagerHandle,
+    targets: *const CaptureTargetRecord,
+    target_count: usize,
+    out_membership_version: *mut u64,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if manager.is_null() || targets.is_null() || target_count == 0 || target_count > 1024 {
+            return CSPA_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: `manager` and `targets` were checked non-null above.
+        let mgr_handle = unsafe { &*manager };
+        let raw_targets = unsafe { std::slice::from_raw_parts(targets, target_count) };
+        let mut decoded = Vec::with_capacity(target_count);
+        for rec in raw_targets {
+            match rec.decode() {
+                Ok(t) => decoded.push(t),
+                Err(code) => return code,
+            }
+        }
+        let Ok(mut guard) = mgr_handle.manager.lock() else {
+            return CSPA_STATUS_INTERNAL_ERROR;
+        };
+        let version = match guard.update_targets(decoded) {
+            Ok(v) => v,
+            Err(err) => return map_capability_error(err),
+        };
+        if !out_membership_version.is_null() {
+            // SAFETY: `out_membership_version` is non-null.
+            unsafe {
+                *out_membership_version = version;
+            }
+        }
+        CSPA_STATUS_OK
+    }))
+    .unwrap_or(CSPA_STATUS_INTERNAL_ERROR)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_manager_read(
+    manager: *mut CspaManagerHandle,
+    requested_frames: u64,
+    timeout_ms: u64,
+    cancel: *mut CspaCancelHandle,
+    out_outcome: *mut CspaManagedReadOutcomeRecord,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if manager.is_null() || out_outcome.is_null() || requested_frames == 0 {
+            return CSPA_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: `manager` and `out_outcome` were checked non-null above.
+        let (mgr, out_ref) = unsafe { (&*manager, &mut *out_outcome) };
+        if let Err(code) = out_ref.check_abi() {
+            return code;
+        }
+        if mgr.callback_active.load(SeqCst)
+            || mgr
+                .active_readers
+                .compare_exchange(0, 1, SeqCst, SeqCst)
+                .is_err()
+        {
+            return CSPA_STATUS_ALREADY_PENDING;
+        }
+        let cancel_tok = if cancel.is_null() {
+            mgr.default_cancel.clone()
+        } else {
+            // SAFETY: `cancel` is non-null.
+            unsafe { (*cancel).inner.clone() }
+        };
+        let res = mgr
+            .manager
+            .lock()
+            .map_err(|_| CSPA_STATUS_INTERNAL_ERROR)
+            .and_then(|mut guard| {
+                let read_res = guard
+                    .read_with_cancel(
+                        requested_frames as usize,
+                        Duration::from_millis(timeout_ms),
+                        cancel_tok,
+                    )
+                    .map_err(map_read_error)?;
+                Ok((
+                    guard.session_id(),
+                    guard.segment_id(),
+                    guard.last_block_metadata(),
+                    read_res,
+                ))
+            });
+        mgr.active_readers.fetch_sub(1, SeqCst);
+        match res {
+            Ok((sess, seg, meta, read_res)) => {
+                populate_owned_outcome_record(sess, seg, meta, read_res, out_ref);
+                CSPA_STATUS_OK
+            }
+            Err(code) => code,
+        }
+    }))
+    .unwrap_or(CSPA_STATUS_INTERNAL_ERROR)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_manager_read_into(
+    manager: *mut CspaManagerHandle,
+    destination: *mut u8,
+    destination_bytes: usize,
+    requested_frames: u64,
+    timeout_ms: u64,
+    cancel: *mut CspaCancelHandle,
+    out_outcome: *mut CspaManagedReadOutcomeRecord,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if manager.is_null()
+            || destination.is_null()
+            || destination_bytes == 0
+            || out_outcome.is_null()
+            || requested_frames == 0
+        {
+            return CSPA_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: `manager` and `out_outcome` were checked non-null above.
+        let (mgr, out_ref) = unsafe { (&*manager, &mut *out_outcome) };
+        if let Err(code) = out_ref.check_abi() {
+            return code;
+        }
+        if mgr.callback_active.load(SeqCst)
+            || mgr
+                .active_readers
+                .compare_exchange(0, 1, SeqCst, SeqCst)
+                .is_err()
+        {
+            return CSPA_STATUS_ALREADY_PENDING;
+        }
+        let cancel_tok = if cancel.is_null() {
+            mgr.default_cancel.clone()
+        } else {
+            // SAFETY: `cancel` is non-null.
+            unsafe { (*cancel).inner.clone() }
+        };
+        // SAFETY: `destination` is non-null and caller declared `destination_bytes` writable bytes.
+        let dst_slice = unsafe { std::slice::from_raw_parts_mut(destination, destination_bytes) };
+        let res = mgr
+            .manager
+            .lock()
+            .map_err(|_| CSPA_STATUS_INTERNAL_ERROR)
+            .and_then(|mut guard| {
+                let read_res = guard
+                    .read_into_with_cancel(
+                        dst_slice,
+                        requested_frames as usize,
+                        Duration::from_millis(timeout_ms),
+                        cancel_tok,
+                    )
+                    .map_err(map_read_error)?;
+                Ok((
+                    guard.session_id(),
+                    guard.segment_id(),
+                    guard.last_block_metadata(),
+                    read_res,
+                ))
+            });
+        mgr.active_readers.fetch_sub(1, SeqCst);
+        match res {
+            Ok((sess, seg, meta, read_res)) => {
+                populate_into_outcome_record(sess, seg, meta, read_res, destination, out_ref);
+                CSPA_STATUS_OK
+            }
+            Err(code) => code,
+        }
+    }))
+    .unwrap_or(CSPA_STATUS_INTERNAL_ERROR)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_manager_input_count(
+    manager: *const CspaManagerHandle,
+    out_count: *mut usize,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if manager.is_null() || out_count.is_null() {
+            return CSPA_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: Both pointers were checked non-null above.
+        let mgr = unsafe { &*manager };
+        let Ok(guard) = mgr.manager.lock() else {
+            return CSPA_STATUS_INTERNAL_ERROR;
+        };
+        let count = guard.input_handles().len().max(1);
+        unsafe {
+            *out_count = count;
+        }
+        CSPA_STATUS_OK
+    }))
+    .unwrap_or(CSPA_STATUS_INTERNAL_ERROR)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_manager_input_status(
+    manager: *const CspaManagerHandle,
+    index: usize,
+    out_status: *mut CspaInputStatusRecord,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if manager.is_null() || out_status.is_null() {
+            return CSPA_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: Both pointers were checked non-null above.
+        let (mgr, st_out) = unsafe { (&*manager, &mut *out_status) };
+        if let Err(code) = st_out.check_abi() {
+            return code;
+        }
+        let Ok(guard) = mgr.manager.lock() else {
+            return CSPA_STATUS_INTERNAL_ERROR;
+        };
+        if let Some(h) = guard.input_handles().get(index) {
+            fill_input_status_from_handle(h, st_out);
+            return CSPA_STATUS_OK;
+        }
+        if index != 0 {
+            return CSPA_STATUS_INVALID_ARGUMENT;
+        }
+        let native_fmt = guard.output_format().cloned();
+        st_out.target_index = 0;
+        st_out.backend = encode_backend(guard.selected_backend());
+        st_out.participation_state = CSPA_PARTICIPATION_ACTIVE;
+        st_out.failure_code = 0;
+        st_out.native_rate_hz = native_fmt.as_ref().map_or(0, |f| f.rate());
+        st_out.native_channels = native_fmt.as_ref().map_or(0, |f| u32::from(f.channels()));
+        st_out.native_sample_format = native_fmt
+            .as_ref()
+            .map_or(0, |f| encode_sample_type(f.sample()));
+        st_out.mixer_rate_hz = st_out.native_rate_hz;
+        st_out.mixer_channels = st_out.native_channels;
+        st_out.is_resampled = 0;
+        st_out.is_identity_bypass = 1;
+        st_out.reserved = 0;
+        st_out.queued_packets = 0;
+        st_out.dropped_frames = 0;
+        st_out.clipped_samples = 0;
+        st_out.nonfinite_samples = 0;
+        st_out.drift_slips = 0;
+        CSPA_STATUS_OK
+    }))
+    .unwrap_or(CSPA_STATUS_INTERNAL_ERROR)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_manager_start_callback(
+    manager: *mut CspaManagerHandle,
+    requested_frames: u64,
+    timeout_ms: u64,
+    callback: CspaManagedCallbackFn,
+    user_data: *mut c_void,
+    on_context_release: CspaContextReleaseFn,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if manager.is_null() || callback.is_none() || requested_frames == 0 {
+            return CSPA_STATUS_INVALID_ARGUMENT;
+        }
+        let cb_fn = callback.unwrap();
+        // SAFETY: `manager` was checked non-null above.
+        let mgr = unsafe { &*manager };
+        if mgr.active_readers.load(SeqCst) > 0
+            || mgr
+                .callback_active
+                .compare_exchange(false, true, SeqCst, SeqCst)
+                .is_err()
+        {
+            return CSPA_STATUS_ALREADY_PENDING;
+        }
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop_flag.clone();
+        let cb_cancel = Cancellation::default();
+        let cb_cancel_worker = cb_cancel.clone();
+        let manager_arc = mgr.manager.clone();
+        let cb_active = mgr.callback_active.clone();
+        let cb_invocations = mgr.callback_invocations.clone();
+        let user_data_addr = user_data as usize;
+
+        let Ok(join_handle) = thread::Builder::new()
+            .name("cspa-ffi-callback".into())
+            .spawn(move || {
+                while !stop_clone.load(SeqCst) {
+                    let res = manager_arc
+                        .lock()
+                        .map_err(|_| CSPA_STATUS_INTERNAL_ERROR)
+                        .and_then(|mut guard| {
+                            let read_res = guard
+                                .read_with_cancel(
+                                    requested_frames as usize,
+                                    Duration::from_millis(timeout_ms),
+                                    cb_cancel_worker.clone(),
+                                )
+                                .map_err(map_read_error)?;
+                            Ok((
+                                guard.session_id(),
+                                guard.segment_id(),
+                                guard.last_block_metadata(),
+                                read_res,
+                            ))
+                        });
+                    match res {
+                        Ok((sess, seg, meta, read_res)) => {
+                            if stop_clone.load(SeqCst)
+                                || matches!(read_res.reason, PartialReason::Cancelled)
+                            {
+                                break;
+                            }
+                            if read_res.frames == 0
+                                && matches!(
+                                    read_res.reason,
+                                    PartialReason::Timeout | PartialReason::WouldBlock
+                                )
+                            {
+                                continue;
+                            }
+                            let is_terminal = matches!(
+                                read_res.reason,
+                                PartialReason::Eof | PartialReason::Failure(_)
+                            ) && read_res.frames == 0;
+                            let mut outcome = CspaManagedReadOutcomeRecord {
+                                struct_size: size_of::<CspaManagedReadOutcomeRecord>() as u32,
+                                schema_revision: CSPA_EXPERIMENTAL_SCHEMA_REVISION,
+                                partial_reason: 0,
+                                boundary_kind: 0,
+                                has_mixed_metadata: 0,
+                                reserved: 0,
+                                session: 0,
+                                segment: 0,
+                                actual_frames: 0,
+                                copy_bytes: 0,
+                                copy_destinations: 0,
+                                block: CspaBlockRecord {
+                                    header: CspaHeaderRecord::default(),
+                                    bytes: ptr::null(),
+                                    byte_length: 0,
+                                    retained_owner: ptr::null_mut(),
+                                },
+                                mixed_metadata: MixedBlockMetadataRecord::from(
+                                    capture_system_or_process_audio::MixedBlockMetadata::default(),
+                                ),
+                            };
+                            populate_owned_outcome_record(sess, seg, meta, read_res, &mut outcome);
+                            cb_invocations.fetch_add(1, SeqCst);
+                            let cb_status = catch_unwind(AssertUnwindSafe(|| {
+                                // SAFETY: `outcome` is valid on the worker stack and `user_data`
+                                // remains retained until `stop_join_and_release_context` joins this worker.
+                                unsafe { cb_fn(&outcome, user_data_addr as *mut c_void) }
+                            }))
+                            .unwrap_or(CSPA_STATUS_CALLBACK_FAILURE);
+                            if !outcome.block.retained_owner.is_null() {
+                                // SAFETY: Release the worker's temporary owner ref after callback return.
+                                unsafe {
+                                    cspa_block_release(&mut outcome.block);
+                                }
+                            }
+                            if cb_status != CSPA_STATUS_OK {
+                                if let Ok(mut guard) = manager_arc.lock() {
+                                    guard.stop(Stop::Abort);
+                                }
+                                stop_clone.store(true, SeqCst);
+                                break;
+                            }
+                            if is_terminal {
+                                stop_clone.store(true, SeqCst);
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            stop_clone.store(true, SeqCst);
+                            break;
+                        }
+                    }
+                }
+                cb_active.store(false, SeqCst);
+            })
+        else {
+            mgr.callback_active.store(false, SeqCst);
+            return CSPA_STATUS_INTERNAL_ERROR;
+        };
+
+        if let Ok(mut guard) = mgr.callback_ctrl.lock() {
+            *guard = Some(FfiCallbackControl {
+                stop_flag,
+                cb_cancel,
+                join_handle: Some(join_handle),
+                user_data_addr,
+                on_context_release,
+                released: false,
+            });
+        }
+        CSPA_STATUS_OK
+    }))
+    .unwrap_or(CSPA_STATUS_INTERNAL_ERROR)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_manager_stop_callback(manager: *mut CspaManagerHandle) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if manager.is_null() {
+            return CSPA_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: `manager` was checked non-null above.
+        let mgr = unsafe { &*manager };
+        mgr.join_callback_if_safe();
+        CSPA_STATUS_OK
+    }))
+    .unwrap_or(CSPA_STATUS_INTERNAL_ERROR)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_manager_callback_invocations(
+    manager: *const CspaManagerHandle,
+    out_count: *mut usize,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if manager.is_null() || out_count.is_null() {
+            return CSPA_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: Both pointers were checked non-null above.
+        let mgr = unsafe { &*manager };
+        unsafe {
+            *out_count = mgr.callback_invocations.load(SeqCst);
+        }
+        CSPA_STATUS_OK
+    }))
+    .unwrap_or(CSPA_STATUS_INTERNAL_ERROR)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_manager_stop(
+    manager: *mut CspaManagerHandle,
+    abort_mode: u32,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if manager.is_null() || abort_mode > 1 {
+            return CSPA_STATUS_INVALID_ARGUMENT;
+        }
+        let mode = if abort_mode != 0 {
+            Stop::Abort
+        } else {
+            Stop::Drain
+        };
+        // SAFETY: `manager` was checked non-null above.
+        let mgr = unsafe { &*manager };
+        if let Ok(mut guard) = mgr.callback_ctrl.lock()
+            && let Some(ctrl) = guard.as_mut()
+        {
+            ctrl.stop_flag.store(true, SeqCst);
+            ctrl.cb_cancel.cancel();
+        }
+        let status = if let Ok(mut guard) = mgr.manager.lock() {
+            guard.stop(mode);
+            CSPA_STATUS_OK
+        } else {
+            CSPA_STATUS_INTERNAL_ERROR
+        };
+        if abort_mode != 0 {
+            mgr.join_callback_if_safe();
+        }
+        status
+    }))
+    .unwrap_or(CSPA_STATUS_INTERNAL_ERROR)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_manager_wait_cleanup(
+    manager: *mut CspaManagerHandle,
+    timeout_ms: u64,
+    out_cleaned: *mut u32,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if manager.is_null() || out_cleaned.is_null() {
+            return CSPA_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: Both pointers were checked non-null above.
+        let mgr = unsafe { &*manager };
+        mgr.join_callback_if_safe();
+        let Ok(mut guard) = mgr.manager.lock() else {
+            return CSPA_STATUS_INTERNAL_ERROR;
+        };
+        let cleaned = guard.wait_cleanup(Duration::from_millis(timeout_ms.max(1)));
+        unsafe {
+            *out_cleaned = u32::from(cleaned);
+        }
+        CSPA_STATUS_OK
+    }))
+    .unwrap_or(CSPA_STATUS_INTERNAL_ERROR)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_manager_release(manager: *mut CspaManagerHandle) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if !manager.is_null() {
+            // SAFETY: `manager` was allocated by `Box::into_raw` in `cspa_manager_open`.
+            let mgr = unsafe { Box::from_raw(manager) };
+            if let Ok(mut guard) = mgr.manager.lock() {
+                guard.stop(Stop::Abort);
+            }
+            mgr.join_callback_if_safe();
+            drop(mgr);
+        }
+    }));
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_test_simulate_panic_containment(should_panic: u32) -> u32 {
+    catch_unwind(|| {
+        if should_panic != 0 {
+            panic!("deliberate simulated panic inside FFI boundary");
+        }
+        CSPA_STATUS_OK
+    })
+    .unwrap_or(CSPA_STATUS_INTERNAL_ERROR)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cspa_test_discovery_publish_synthetic(
+    discovery: *const CspaDiscoveryHandle,
+    count: usize,
+    out_revision: *mut u64,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if discovery.is_null() {
+            return CSPA_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: `discovery` was checked non-null above.
+        let svc = unsafe { (*discovery).inner.service() };
+        let mut rev = svc.current_revision();
+        for idx in 0..count {
+            rev = svc.publish_event(DiscoveryEventKind::Removed(
+                format!("process:{idx}:1").into(),
+            ));
+        }
+        if !out_revision.is_null() {
+            // SAFETY: `out_revision` is non-null.
+            unsafe {
+                *out_revision = rev;
+            }
+        }
+        CSPA_STATUS_OK
+    }))
+    .unwrap_or(CSPA_STATUS_INTERNAL_ERROR)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn ffi_crate_has_zero_os_cfg_attributes_and_validates_abi() {
+        let win_cfg = concat!("cfg(", "windows)");
+        let os_cfg = concat!("cfg(", "target_os");
+        let win_macro = concat!("cfg!(", "windows)");
+        let os_macro = concat!("cfg!(", "target_os");
+        for (name, src) in [
+            ("src/lib.rs", include_str!("lib.rs")),
+            ("src/records.rs", include_str!("records.rs")),
+        ] {
+            for pat in [win_cfg, os_cfg, win_macro, os_macro] {
+                assert!(
+                    !src.contains(pat),
+                    "{name} must not contain OS conditional compilation `{pat}`"
+                );
+            }
+        }
+
+        // SAFETY: Pure scalar FFI functions.
+        unsafe {
+            assert_eq!(cspa_abi_check(0, 1), CSPA_STATUS_OK);
+            assert_eq!(cspa_abi_check(0, 0), CSPA_STATUS_ABI_MISMATCH);
+            assert_eq!(cspa_abi_check(1, 1), CSPA_STATUS_ABI_MISMATCH);
+            assert_eq!(cspa_test_simulate_panic_containment(0), CSPA_STATUS_OK);
+            assert_eq!(
+                cspa_test_simulate_panic_containment(1),
+                CSPA_STATUS_INTERNAL_ERROR
+            );
+        }
+    }
+
+    #[test]
+    fn cspa_manager_read_into_runs_zero_steady_state_allocations_over_1000_blocks() {
+        let mut t_out = CaptureTargetRecord::default();
+        // SAFETY: Valid stack pointer with initialized ABI header.
+        assert_eq!(
+            unsafe { cspa_target_default_output(CSPA_DEFAULT_DEVICE_PIN, 1.0, &mut t_out) },
+            CSPA_STATUS_OK
+        );
+
+        let mix_cfg = CspaMixerConfigRecord {
+            silence_on_idle: 1,
+            ..CspaMixerConfigRecord::default()
+        };
+
+        let mut req = CspaCaptureRequestRecord {
+            struct_size: 0,
+            schema_revision: 0,
+            tree_strategy: ProcessTreeRangeRecord::default(),
+            combine_mode: 0,
+            input_conversion: 0,
+            on_format_change: 0,
+            allow_reroute: 0,
+            require_precise_timing: 0,
+            overflow: 0,
+            permission_policy: 0,
+            reserved: 0,
+            targets: ptr::null(),
+            target_count: 0,
+            backends: ptr::null(),
+            converter: ptr::null(),
+            mixer_config: ptr::null(),
+            budgets: ptr::null(),
+        };
+        // SAFETY: Valid stack pointers.
+        assert_eq!(
+            unsafe { cspa_capture_request_init(&mut req, &t_out, 1) },
+            CSPA_STATUS_OK
+        );
+        req.combine_mode = CSPA_COMBINE_MODE_CSPA_MIXER;
+        req.mixer_config = &mix_cfg;
+
+        let mut mgr: *mut CspaManagerHandle = ptr::null_mut();
+        // SAFETY: Valid request and output handle pointer.
+        assert_eq!(unsafe { cspa_manager_open(&req, &mut mgr) }, CSPA_STATUS_OK);
+        assert!(!mgr.is_null());
+
+        let mut fmt = CspaPcmFormatRecord {
+            struct_size: size_of::<CspaPcmFormatRecord>() as u32,
+            schema_revision: CSPA_EXPERIMENTAL_SCHEMA_REVISION,
+            sample_format: 0,
+            byte_order: 0,
+            rate_hz: 0,
+            channels: 0,
+        };
+        // SAFETY: Valid manager handle and initialized format record.
+        assert_eq!(
+            unsafe { cspa_manager_output_format(mgr, &mut fmt) },
+            CSPA_STATUS_OK
+        );
+        let bpf = (fmt.channels as usize) * 4;
+        let mut dst = vec![0u8; 256 * bpf];
+        let mut outcome = CspaManagedReadOutcomeRecord {
+            struct_size: size_of::<CspaManagedReadOutcomeRecord>() as u32,
+            schema_revision: CSPA_EXPERIMENTAL_SCHEMA_REVISION,
+            partial_reason: 0,
+            boundary_kind: 0,
+            has_mixed_metadata: 0,
+            reserved: 0,
+            session: 0,
+            segment: 0,
+            actual_frames: 0,
+            copy_bytes: 0,
+            copy_destinations: 0,
+            block: CspaBlockRecord {
+                header: CspaHeaderRecord::default(),
+                bytes: ptr::null(),
+                byte_length: 0,
+                retained_owner: ptr::null_mut(),
+            },
+            mixed_metadata: MixedBlockMetadataRecord::from(
+                capture_system_or_process_audio::MixedBlockMetadata::default(),
+            ),
+        };
+
+        for _ in 0..4 {
+            // SAFETY: Valid manager handle, destination buffer, and outcome struct.
+            assert_eq!(
+                unsafe {
+                    cspa_manager_read_into(
+                        mgr,
+                        dst.as_mut_ptr(),
+                        dst.len(),
+                        128,
+                        50,
+                        ptr::null_mut(),
+                        &mut outcome,
+                    )
+                },
+                CSPA_STATUS_OK
+            );
+            assert!(outcome.block.retained_owner.is_null());
+        }
+
+        let allocs = allocation_counter::measure(|| {
+            for _ in 0..1_000 {
+                // SAFETY: Valid manager handle, destination buffer, and outcome struct.
+                let st = unsafe {
+                    cspa_manager_read_into(
+                        mgr,
+                        dst.as_mut_ptr(),
+                        dst.len(),
+                        128,
+                        20,
+                        ptr::null_mut(),
+                        &mut outcome,
+                    )
+                };
+                assert_eq!(st, CSPA_STATUS_OK);
+                assert!(outcome.actual_frames > 0 && outcome.actual_frames <= 128);
+            }
+        });
+        assert_eq!(
+            allocs.count_total, 0,
+            "cspa_manager_read_into must allocate 0 bytes over 1,000 warmed blocks (got {} allocs / {} bytes)",
+            allocs.count_total, allocs.bytes_total
+        );
+
+        let drop_t0 = Instant::now();
+        // SAFETY: Valid manager handle.
+        assert_eq!(unsafe { cspa_manager_stop(mgr, 1) }, CSPA_STATUS_OK);
+        let mut cleaned = 0u32;
+        assert_eq!(
+            unsafe { cspa_manager_wait_cleanup(mgr, 2000, &mut cleaned) },
+            CSPA_STATUS_OK
+        );
+        assert_eq!(cleaned, 1);
+        unsafe {
+            cspa_manager_release(mgr);
+        }
+        let drop_ms = drop_t0.elapsed().as_millis();
+        assert!(drop_ms <= 2_000);
+        println!(
+            "{{\"event\":\"ffi-read-into-zero-alloc\",\"warmed_blocks\":1000,\"allocs\":{},\"bytes\":{},\"cleanup_ms\":{}}}",
+            allocs.count_total, allocs.bytes_total, drop_ms
+        );
+    }
+
+    #[test]
+    fn cspa_permissions_check_and_request_validate_abi_and_target_domains() {
+        assert_eq!(size_of::<CspaCaptureRequestRecord>(), 96);
+        assert_eq!(size_of::<CspaPlanReportRecord>(), 112);
+        assert_eq!(size_of::<CspaPermissionReportRecord>(), 104);
+
+        let mut rep = CspaPermissionReportRecord::default();
+        // SAFETY: Valid stack pointer.
+        assert_eq!(
+            unsafe { cspa_permission_report_init(&mut rep) },
+            CSPA_STATUS_OK
+        );
+        assert_eq!(
+            unsafe { cspa_permissions_check(ptr::null(), 0, ptr::null(), &mut rep) },
+            CSPA_STATUS_OK
+        );
+        assert_eq!(rep.entry_count, CSPA_PERMISSION_KIND_COUNT as u32);
+        assert_eq!(rep.entries[0].kind, CSPA_PERMISSION_KIND_MICROPHONE);
+        assert_eq!(rep.entries[1].kind, CSPA_PERMISSION_KIND_SYSTEM_AUDIO);
+        assert_eq!(rep.entries[2].kind, CSPA_PERMISSION_KIND_SCREEN_RECORDING);
+
+        let mut bad_rep = rep;
+        bad_rep.struct_size = 16;
+        assert_eq!(
+            unsafe { cspa_permissions_check(ptr::null(), 0, ptr::null(), &mut bad_rep) },
+            CSPA_STATUS_ABI_MISMATCH
+        );
+
+        let mut t_mic = CaptureTargetRecord::default();
+        assert_eq!(
+            unsafe { cspa_target_microphone(CSPA_DEFAULT_DEVICE_FOLLOW, 1.0, &mut t_mic) },
+            CSPA_STATUS_OK
+        );
+        let mut req = CspaCaptureRequestRecord {
+            struct_size: 0,
+            schema_revision: 0,
+            tree_strategy: ProcessTreeRangeRecord::default(),
+            combine_mode: 0,
+            input_conversion: 0,
+            on_format_change: 0,
+            allow_reroute: 0,
+            require_precise_timing: 0,
+            overflow: 0,
+            permission_policy: 0,
+            reserved: 0,
+            targets: ptr::null(),
+            target_count: 0,
+            backends: ptr::null(),
+            converter: ptr::null(),
+            mixer_config: ptr::null(),
+            budgets: ptr::null(),
+        };
+        assert_eq!(
+            unsafe { cspa_capture_request_init(&mut req, &t_mic, 1) },
+            CSPA_STATUS_OK
+        );
+        req.permission_policy = CSPA_PERMISSION_POLICY_CHECK_ONLY;
+        assert_eq!(
+            unsafe { cspa_request_check_permissions(&req, &mut rep) },
+            CSPA_STATUS_OK
+        );
+        assert_eq!(rep.entries[0].required, 1);
+        assert_eq!(rep.entries[1].required, 0);
+        assert_eq!(
+            unsafe { cspa_request_request_permissions(&req, 500, 0, &mut rep) },
+            CSPA_STATUS_OK
+        );
+    }
+}
