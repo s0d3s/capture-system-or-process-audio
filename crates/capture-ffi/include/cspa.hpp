@@ -893,3 +893,743 @@ private:
     cspa_discovery *handle_;
 };
 
+struct PlanReport {
+    PlatformOs os = PlatformOs::Windows;
+    BackendId selected_backend = BackendId::None;
+    CombineMode combine_mode = CombineMode::Auto;
+    CombineResolution combine_resolution = CombineResolution::PassThrough;
+    InputConversionPolicy input_conversion = InputConversionPolicy::AutoWhenMixing;
+    bool uses_software_mixer = false;
+    bool uses_output_converter = false;
+    bool requires_discovery_subscription = false;
+    OverlapSemantics overlap_semantics = OverlapSemantics::SingleTarget;
+    bool allow_reroute = false;
+    PermissionPolicy permission_policy = PermissionPolicy::AutoRequest;
+    uint64_t duplicate_target_count = 0;
+    uint64_t estimated_active_streams = 0;
+    uint64_t estimated_pcm_bytes = 0;
+    std::vector<cspa_target_plan_record> target_plans;
+};
+
+class CaptureRequest {
+public:
+    explicit CaptureRequest(std::vector<Target> targets)
+        : targets_(std::move(targets)) {}
+
+    CaptureRequest &set_tree_strategy(ProcessTreeRange range) noexcept {
+        tree_strategy_ = range;
+        return *this;
+    }
+
+    CaptureRequest &set_combine_mode(CombineMode mode) noexcept {
+        combine_mode_ = mode;
+        return *this;
+    }
+
+    CaptureRequest &set_input_conversion(InputConversionPolicy policy) noexcept {
+        input_conversion_ = policy;
+        return *this;
+    }
+
+    CaptureRequest &set_on_format_change(OnFormatChange policy) noexcept {
+        on_format_change_ = policy;
+        return *this;
+    }
+
+    CaptureRequest &set_backends(Backends backends) noexcept {
+        has_backends_ = true;
+        backends_ = backends;
+        return *this;
+    }
+
+    CaptureRequest &set_output_converter(OutputConverter converter) noexcept {
+        has_converter_ = true;
+        converter_ = converter;
+        return *this;
+    }
+
+    CaptureRequest &set_mixer_config(MixerConfig config) noexcept {
+        has_mixer_ = true;
+        mixer_config_ = config;
+        return *this;
+    }
+
+    CaptureRequest &set_allow_reroute(bool allow) noexcept {
+        allow_reroute_ = allow;
+        return *this;
+    }
+
+    CaptureRequest &set_require_precise_timing(bool require) noexcept {
+        require_precise_timing_ = require;
+        return *this;
+    }
+
+    CaptureRequest &set_overflow(Overflow overflow) noexcept {
+        overflow_ = overflow;
+        return *this;
+    }
+
+    CaptureRequest &set_permission_policy(PermissionPolicy policy) noexcept {
+        permission_policy_ = policy;
+        return *this;
+    }
+
+    void build_raw(
+        std::vector<cspa_capture_target_record> &raw_targets,
+        cspa_capture_request_record &out_req
+    ) const {
+        raw_targets.clear();
+        raw_targets.reserve(targets_.size());
+        for (const auto &t : targets_) {
+            raw_targets.push_back(t.raw());
+        }
+        (void)cspa_capture_request_init(&out_req, raw_targets.data(), raw_targets.size());
+        out_req.tree_strategy = tree_strategy_.to_raw();
+        out_req.combine_mode = static_cast<uint32_t>(combine_mode_);
+        out_req.input_conversion = static_cast<uint32_t>(input_conversion_);
+        out_req.on_format_change = static_cast<uint32_t>(on_format_change_);
+        out_req.allow_reroute = allow_reroute_ ? 1u : 0u;
+        out_req.require_precise_timing = require_precise_timing_ ? 1u : 0u;
+        out_req.overflow = static_cast<uint32_t>(overflow_);
+        out_req.permission_policy = static_cast<uint32_t>(permission_policy_);
+        out_req.backends = has_backends_ ? &backends_.raw() : nullptr;
+        out_req.converter = has_converter_ ? &converter_.raw() : nullptr;
+        out_req.mixer_config = has_mixer_ ? &mixer_config_.raw() : nullptr;
+        out_req.budgets = nullptr;
+    }
+
+    Result<PermissionReport> check_permissions() const {
+        std::vector<cspa_capture_target_record> raw_targets;
+        cspa_capture_request_record raw_req{};
+        build_raw(raw_targets, raw_req);
+        cspa_permission_report_record rep{};
+        (void)cspa_permission_report_init(&rep);
+        uint32_t st = cspa_request_check_permissions(&raw_req, &rep);
+        if (st != CSPA_STATUS_OK) {
+            return Result<PermissionReport>::err(static_cast<Status>(st));
+        }
+        return Result<PermissionReport>::ok(PermissionReport::from_raw(rep));
+    }
+
+    Result<PermissionReport> request_permissions(
+        uint64_t timeout_ms = 30000,
+        bool open_settings_if_denied = false
+    ) const {
+        std::vector<cspa_capture_target_record> raw_targets;
+        cspa_capture_request_record raw_req{};
+        build_raw(raw_targets, raw_req);
+        cspa_permission_report_record rep{};
+        (void)cspa_permission_report_init(&rep);
+        uint32_t st = cspa_request_request_permissions(
+            &raw_req,
+            timeout_ms,
+            open_settings_if_denied ? 1u : 0u,
+            &rep
+        );
+        if (st != CSPA_STATUS_OK) {
+            return Result<PermissionReport>::err(static_cast<Status>(st));
+        }
+        return Result<PermissionReport>::ok(PermissionReport::from_raw(rep));
+    }
+
+    Result<PlanReport> inspect() const {
+        std::vector<cspa_capture_target_record> raw_targets;
+        cspa_capture_request_record raw_req{};
+        build_raw(raw_targets, raw_req);
+        std::vector<cspa_target_plan_record> tplans(targets_.size());
+        cspa_plan_report_record rep{};
+        rep.struct_size = static_cast<uint32_t>(sizeof(rep));
+        rep.schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+        rep.target_plans = tplans.empty() ? nullptr : tplans.data();
+        rep.target_plans_capacity = tplans.size();
+        uint32_t st = cspa_request_inspect(&raw_req, &rep);
+        if (st != CSPA_STATUS_OK) {
+            return Result<PlanReport>::err(static_cast<Status>(st));
+        }
+        return Result<PlanReport>::ok(decode_plan_report(rep, tplans));
+    }
+
+    Result<PlanReport> inspect_for_os(PlatformOs os) const {
+        std::vector<cspa_capture_target_record> raw_targets;
+        cspa_capture_request_record raw_req{};
+        build_raw(raw_targets, raw_req);
+        std::vector<cspa_target_plan_record> tplans(targets_.size());
+        cspa_plan_report_record rep{};
+        rep.struct_size = static_cast<uint32_t>(sizeof(rep));
+        rep.schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+        rep.target_plans = tplans.empty() ? nullptr : tplans.data();
+        rep.target_plans_capacity = tplans.size();
+        uint32_t st = cspa_request_inspect_for_os(static_cast<uint32_t>(os), &raw_req, &rep);
+        if (st != CSPA_STATUS_OK) {
+            return Result<PlanReport>::err(static_cast<Status>(st));
+        }
+        return Result<PlanReport>::ok(decode_plan_report(rep, tplans));
+    }
+
+#if CSPA_HAS_EXCEPTIONS
+    PlanReport inspect_or_throw() const { return unwrap_or_throw(inspect()); }
+    PlanReport inspect_for_os_or_throw(PlatformOs os) const {
+        return unwrap_or_throw(inspect_for_os(os));
+    }
+    PermissionReport check_permissions_or_throw() const {
+        return unwrap_or_throw(check_permissions());
+    }
+    PermissionReport request_permissions_or_throw(
+        uint64_t timeout_ms = 30000,
+        bool open_settings_if_denied = false
+    ) const {
+        return unwrap_or_throw(request_permissions(timeout_ms, open_settings_if_denied));
+    }
+#endif
+
+    static PlanReport decode_plan_report(
+        const cspa_plan_report_record &rep,
+        std::vector<cspa_target_plan_record> &tplans
+    ) {
+        PlanReport out{};
+        out.os = static_cast<PlatformOs>(rep.platform_os);
+        out.selected_backend = static_cast<BackendId>(rep.selected_backend);
+        out.combine_mode = static_cast<CombineMode>(rep.combine_mode);
+        out.combine_resolution = static_cast<CombineResolution>(rep.combine_resolution);
+        out.input_conversion = static_cast<InputConversionPolicy>(rep.input_conversion);
+        out.uses_software_mixer = rep.uses_software_mixer != 0;
+        out.uses_output_converter = rep.uses_output_converter != 0;
+        out.requires_discovery_subscription = rep.requires_discovery_subscription != 0;
+        out.overlap_semantics = static_cast<OverlapSemantics>(rep.overlap_semantics);
+        out.allow_reroute = rep.allow_reroute != 0;
+        out.permission_policy = static_cast<PermissionPolicy>(rep.permission_policy);
+        out.duplicate_target_count = rep.duplicate_target_count;
+        out.estimated_active_streams = rep.estimated_active_streams;
+        out.estimated_pcm_bytes = rep.estimated_pcm_bytes;
+        if (rep.target_plan_count < tplans.size()) {
+            tplans.resize(static_cast<size_t>(rep.target_plan_count));
+        }
+        out.target_plans = std::move(tplans);
+        return out;
+    }
+
+private:
+    std::vector<Target> targets_;
+    ProcessTreeRange tree_strategy_{};
+    CombineMode combine_mode_ = CombineMode::Auto;
+    InputConversionPolicy input_conversion_ = InputConversionPolicy::AutoWhenMixing;
+    OnFormatChange on_format_change_ = OnFormatChange::Adapt;
+    bool has_backends_ = false;
+    Backends backends_{};
+    bool has_converter_ = false;
+    OutputConverter converter_{48000, 2};
+    bool has_mixer_ = false;
+    MixerConfig mixer_config_{};
+    bool allow_reroute_ = false;
+    bool require_precise_timing_ = false;
+    Overflow overflow_ = Overflow::DropOldest;
+    PermissionPolicy permission_policy_ = PermissionPolicy::AutoRequest;
+};
+
+inline Result<PermissionReport> check_permissions(
+    const std::vector<Target> &targets = {}
+) {
+    std::vector<cspa_capture_target_record> raw_targets;
+    raw_targets.reserve(targets.size());
+    for (const auto &t : targets) {
+        raw_targets.push_back(t.raw());
+    }
+    cspa_permission_report_record rep{};
+    (void)cspa_permission_report_init(&rep);
+    uint32_t st = cspa_permissions_check(
+        raw_targets.empty() ? nullptr : raw_targets.data(),
+        raw_targets.size(),
+        nullptr,
+        &rep
+    );
+    if (st != CSPA_STATUS_OK) {
+        return Result<PermissionReport>::err(static_cast<Status>(st));
+    }
+    return Result<PermissionReport>::ok(PermissionReport::from_raw(rep));
+}
+
+inline Result<PermissionReport> request_permissions(
+    const std::vector<Target> &targets = {},
+    uint64_t timeout_ms = 30000,
+    bool open_settings_if_denied = false
+) {
+    std::vector<cspa_capture_target_record> raw_targets;
+    raw_targets.reserve(targets.size());
+    for (const auto &t : targets) {
+        raw_targets.push_back(t.raw());
+    }
+    cspa_permission_report_record rep{};
+    (void)cspa_permission_report_init(&rep);
+    uint32_t st = cspa_permissions_request(
+        raw_targets.empty() ? nullptr : raw_targets.data(),
+        raw_targets.size(),
+        nullptr,
+        timeout_ms,
+        open_settings_if_denied ? 1u : 0u,
+        &rep
+    );
+    if (st != CSPA_STATUS_OK) {
+        return Result<PermissionReport>::err(static_cast<Status>(st));
+    }
+    return Result<PermissionReport>::ok(PermissionReport::from_raw(rep));
+}
+
+class PcmBlock {
+public:
+    PcmBlock() noexcept { std::memset(&record_, 0, sizeof(record_)); }
+
+    explicit PcmBlock(cspa_block_record record) noexcept : record_(record) {}
+
+    PcmBlock(const PcmBlock &) = delete;
+    PcmBlock &operator=(const PcmBlock &) = delete;
+
+    PcmBlock(PcmBlock &&other) noexcept : record_(other.record_) {
+        std::memset(&other.record_, 0, sizeof(other.record_));
+    }
+
+    PcmBlock &operator=(PcmBlock &&other) noexcept {
+        if (this != &other) {
+            release();
+            record_ = other.record_;
+            std::memset(&other.record_, 0, sizeof(other.record_));
+        }
+        return *this;
+    }
+
+    ~PcmBlock() noexcept { release(); }
+
+    void release() noexcept {
+        if (record_.retained_owner != nullptr) {
+            cspa_block_release(&record_);
+        }
+    }
+
+    const uint8_t *data() const noexcept { return record_.bytes; }
+    uint64_t byte_len() const noexcept { return record_.byte_length; }
+    uint64_t frames() const noexcept { return record_.header.frames; }
+    uint64_t sequence() const noexcept { return record_.header.sequence; }
+    uint64_t segment() const noexcept { return record_.header.segment; }
+    bool valid() const noexcept { return record_.header.valid != 0 && record_.bytes != nullptr; }
+
+private:
+    cspa_block_record record_{};
+};
+
+struct ReadOutcome {
+    PartialReason reason = PartialReason::None;
+    uint32_t boundary_kind = 0;
+    bool has_mixed_metadata = false;
+    uint64_t session = 0;
+    uint64_t segment = 0;
+    uint64_t frames = 0;
+    uint64_t copy_bytes = 0;
+    uint64_t copy_destinations = 0;
+    PcmBlock block;
+    cspa_mixed_block_metadata_record mixed_metadata{};
+};
+
+class CancelToken {
+public:
+    CancelToken() noexcept : handle_(nullptr) {}
+    explicit CancelToken(cspa_cancel *handle) noexcept : handle_(handle) {}
+
+    static Result<CancelToken> create() noexcept {
+        cspa_cancel *raw = nullptr;
+        uint32_t st = cspa_cancel_create(&raw);
+        if (st != CSPA_STATUS_OK) {
+            return Result<CancelToken>::err(static_cast<Status>(st));
+        }
+        return Result<CancelToken>::ok(CancelToken(raw));
+    }
+
+    CancelToken(const CancelToken &) = delete;
+    CancelToken &operator=(const CancelToken &) = delete;
+
+    CancelToken(CancelToken &&other) noexcept : handle_(other.handle_) {
+        other.handle_ = nullptr;
+    }
+
+    CancelToken &operator=(CancelToken &&other) noexcept {
+        if (this != &other) {
+            if (handle_ != nullptr) {
+                cspa_cancel_release(handle_);
+            }
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+
+    ~CancelToken() noexcept {
+        if (handle_ != nullptr) {
+            cspa_cancel_release(handle_);
+            handle_ = nullptr;
+        }
+    }
+
+    void cancel() noexcept {
+        if (handle_ != nullptr) {
+            cspa_cancel_trigger(handle_);
+        }
+    }
+
+    bool is_cancelled() const noexcept {
+        return handle_ != nullptr && cspa_cancel_is_cancelled(handle_) != 0;
+    }
+
+    cspa_cancel *raw() const noexcept { return handle_; }
+
+private:
+    cspa_cancel *handle_;
+};
+
+class AudioStream {
+public:
+    AudioStream() noexcept : handle_(nullptr) {}
+    explicit AudioStream(cspa_stream *handle) noexcept : handle_(handle) {}
+
+    static Result<AudioStream> open(
+        const Target &target,
+        Overflow overflow = Overflow::DropOldest,
+        PermissionPolicy permission_policy = PermissionPolicy::AutoRequest
+    ) noexcept {
+        cspa_stream *raw = nullptr;
+        uint32_t st = cspa_stream_open_with_policy(
+            &target.raw(),
+            static_cast<uint32_t>(overflow),
+            static_cast<uint32_t>(permission_policy),
+            &raw
+        );
+        if (st != CSPA_STATUS_OK) {
+            return Result<AudioStream>::err(static_cast<Status>(st));
+        }
+        return Result<AudioStream>::ok(AudioStream(raw));
+    }
+
+#if CSPA_HAS_EXCEPTIONS
+    static AudioStream open_or_throw(
+        const Target &target,
+        Overflow overflow = Overflow::DropOldest,
+        PermissionPolicy permission_policy = PermissionPolicy::AutoRequest
+    ) {
+        return unwrap_or_throw(open(target, overflow, permission_policy));
+    }
+#endif
+
+    AudioStream(const AudioStream &) = delete;
+    AudioStream &operator=(const AudioStream &) = delete;
+
+    AudioStream(AudioStream &&other) noexcept : handle_(other.handle_) {
+        other.handle_ = nullptr;
+    }
+
+    AudioStream &operator=(AudioStream &&other) noexcept {
+        if (this != &other) {
+            reset();
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+
+    ~AudioStream() noexcept { reset(); }
+
+    void reset() noexcept {
+        if (handle_ != nullptr) {
+            cspa_stream_release(handle_);
+            handle_ = nullptr;
+        }
+    }
+
+    Result<cspa_pcm_format_record> format() const noexcept {
+        if (handle_ == nullptr) {
+            return Result<cspa_pcm_format_record>::err(Status::InvalidArgument);
+        }
+        cspa_pcm_format_record fmt{};
+        fmt.struct_size = static_cast<uint32_t>(sizeof(fmt));
+        fmt.schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+        uint32_t st = cspa_stream_format(handle_, &fmt);
+        if (st != CSPA_STATUS_OK) {
+            return Result<cspa_pcm_format_record>::err(static_cast<Status>(st));
+        }
+        return Result<cspa_pcm_format_record>::ok(fmt);
+    }
+
+    Result<ReadOutcome> read_into(
+        uint8_t *destination,
+        size_t destination_bytes,
+        uint64_t requested_frames,
+        uint64_t timeout_ms = 100,
+        CancelToken *cancel = nullptr
+    ) noexcept {
+        if (handle_ == nullptr) {
+            return Result<ReadOutcome>::err(Status::InvalidArgument);
+        }
+        cspa_managed_read_outcome_record raw{};
+        raw.struct_size = static_cast<uint32_t>(sizeof(raw));
+        raw.schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+        uint32_t st = cspa_stream_read_into(
+            handle_,
+            destination,
+            destination_bytes,
+            requested_frames,
+            timeout_ms,
+            cancel != nullptr ? cancel->raw() : nullptr,
+            &raw
+        );
+        if (st != CSPA_STATUS_OK) {
+            return Result<ReadOutcome>::err(static_cast<Status>(st));
+        }
+        ReadOutcome out{};
+        out.reason = static_cast<PartialReason>(raw.partial_reason);
+        out.boundary_kind = raw.boundary_kind;
+        out.has_mixed_metadata = raw.has_mixed_metadata != 0;
+        out.session = raw.session;
+        out.segment = raw.segment;
+        out.frames = raw.actual_frames;
+        out.copy_bytes = raw.copy_bytes;
+        out.copy_destinations = raw.copy_destinations;
+        out.block = PcmBlock(raw.block);
+        out.mixed_metadata = raw.mixed_metadata;
+        return Result<ReadOutcome>::ok(std::move(out));
+    }
+
+    Status stop(bool abort_mode = false) noexcept {
+        if (handle_ == nullptr) {
+            return Status::InvalidArgument;
+        }
+        return static_cast<Status>(cspa_stream_stop(handle_, abort_mode ? 1u : 0u));
+    }
+
+    bool wait_cleanup(uint64_t timeout_ms = 2000) noexcept {
+        if (handle_ == nullptr) {
+            return true;
+        }
+        uint32_t cleaned = 0;
+        if (cspa_stream_wait_cleanup(handle_, timeout_ms, &cleaned) != CSPA_STATUS_OK) {
+            return false;
+        }
+        return cleaned != 0;
+    }
+
+private:
+    cspa_stream *handle_;
+};
+
+class ManagedStream {
+public:
+    ManagedStream() noexcept : handle_(nullptr) {}
+    explicit ManagedStream(cspa_manager *handle) noexcept : handle_(handle) {}
+
+    static Result<ManagedStream> open(const CaptureRequest &request) {
+        std::vector<cspa_capture_target_record> raw_targets;
+        cspa_capture_request_record raw_req{};
+        request.build_raw(raw_targets, raw_req);
+        cspa_manager *raw = nullptr;
+        uint32_t st = cspa_manager_open(&raw_req, &raw);
+        if (st != CSPA_STATUS_OK) {
+            return Result<ManagedStream>::err(static_cast<Status>(st));
+        }
+        return Result<ManagedStream>::ok(ManagedStream(raw));
+    }
+
+#if CSPA_HAS_EXCEPTIONS
+    static ManagedStream open_or_throw(const CaptureRequest &request) {
+        return unwrap_or_throw(open(request));
+    }
+#endif
+
+    ManagedStream(const ManagedStream &) = delete;
+    ManagedStream &operator=(const ManagedStream &) = delete;
+
+    ManagedStream(ManagedStream &&other) noexcept : handle_(other.handle_) {
+        other.handle_ = nullptr;
+    }
+
+    ManagedStream &operator=(ManagedStream &&other) noexcept {
+        if (this != &other) {
+            reset();
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+
+    ~ManagedStream() noexcept { reset(); }
+
+    void reset() noexcept {
+        if (handle_ != nullptr) {
+            cspa_manager_release(handle_);
+            handle_ = nullptr;
+        }
+    }
+
+    Result<cspa_pcm_format_record> output_format() const noexcept {
+        if (handle_ == nullptr) {
+            return Result<cspa_pcm_format_record>::err(Status::InvalidArgument);
+        }
+        cspa_pcm_format_record fmt{};
+        fmt.struct_size = static_cast<uint32_t>(sizeof(fmt));
+        fmt.schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+        uint32_t st = cspa_manager_output_format(handle_, &fmt);
+        if (st != CSPA_STATUS_OK) {
+            return Result<cspa_pcm_format_record>::err(static_cast<Status>(st));
+        }
+        return Result<cspa_pcm_format_record>::ok(fmt);
+    }
+
+    Result<uint64_t> update_targets(const std::vector<Target> &new_targets) {
+        if (handle_ == nullptr || new_targets.empty()) {
+            return Result<uint64_t>::err(Status::InvalidArgument);
+        }
+        std::vector<cspa_capture_target_record> raw_targets;
+        raw_targets.reserve(new_targets.size());
+        for (const auto &t : new_targets) {
+            raw_targets.push_back(t.raw());
+        }
+        uint64_t version = 0;
+        uint32_t st = cspa_manager_update_targets(
+            handle_,
+            raw_targets.data(),
+            raw_targets.size(),
+            &version
+        );
+        if (st != CSPA_STATUS_OK) {
+            return Result<uint64_t>::err(static_cast<Status>(st));
+        }
+        return Result<uint64_t>::ok(version);
+    }
+
+#if CSPA_HAS_EXCEPTIONS
+    uint64_t update_targets_or_throw(const std::vector<Target> &new_targets) {
+        return unwrap_or_throw(update_targets(new_targets));
+    }
+#endif
+
+    Result<size_t> input_count() const noexcept {
+        if (handle_ == nullptr) {
+            return Result<size_t>::err(Status::InvalidArgument);
+        }
+        size_t n = 0;
+        uint32_t st = cspa_manager_input_count(handle_, &n);
+        if (st != CSPA_STATUS_OK) {
+            return Result<size_t>::err(static_cast<Status>(st));
+        }
+        return Result<size_t>::ok(n);
+    }
+
+    Result<cspa_input_status_record> input_status(size_t index) const noexcept {
+        if (handle_ == nullptr) {
+            return Result<cspa_input_status_record>::err(Status::InvalidArgument);
+        }
+        cspa_input_status_record rec{};
+        rec.struct_size = static_cast<uint32_t>(sizeof(rec));
+        rec.schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+        uint32_t st = cspa_manager_input_status(handle_, index, &rec);
+        if (st != CSPA_STATUS_OK) {
+            return Result<cspa_input_status_record>::err(static_cast<Status>(st));
+        }
+        return Result<cspa_input_status_record>::ok(rec);
+    }
+
+    Result<ReadOutcome> read(
+        uint64_t requested_frames,
+        uint64_t timeout_ms = 200,
+        CancelToken *cancel = nullptr
+    ) noexcept {
+        if (handle_ == nullptr) {
+            return Result<ReadOutcome>::err(Status::InvalidArgument);
+        }
+        cspa_managed_read_outcome_record raw{};
+        raw.struct_size = static_cast<uint32_t>(sizeof(raw));
+        raw.schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+        uint32_t st = cspa_manager_read(
+            handle_,
+            requested_frames,
+            timeout_ms,
+            cancel != nullptr ? cancel->raw() : nullptr,
+            &raw
+        );
+        if (st != CSPA_STATUS_OK) {
+            return Result<ReadOutcome>::err(static_cast<Status>(st));
+        }
+        ReadOutcome out{};
+        out.reason = static_cast<PartialReason>(raw.partial_reason);
+        out.boundary_kind = raw.boundary_kind;
+        out.has_mixed_metadata = raw.has_mixed_metadata != 0;
+        out.session = raw.session;
+        out.segment = raw.segment;
+        out.frames = raw.actual_frames;
+        out.copy_bytes = raw.copy_bytes;
+        out.copy_destinations = raw.copy_destinations;
+        out.block = PcmBlock(raw.block);
+        out.mixed_metadata = raw.mixed_metadata;
+        return Result<ReadOutcome>::ok(std::move(out));
+    }
+
+    Result<ReadOutcome> read_into(
+        uint8_t *destination,
+        size_t destination_bytes,
+        uint64_t requested_frames,
+        uint64_t timeout_ms = 200,
+        CancelToken *cancel = nullptr
+    ) noexcept {
+        if (handle_ == nullptr) {
+            return Result<ReadOutcome>::err(Status::InvalidArgument);
+        }
+        cspa_managed_read_outcome_record raw{};
+        raw.struct_size = static_cast<uint32_t>(sizeof(raw));
+        raw.schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+        uint32_t st = cspa_manager_read_into(
+            handle_,
+            destination,
+            destination_bytes,
+            requested_frames,
+            timeout_ms,
+            cancel != nullptr ? cancel->raw() : nullptr,
+            &raw
+        );
+        if (st != CSPA_STATUS_OK) {
+            return Result<ReadOutcome>::err(static_cast<Status>(st));
+        }
+        ReadOutcome out{};
+        out.reason = static_cast<PartialReason>(raw.partial_reason);
+        out.boundary_kind = raw.boundary_kind;
+        out.has_mixed_metadata = raw.has_mixed_metadata != 0;
+        out.session = raw.session;
+        out.segment = raw.segment;
+        out.frames = raw.actual_frames;
+        out.copy_bytes = raw.copy_bytes;
+        out.copy_destinations = raw.copy_destinations;
+        out.block = PcmBlock(raw.block);
+        out.mixed_metadata = raw.mixed_metadata;
+        return Result<ReadOutcome>::ok(std::move(out));
+    }
+
+    Status stop(bool abort_mode = false) noexcept {
+        if (handle_ == nullptr) {
+            return Status::InvalidArgument;
+        }
+        return static_cast<Status>(cspa_manager_stop(handle_, abort_mode ? 1u : 0u));
+    }
+
+    bool wait_cleanup(uint64_t timeout_ms = 2000) noexcept {
+        if (handle_ == nullptr) {
+            return true;
+        }
+        uint32_t cleaned = 0;
+        if (cspa_manager_wait_cleanup(handle_, timeout_ms, &cleaned) != CSPA_STATUS_OK) {
+            return false;
+        }
+        return cleaned != 0;
+    }
+
+    cspa_manager *raw() const noexcept { return handle_; }
+
+private:
+    cspa_manager *handle_;
+};
+
+} // namespace cspa
+
+#endif
