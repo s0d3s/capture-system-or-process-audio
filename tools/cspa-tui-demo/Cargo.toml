@@ -1,0 +1,25 @@
+[package]
+name = "cspa-tui-demo"
+version = "1.3.1"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "Interactive Ratatui studio demo for capture-system-or-process-audio"
+readme = "README.md"
+repository = "https://github.com/s0d3s/capture-system-or-process-audio"
+
+[workspace]
+
+[dependencies]
+capture-system-or-process-audio = { path = "../../crates/capture", default-features = false }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29", "all-widgets", "macros"] }
+crossterm = "0.29.0"
+rustfft = "6.4.1"
+cpal = "0.18.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cpal = { version = "0.18.2", features = ["pulseaudio"] }
+
+[profile.dev]
+opt-level = 2
