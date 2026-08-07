@@ -736,3 +736,498 @@ class TestMinimalPythonSlice(unittest.TestCase):
     def test_optional_numpy_views_packed_i24_and_no_numpy_fallback(self):
         cspa = self.cspa
 
+        mgr_f32 = cspa._synthetic_mixed_demo(sample_format="f32")
+        out_f32 = mgr_f32.read(480, 50, None)
+        blk_f32 = out_f32.blocks[0]
+        arr_ro = blk_f32.to_numpy(copy=False)
+        self.assertEqual(arr_ro.shape, (480, 2))
+        self.assertEqual(str(arr_ro.dtype), "float32")
+        self.assertFalse(arr_ro.flags.writeable)
+        self.assertEqual(arr_ro.__array_interface__["data"][0], blk_f32.data_ptr)
+        self.assertEqual(blk_f32.materialized_copies, 0)
+
+        mgr_f32.stop(cspa.StopMode.ABORT)
+        self.assertTrue(mgr_f32.wait_cleanup())
+        self.assertEqual(float(arr_ro[0, 0]), 1.5)
+        self.assertEqual(float(arr_ro[0, 1]), -1.5)
+
+        arr_rw = blk_f32.to_numpy(copy=True)
+        self.assertTrue(arr_rw.flags.writeable)
+        self.assertEqual(blk_f32.materialized_copies, 1)
+
+        mgr_i24 = cspa._synthetic_mixed_demo(sample_format=cspa.SampleType.I24)
+        out_i24 = mgr_i24.read(480, 50, None)
+        blk_i24 = out_i24.blocks[0]
+        mv_i24 = memoryview(blk_i24)
+        self.assertEqual(mv_i24.shape, (480, 6))
+        mv_i24.release()
+
+        with self.assertRaises(ValueError):
+            blk_i24.to_numpy(copy=False, unpack_i24=False)
+
+        arr_i24 = blk_i24.to_numpy(unpack_i24=True)
+        self.assertEqual(arr_i24.shape, (480, 2))
+        self.assertEqual(str(arr_i24.dtype), "int32")
+        self.assertEqual(blk_i24.materialized_copies, 1)
+        mgr_i24.stop("abort")
+
+        saved_np = sys.modules.get("numpy")
+        try:
+            sys.modules["numpy"] = None
+            mgr_no_np = cspa._synthetic_retention_demo()
+            out_no_np = mgr_no_np.read(8, 0, None)
+            blk_no_np = out_no_np.blocks[0]
+            mv_no_np = memoryview(blk_no_np)
+            self.assertEqual(mv_no_np.shape, (8, 2))
+            mv_no_np.release()
+            with self.assertRaises(ImportError):
+                blk_no_np.to_numpy()
+            dst = bytearray(64)
+            out_into = mgr_no_np.read_into(dst, 8, 0, None)
+            self.assertEqual(out_into.frames, 8)
+            mgr_no_np.stop("abort")
+        finally:
+            if saved_np is not None:
+                sys.modules["numpy"] = saved_np
+            else:
+                sys.modules.pop("numpy", None)
+
+    def test_pyi_stub_parity_and_pyaudio_sounddevice_consumer_interop(self):
+        cspa = self.cspa
+        stub_path = (
+            pathlib.Path(__file__).resolve().parent.parent
+            / "python"
+            / "capture_system_or_process_audio"
+            / "__init__.pyi"
+        )
+        self.assertTrue(stub_path.is_file())
+        stub_text = stub_path.read_text(encoding="utf-8")
+        self.assertNotIn("Incomplete", stub_text)
+        self.assertNotIn("typing_extensions", stub_text)
+        self.assertNotIn("StrategyRange", stub_text)
+        self.assertNotIn("StrategyLevel", stub_text)
+        tree = ast.parse(stub_text)
+
+        stub_all = None
+        stub_classes = {}
+        stub_funcs = {}
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name) and t.id == "__all__" and isinstance(node.value, ast.List):
+                        stub_all = [elt.value for elt in node.value.elts if isinstance(elt, ast.Constant)]
+            elif isinstance(node, ast.ClassDef):
+                methods = {
+                    item.name
+                    for item in node.body
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                }
+                attrs = {
+                    item.targets[0].id
+                    for item in node.body
+                    if isinstance(item, ast.Assign) and isinstance(item.targets[0], ast.Name)
+                }
+                stub_classes[node.name] = (methods, attrs)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                all_args = [
+                    arg.arg
+                    for arg in node.args.posonlyargs + node.args.args + node.args.kwonlyargs
+                ]
+                stub_funcs[node.name] = all_args
+
+        self.assertIsNotNone(stub_all)
+        for exported in stub_all:
+            self.assertTrue(hasattr(cspa, exported), f"__all__ symbol {exported} missing at runtime")
+
+        for cls_name, (methods, attrs) in stub_classes.items():
+            self.assertTrue(hasattr(cspa, cls_name), f"missing runtime class {cls_name}")
+            cls_obj = getattr(cspa, cls_name)
+            for method_name in methods:
+                if method_name in ("__init__", "__new__", "__buffer__"):
+                    continue
+                self.assertTrue(
+                    hasattr(cls_obj, method_name),
+                    f"missing runtime attribute {cls_name}.{method_name}",
+                )
+            for attr_name in attrs:
+                self.assertTrue(
+                    hasattr(cls_obj, attr_name),
+                    f"missing enum/class attribute {cls_name}.{attr_name}",
+                )
+
+        for fn_name, arg_names in stub_funcs.items():
+            self.assertTrue(hasattr(cspa, fn_name), f"missing runtime function {fn_name}")
+            sig = inspect.signature(getattr(cspa, fn_name))
+            self.assertEqual(list(sig.parameters.keys()), arg_names, f"signature mismatch on {fn_name}")
+
+        mgr = cspa._synthetic_mixed_demo(sample_format="f32", clamp_f32=True)
+        out = mgr.read(480, 50, None)
+        blk = out.blocks[0]
+
+        mv = memoryview(blk)
+        pyaudio_frame_bytes = bytes(mv)
+        mv.release()
+        self.assertEqual(len(pyaudio_frame_bytes), 480 * 2 * 4)
+
+        sd_indata = blk.to_numpy(copy=False)
+        self.assertEqual(sd_indata.shape, (480, 2))
+        self.assertEqual(float(sd_indata[0, 0]), 1.0)
+        self.assertEqual(float(sd_indata[0, 1]), -1.0)
+        mgr.stop(cspa.StopMode.ABORT)
+
+    def test_cli_main_diagnostics_tables_and_module_entrypoint(self):
+        import importlib.util
+        import re
+        import shutil
+        import subprocess
+        import tempfile
+
+        cspa = self.cspa
+        pkg_src = (
+            pathlib.Path(__file__).resolve().parent.parent
+            / "python"
+            / "capture_system_or_process_audio"
+        )
+        self.assertTrue((pkg_src / "__main__.py").is_file())
+        ext_file = pathlib.Path(getattr(cspa, "capture_system_or_process_audio", cspa).__file__).resolve()
+
+        with tempfile.TemporaryDirectory(prefix="cspa-cli-pkg-") as td:
+            pkg_dst = pathlib.Path(td) / "capture_system_or_process_audio"
+            shutil.copytree(pkg_src, pkg_dst, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+            shutil.copy2(ext_file, pkg_dst / ext_file.name)
+
+            spec = importlib.util.spec_from_file_location("cspa_cli_main", pkg_dst / "__main__.py")
+            self.assertIsNotNone(spec)
+            cli_mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(cli_mod)
+
+            plain_unicode = cli_mod.render_diagnostics(cspa, color=False, unicode_box=True, width=104)
+            self.assertIn("capture-system-or-process-audio", plain_unicode)
+            self.assertIn("Platform", plain_unicode)
+            self.assertIn("Backends", plain_unicode)
+            self.assertIn("Backend:", plain_unicode)
+            self.assertIn("CaptureTarget", plain_unicode)
+            self.assertIn("╭", plain_unicode)
+            self.assertNotIn("\x1b[", plain_unicode)
+
+            plain_ascii = cli_mod.render_diagnostics(cspa, color=False, unicode_box=False, width=96)
+            self.assertIn("+--", plain_ascii)
+            self.assertNotIn("╭", plain_ascii)
+            plain_ascii.encode("ascii")
+
+            ansi_unicode = cli_mod.render_diagnostics(cspa, color=True, unicode_box=True, width=104)
+            self.assertIn("\x1b[", ansi_unicode)
+            ansi_re = re.compile(r"\x1b\[[0-9;]*m")
+            stripped_ansi = ansi_re.sub("", ansi_unicode)
+            self.assertEqual(stripped_ansi, plain_unicode)
+
+            # Synthetic multi-backend scenario covering populated, empty, and unavailable backends:
+            class _Val:
+                def __init__(self, v):
+                    self.value = v
+
+            class _FakePermEntry:
+                def __init__(self, kind, state):
+                    self.kind = _Val(kind)
+                    self.state = _Val(state)
+
+            class _FakePermReport:
+                is_granted = True
+                has_denial = False
+                entries = [
+                    _FakePermEntry("microphone", "granted"),
+                    _FakePermEntry("system_audio", "granted"),
+                    _FakePermEntry("screen_recording", "granted"),
+                ]
+
+            class _FakeTarget:
+                def __init__(self, kind, name, pid, device_id, scope, active_audio, logical_id):
+                    self.kind = _Val(kind)
+                    self.name = name
+                    self.pid = pid
+                    self.device_id = device_id
+                    self.scope = _Val(scope)
+                    self.active_audio = active_audio
+                    self.logical_id = logical_id
+
+            class _FakeCatalog:
+                def __init__(self, targets, def_out=None, def_in=None):
+                    self.targets = targets
+                    self.applications = [t for t in targets if t.kind.value == "application"]
+                    self.processes = [t for t in targets if t.kind.value == "process"]
+                    self.output_devices = [t for t in targets if t.kind.value == "device"]
+                    self.input_devices = [t for t in targets if t.kind.value == "input_device"]
+                    self.default_output_device_id = def_out
+                    self.default_input_device_id = def_in
+
+            class _FakeMod:
+                __version__ = "1.3.1"
+                DiscoveryDedupe = cspa.DiscoveryDedupe
+                DiscoveryOrder = cspa.DiscoveryOrder
+
+                class DiscoveryService:
+                    os = _Val("linux")
+
+                class Backends:
+                    def __init__(self, **kwargs):
+                        self.linux = kwargs.get("linux", [_Val("pipewire"), _Val("pulseaudio")])
+
+                class DiscoveryQuery:
+                    def __init__(self, **kwargs):
+                        self.backends = kwargs["backends"]
+
+                @staticmethod
+                def check_permissions():
+                    return _FakePermReport()
+
+                @staticmethod
+                def discover_query(q):
+                    bk = q.backends.linux[0].value
+                    if bk == "pipewire":
+                        return _FakeCatalog(
+                            [
+                                _FakeTarget("application", "Firefox", 4200, None, "tree", True, "application:4200:1"),
+                                _FakeTarget("device", "Built-in Audio", None, "pipewire:device:alsa_out", "tree", None, "device:alsa_out"),
+                                _FakeTarget("input_device", "USB Mic", None, "pipewire:input_device:usb_in", "tree", None, "input_device:usb_in"),
+                            ],
+                            def_out="alsa_out",
+                            def_in="usb_in",
+                        )
+                    raise RuntimeError("pulseaudio daemon offline")
+
+            multi_out = cli_mod.render_diagnostics(_FakeMod, color=False, unicode_box=True, width=100)
+            self.assertIn("pipewire (primary), pulseaudio", multi_out)
+            self.assertIn("Backend: pipewire (primary) · 3 CaptureTargets (1 app · 0 processes · 1 output · 1 input)", multi_out)
+            self.assertIn("Firefox", multi_out)
+            self.assertIn("default", multi_out)
+            self.assertIn("Backend: pulseaudio (secondary) · 0 CaptureTargets — unavailable (pulseaudio daemon offline)", multi_out)
+
+            env = dict(os.environ)
+            env["PYTHONPATH"] = td + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+            py_cmd = [sys.executable, "-B"]
+            if int(sysconfig.get_config_var("Py_GIL_DISABLED") or 0) == 1 and not getattr(sys, "_is_gil_enabled", lambda: True)():
+                py_cmd.extend(["-X", "gil=0"])
+            py_cmd.extend(["-m", "capture_system_or_process_audio", "--no-color"])
+            proc = subprocess.run(py_cmd, env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+            self.assertIn("capture-system-or-process-audio", proc.stdout)
+            self.assertIn("CaptureTarget", proc.stdout)
+
+    def test_adapter_performance_dispatch_metrics_and_retained_generation_cap(self):
+        cspa = self.cspa
+        self.assertEqual(cspa._measure_steady_state_read_into_allocations(1000), 0)
+
+        async def measure_async():
+            mgr = cspa._synthetic_retention_demo()
+            latencies_us = []
+            for _ in range(8):
+                t0 = time.perf_counter_ns()
+                out = await mgr.read_async(8, 50, None)
+                dt_us = (time.perf_counter_ns() - t0) / 1000.0
+                self.assertEqual(out.frames, 8)
+                latencies_us.append(dt_us)
+            mgr.stop(cspa.StopMode.ABORT)
+            latencies_us.sort()
+            self.assertEqual(len(latencies_us), 8)
+            self.assertLess(latencies_us[len(latencies_us) // 2], 50_000.0)
+
+        asyncio.run(measure_async())
+
+        mgr_cb = cspa._synthetic_retention_demo()
+        cb_timestamps = []
+
+        def perf_cb(outcome):
+            if outcome.frames > 0:
+                cb_timestamps.append(time.perf_counter_ns())
+
+        t_start = time.perf_counter_ns()
+        mgr_cb.start_callback(perf_cb, frames=8, timeout_ms=20)
+        deadline = time.time() + 2.0
+        while len(cb_timestamps) < 8 and time.time() < deadline:
+            time.sleep(0.002)
+        mgr_cb.stop_callback()
+        mgr_cb.stop(cspa.StopMode.ABORT)
+        self.assertEqual(len(cb_timestamps), 8)
+        self.assertGreaterEqual(cb_timestamps[0], t_start)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows native capability checks")
+    def test_windows_rejection_of_exact_scope_and_precise_timing(self):
+        cspa = self.cspa
+        pid = os.getpid()
+        exact_target = cspa.process(pid, scope=cspa.ProcessScope.EXACT)
+        with self.assertRaises(RuntimeError):
+            cspa.capture(exact_target)
+        with self.assertRaises(RuntimeError):
+            cspa.AudioStream.open(exact_target)
+
+        pin_default = cspa.default_output(cspa.DefaultDeviceMode.PIN)
+        with self.assertRaises(RuntimeError):
+            cspa.capture(pin_default, timing=cspa.TimingRequirement.PRECISE)
+        with self.assertRaises(RuntimeError):
+            cspa.AudioStream.open(pin_default, timing="precise")
+
+    @unittest.skipUnless(
+        sys.platform == "win32" and os.environ.get("CSPA_NATIVE_AUDIO") == "1",
+        "Opt-in Windows native audio smoke requires CSPA_NATIVE_AUDIO=1",
+    )
+    def test_windows_native_endpoint_microphone_and_hotswap_smoke(self):
+        cspa = self.cspa
+        devs = cspa.output_devices()
+        in_devs = cspa.input_devices()
+        self.assertGreater(len(devs), 0)
+        self.assertIsInstance(in_devs, list)
+        _apps = cspa.applications()
+        _procs = cspa.processes()
+        cat = cspa.discover()
+        self.assertGreater(len(cat.targets), 0)
+
+        allowed_reasons = (
+            cspa.PartialReason.COMPLETE,
+            cspa.PartialReason.READY,
+            cspa.PartialReason.TIMEOUT,
+            cspa.PartialReason.WOULD_BLOCK,
+            cspa.PartialReason.BOUNDARY,
+        )
+
+        pin_default = cspa.default_output("pin")
+        with cspa.capture(pin_default) as mgr:
+            out = mgr.read(4096, 150, None)
+            self.assertIn(out.reason, allowed_reasons)
+            dst = bytearray(256 * 8)
+            out_into = mgr.read_into(dst, 256, 150, None)
+            self.assertIn(out_into.reason, allowed_reasons)
+
+        tree_target = cspa.process(os.getpid(), scope="tree")
+        mix_targets = [cspa.microphone(), pin_default] if len(in_devs) > 0 else [pin_default, tree_target]
+        with cspa.capture(mix_targets, silence_on_idle=True) as mgr_multi:
+            out_multi = mgr_multi.read(480, 150, None)
+            self.assertIn(out_multi.reason, allowed_reasons)
+            new_ver = mgr_multi.update_targets([pin_default, tree_target])
+            self.assertGreaterEqual(new_ver, 1)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux native capability and capture checks")
+    def test_linux_native_discovery_capture_microphone_and_rejections(self):
+        cspa = self.cspa
+        pid = os.getpid()
+        proc_target = cspa.process(pid, scope="tree")
+        with self.assertRaises(RuntimeError):
+            cspa.capture(proc_target, tree_strategy=cspa.ProcessTreeStrategy.NATIVE_KERNEL_CAPTURE)
+        with self.assertRaises(RuntimeError):
+            cspa.AudioStream.open(proc_target, tree_strategy="native_kernel_capture")
+
+        pin_default = cspa.default_output("pin")
+        with self.assertRaises(RuntimeError):
+            cspa.capture(pin_default, timing="precise")
+        with self.assertRaises(RuntimeError):
+            cspa.AudioStream.open(pin_default, timing=cspa.TimingRequirement.PRECISE)
+
+        devs = cspa.output_devices()
+        in_devs = cspa.input_devices()
+        self.assertGreater(len(devs), 0)
+        self.assertGreater(len(in_devs), 0)
+        self.assertFalse(any((d.device_id or "").endswith(".monitor") for d in in_devs))
+        _procs = cspa.processes(include_non_audio=True)
+        self.assertTrue(any(p.pid == pid for p in _procs))
+        cat = cspa.discover()
+        self.assertGreater(len(cat.targets), 0)
+
+        allowed_reasons = (
+            cspa.PartialReason.COMPLETE,
+            cspa.PartialReason.READY,
+            cspa.PartialReason.TIMEOUT,
+            cspa.PartialReason.WOULD_BLOCK,
+            cspa.PartialReason.BOUNDARY,
+        )
+
+        with cspa.subscribe_discovery() as sub:
+            resnap = sub.resnapshot()
+            self.assertGreaterEqual(resnap.revision, 1)
+
+        with cspa.AudioStream.open(pin_default) as stream:
+            out_s = stream.read(240, 50, None)
+            self.assertIn(out_s.reason, allowed_reasons)
+
+        with cspa.capture([cspa.microphone("pin"), pin_default], silence_on_idle=True) as mgr_multi:
+            out_multi = mgr_multi.read(480, 120, None)
+            self.assertIn(out_multi.reason, allowed_reasons)
+            dst = bytearray(256 * 8)
+            out_into = mgr_multi.read_into(dst, 256, 120, None)
+            self.assertIn(out_into.reason, allowed_reasons)
+            rev = mgr_multi.update_targets([pin_default, proc_target])
+            self.assertGreaterEqual(rev, 1)
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS native capability and capture checks")
+    def test_macos_native_discovery_capture_and_rejections(self):
+        cspa = self.cspa
+        pid = os.getpid()
+        proc_target = cspa.process(pid, scope="tree")
+
+        with self.assertRaises(RuntimeError):
+            cspa.capture(proc_target, tree_strategy=cspa.ProcessTreeStrategy.NATIVE_KERNEL_CAPTURE)
+
+        pin_default = cspa.default_output("pin")
+        with self.assertRaises(RuntimeError):
+            cspa.capture(pin_default, timing="precise")
+        with self.assertRaises(RuntimeError):
+            cspa.AudioStream.open(pin_default, timing=cspa.TimingRequirement.PRECISE)
+
+        app_tree = cspa.find_app("PythonMacApp", pid=pid, scope="tree")
+        with self.assertRaises(RuntimeError):
+            cspa.capture(app_tree, backends=cspa.Backends(macos=["screencapturekit"]))
+
+        devs = cspa.output_devices()
+        in_devs = cspa.input_devices()
+        self.assertGreater(len(devs), 0)
+        self.assertIsInstance(in_devs, list)
+        _procs = cspa.processes(include_non_audio=True)
+        self.assertTrue(any(p.pid == pid for p in _procs))
+        cat = cspa.discover(include_non_audio=True)
+        self.assertGreater(len(cat.targets), 0)
+
+        allowed_reasons = (
+            cspa.PartialReason.COMPLETE,
+            cspa.PartialReason.READY,
+            cspa.PartialReason.TIMEOUT,
+            cspa.PartialReason.WOULD_BLOCK,
+            cspa.PartialReason.BOUNDARY,
+        )
+
+        with cspa.subscribe_discovery(include_non_audio=True) as sub:
+            resnap = sub.resnapshot()
+            self.assertGreaterEqual(resnap.revision, 1)
+
+        with cspa.AudioStream.open(pin_default) as stream:
+            out_s = stream.read(240, 100, None)
+            self.assertIn(out_s.reason, allowed_reasons)
+
+        # A headless session may lack microphone consent.
+        mac_perm = cspa.check_permissions(cspa.microphone())
+        self.assertTrue(mac_perm.microphone.required)
+        self.assertFalse(mac_perm.system_audio.required)
+        try:
+            mic_mgr = cspa.capture(
+                [cspa.microphone("pin"), pin_default],
+                silence_on_idle=True,
+                request_permissions=False,
+            )
+            with mic_mgr:
+                out_m = mic_mgr.read(480, 150, None)
+                self.assertIn(out_m.reason, allowed_reasons)
+        except PermissionError as exc:
+            self.assertIsInstance(exc, OSError)
+            self.assertIn("consent", str(exc).lower())
+
+        with cspa.capture([pin_default, devs[0]], combine_mode="cspa_mixer", silence_on_idle=True) as mgr:
+            out = mgr.read(480, 150, None)
+            self.assertIn(out.reason, allowed_reasons)
+            dst = bytearray(256 * 8)
+            out_into = mgr.read_into(dst, 256, 150, None)
+            self.assertIn(out_into.reason, allowed_reasons)
+            rev = mgr.update_targets([pin_default])
+            self.assertGreaterEqual(rev, 1)
+
+
+if __name__ == "__main__":
+    runner = unittest.TextTestRunner(stream=sys.stdout, verbosity=2)
+    result = runner.run(unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__]))
+    sys.exit(not result.wasSuccessful())
