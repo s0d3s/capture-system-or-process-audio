@@ -1941,3 +1941,885 @@ fn render_telegram_voice_strip(frame: &mut Frame, area: Rect, app: &App, hit_map
     }
 }
 
+fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
+    let line = if let Some(ref err) = app.error_banner {
+        Line::from(vec![
+            Span::styled(
+                " ERROR ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::LightRed)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" {err}"), Style::default().fg(Color::LightRed)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(
+                " STATUS ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {} ", app.status_message),
+                Style::default().fg(Color::White),
+            ),
+        ])
+    };
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+fn render_add_source_modal(frame: &mut Frame, full_area: Rect, app: &App, hit_map: &mut HitMap) {
+    let modal_w = (full_area.width * 84 / 100).clamp(40, full_area.width.saturating_sub(2));
+    let modal_h = (full_area.height * 80 / 100).clamp(14, full_area.height.saturating_sub(2));
+    let modal_rect = Rect {
+        x: full_area.x + (full_area.width.saturating_sub(modal_w)) / 2,
+        y: full_area.y + (full_area.height.saturating_sub(modal_h)) / 2,
+        width: modal_w,
+        height: modal_h,
+    };
+
+    frame.render_widget(Clear, modal_rect);
+    let block = Block::default()
+        .title(Span::styled(
+            " Add Capture Sources (Live Discovery Subscription) ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(modal_rect);
+    frame.render_widget(block, modal_rect);
+
+    if inner.height < 7 {
+        return;
+    }
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let tab_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(15),
+            Constraint::Length(13),
+            Constraint::Length(15),
+            Constraint::Length(15),
+            Constraint::Min(2),
+            Constraint::Length(9),
+        ])
+        .split(rows[0]);
+
+    for (idx, tab) in [
+        ModalTab::Applications,
+        ModalTab::Processes,
+        ModalTab::OutputDevices,
+        ModalTab::Microphones,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let active = app.modal.tab == tab;
+        let style = if active {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(format!(" {} ", tab.label()), style)),
+            tab_cols[idx],
+        );
+        hit_map.register(tab_cols[idx], ClickAction::SwitchModalTab(tab));
+    }
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "[Close X]",
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        )),
+        tab_cols[5],
+    );
+    hit_map.register(tab_cols[5], ClickAction::CloseModal);
+
+    let filter_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Min(20),
+            Constraint::Length(8),
+            Constraint::Length(17),
+            Constraint::Length(18),
+            Constraint::Length(11),
+        ])
+        .split(rows[1]);
+
+    let search_style = if app.modal.search_focused {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            format!("Search (/): [ {}_ ]", app.modal.search_query),
+            search_style,
+        )),
+        filter_cols[0],
+    );
+    hit_map.register(filter_cols[0], ClickAction::FocusModalSearch);
+
+    frame.render_widget(
+        Paragraph::new(Span::styled("[Clear]", Style::default().fg(Color::Gray))),
+        filter_cols[1],
+    );
+    hit_map.register(filter_cols[1], ClickAction::ClearModalSearch);
+
+    let audio_chk = if app.modal.audio_only {
+        "[x] AudioOnly(F)"
+    } else {
+        "[ ] AudioOnly(F)"
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(audio_chk, Style::default().fg(Color::Cyan))),
+        filter_cols[2],
+    );
+    hit_map.register(filter_cols[2], ClickAction::ToggleModalAudioOnly);
+
+    let play_chk = if app.modal.playing_only {
+        "[x] PlayingOnly(P)"
+    } else {
+        "[ ] PlayingOnly(P)"
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            play_chk,
+            Style::default().fg(Color::LightGreen),
+        )),
+        filter_cols[3],
+    );
+    hit_map.register(filter_cols[3], ClickAction::ToggleModalPlayingOnly);
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "[Refresh]",
+            Style::default().fg(Color::Yellow),
+        )),
+        filter_cols[4],
+    );
+    hit_map.register(filter_cols[4], ClickAction::RefreshModalDiscovery);
+
+    let query_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(22),
+            Constraint::Length(26),
+            Constraint::Min(22),
+        ])
+        .split(rows[2]);
+
+    let bk_filter_lbl = match app.modal.backend_filter {
+        None => "[Backend: All (B)]".to_owned(),
+        Some(b) => format!("[Backend: {} (B)]", backend_short_badge(Some(b))),
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            bk_filter_lbl,
+            Style::default().fg(Color::LightCyan),
+        )),
+        query_cols[0],
+    );
+    hit_map.register(query_cols[0], ClickAction::CycleModalBackendFilter);
+
+    let dedupe_lbl = match app.modal.dedupe {
+        DiscoveryDedupe::ByLogicalTarget => "[Dedupe: Logical (U)]",
+        DiscoveryDedupe::PerBackend => "[Dedupe: PerBackend (U)]",
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            dedupe_lbl,
+            Style::default().fg(Color::LightMagenta),
+        )),
+        query_cols[1],
+    );
+    hit_map.register(query_cols[1], ClickAction::ToggleModalDedupe);
+
+    let order_lbl = match app.modal.order {
+        DiscoveryOrder::KindThenBackend => "[Order: Kind->Bk (O)]",
+        DiscoveryOrder::BackendThenKind => "[Order: Bk->Kind (O)]",
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            order_lbl,
+            Style::default().fg(Color::LightYellow),
+        )),
+        query_cols[2],
+    );
+    hit_map.register(query_cols[2], ClickAction::ToggleModalOrder);
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "  Sel  Audio State   Backend   Name / Target                 PID     Identifier / Path",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )),
+        rows[3],
+    );
+
+    let list_area = rows[4];
+    let visible_rows = list_area.height as usize;
+    let scroll = if app.modal.cursor_idx >= visible_rows {
+        app.modal.cursor_idx + 1 - visible_rows
+    } else {
+        0
+    };
+    let mut hovered_row_info: Option<(u16, u16, &ModalCandidate)> = None;
+
+    if app.modal.candidates.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "  No matching targets found. Toggle [AudioOnly(F)] off or switch Backend/Tab.",
+                Style::default().fg(Color::DarkGray),
+            )),
+            list_area,
+        );
+    } else {
+        for (vis_idx, (cand_idx, cand)) in app
+            .modal
+            .candidates
+            .iter()
+            .enumerate()
+            .skip(scroll)
+            .take(visible_rows)
+            .enumerate()
+        {
+            let r_rect = Rect {
+                x: list_area.x,
+                y: list_area.y + vis_idx as u16,
+                width: list_area.width,
+                height: 1,
+            };
+            let is_cursor = cand_idx == app.modal.cursor_idx;
+            let is_hovered = app
+                .modal
+                .hovered_candidate
+                .is_some_and(|(h_idx, _, _)| h_idx == cand_idx);
+            if let Some((h_idx, mouse_col, _)) = app.modal.hovered_candidate
+                && h_idx == cand_idx
+            {
+                hovered_row_info = Some((r_rect.y, mouse_col, cand));
+            }
+            let sel_box = if cand.selected { "[x]" } else { "[ ]" };
+            let (audio_badge, badge_color) = match cand.target.kind() {
+                TargetKind::DefaultOutput => ("🔊 DEFAULT", Color::LightCyan),
+                TargetKind::DefaultInput => ("🎤 DEFAULT", Color::LightMagenta),
+                TargetKind::Device => ("🔈 ENDPOINT", Color::Cyan),
+                TargetKind::InputDevice => ("🎙 MIC IN ", Color::Magenta),
+                TargetKind::Application | TargetKind::Process => match cand.target.active_audio() {
+                    Some(true) => ("🔊 PLAYING", Color::LightGreen),
+                    Some(false) => ("🔈 IDLE   ", Color::Yellow),
+                    None => ("   silent ", Color::DarkGray),
+                },
+            };
+            let bk_tag = if let Some(b) = cand.target.backend() {
+                backend_short_badge(Some(b)).to_owned()
+            } else if !cand.target.available_backends().is_empty() {
+                cand.target
+                    .available_backends()
+                    .iter()
+                    .map(|&b| backend_short_badge(Some(b)))
+                    .collect::<Vec<_>>()
+                    .join("+")
+            } else {
+                "AUTO".to_owned()
+            };
+            let name = match cand.target.kind() {
+                TargetKind::DefaultOutput => "Default System Output",
+                TargetKind::DefaultInput => "Default Microphone",
+                _ => cand
+                    .target
+                    .name()
+                    .map_or_else(|| cand.target.id().as_ref(), |n| n.as_ref()),
+            };
+            let pid_str = cand
+                .target
+                .pid()
+                .map_or_else(|| "-".to_owned(), |p| p.to_string());
+            let path_str = cand
+                .target
+                .executable_path()
+                .map(|s| s.as_ref())
+                .or_else(|| cand.target.clean_device_id())
+                .unwrap_or(cand.target.id().as_ref());
+
+            let row_bg = if is_hovered {
+                Color::Rgb(24, 38, 52)
+            } else {
+                Color::Reset
+            };
+            let row_line = Line::from(vec![
+                Span::styled(
+                    if is_cursor {
+                        "> "
+                    } else if is_hovered {
+                        "• "
+                    } else {
+                        "  "
+                    },
+                    Style::default()
+                        .fg(if is_cursor {
+                            Color::Yellow
+                        } else {
+                            Color::LightCyan
+                        })
+                        .bg(row_bg),
+                ),
+                Span::styled(
+                    format!("{sel_box}  "),
+                    Style::default()
+                        .fg(if cand.selected {
+                            Color::LightCyan
+                        } else {
+                            Color::Gray
+                        })
+                        .bg(row_bg),
+                ),
+                Span::styled(
+                    format!("{audio_badge}   "),
+                    Style::default().fg(badge_color).bg(row_bg),
+                ),
+                Span::styled(
+                    format!("{:<8}  ", truncate_str(&bk_tag, 8)),
+                    Style::default().fg(Color::LightCyan).bg(row_bg),
+                ),
+                Span::styled(
+                    format!("{:<26}  ", truncate_str(name, 26)),
+                    Style::default()
+                        .fg(if is_hovered {
+                            Color::LightYellow
+                        } else {
+                            Color::White
+                        })
+                        .bg(row_bg),
+                ),
+                Span::styled(
+                    format!("{:<6}  ", pid_str),
+                    Style::default().fg(Color::Cyan).bg(row_bg),
+                ),
+                Span::styled(
+                    truncate_str(path_str, 26),
+                    Style::default()
+                        .fg(if is_hovered {
+                            Color::Gray
+                        } else {
+                            Color::DarkGray
+                        })
+                        .bg(row_bg),
+                ),
+            ]);
+            frame.render_widget(
+                Paragraph::new(row_line).style(Style::default().bg(row_bg)),
+                r_rect,
+            );
+            hit_map.register(r_rect, ClickAction::ToggleModalCandidate(cand_idx));
+        }
+    }
+
+    let status_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(24), Constraint::Length(26)])
+        .split(rows[5]);
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            truncate_str(
+                &format!(
+                    "  Live Discovery ({} items) | {}",
+                    app.modal.candidates.len(),
+                    app.modal.last_event_note
+                ),
+                status_cols[0].width as usize,
+            ),
+            Style::default().fg(Color::Gray),
+        )),
+        status_cols[0],
+    );
+
+    if let Ok(rep) = &app.permission_report {
+        let tab_kind = app.modal_tab_primary_permission_kind();
+        let entry = rep.entry(tab_kind);
+        let short_kind = match tab_kind {
+            PermissionKind::Microphone => "Mic",
+            PermissionKind::SystemAudio => "SysAudio",
+            PermissionKind::ScreenRecording => "ScreenRec",
+        };
+        let (pill_txt, pill_style, pill_action) = if entry.can_prompt
+            || (rep.os == PlatformOs::MacOs
+                && tab_kind == PermissionKind::SystemAudio
+                && entry.state == PermissionState::Unknown)
+        {
+            (
+                format!("[Grant {short_kind} (G)]"),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+                ClickAction::RequestDomainPermission(tab_kind),
+            )
+        } else if entry.state.is_denied_or_restricted()
+            && domain_supports_open_settings(rep.os, tab_kind)
+        {
+            (
+                format!("[{short_kind}:Settings (G)]"),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::LightRed)
+                    .add_modifier(Modifier::BOLD),
+                ClickAction::OpenDomainSettings(tab_kind),
+            )
+        } else if entry.state.is_denied_or_restricted() {
+            (
+                format!("[{short_kind}:RESTRICTED(K)]"),
+                Style::default()
+                    .fg(Color::LightRed)
+                    .add_modifier(Modifier::BOLD),
+                ClickAction::OpenPermissionsModal,
+            )
+        } else if entry.state == PermissionState::Granted && entry.requires_relaunch {
+            (
+                format!("[{short_kind}:RELAUNCH (K)]"),
+                Style::default()
+                    .fg(Color::LightMagenta)
+                    .add_modifier(Modifier::BOLD),
+                ClickAction::OpenPermissionsModal,
+            )
+        } else {
+            (
+                format!("[Perm {short_kind}: OK (K)]"),
+                Style::default().fg(Color::LightGreen),
+                ClickAction::OpenPermissionsModal,
+            )
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(pill_txt, pill_style)).alignment(Alignment::Right),
+            status_cols[1],
+        );
+        hit_map.register(status_cols[1], pill_action);
+    }
+
+    let selected_count = app.modal.candidates.iter().filter(|c| c.selected).count();
+    let bot_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Min(10),
+            Constraint::Length(18),
+            Constraint::Length(26),
+        ])
+        .split(rows[6]);
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "[ Cancel (Esc) ]",
+            Style::default().fg(Color::Gray),
+        ))
+        .alignment(Alignment::Center),
+        bot_cols[1],
+    );
+    hit_map.register(bot_cols[1], ClickAction::CloseModal);
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            format!("[ + Add {selected_count} Selected (Enter) ]"),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .alignment(Alignment::Center),
+        bot_cols[2],
+    );
+    hit_map.register(bot_cols[2], ClickAction::ConfirmAddModalCandidates);
+
+    if let Some((hovered_row_y, mouse_col, cand)) = hovered_row_info {
+        render_modal_candidate_hover_popup(
+            frame,
+            modal_rect,
+            list_area,
+            hovered_row_y,
+            mouse_col,
+            cand,
+            app,
+        );
+    }
+}
+
+fn render_modal_candidate_hover_popup(
+    frame: &mut Frame,
+    modal_rect: Rect,
+    list_area: Rect,
+    hovered_row_y: u16,
+    mouse_col: u16,
+    cand: &ModalCandidate,
+    app: &App,
+) {
+    if modal_rect.width < 30 || modal_rect.height < 8 {
+        return;
+    }
+
+    let popup_w = modal_rect
+        .width
+        .saturating_sub(6)
+        .clamp(42, 76)
+        .min(modal_rect.width.saturating_sub(2));
+    let inner_w = popup_w.saturating_sub(2) as usize;
+    let label_col_w = 12usize;
+    let val_col_w = inner_w.saturating_sub(label_col_w).max(12);
+
+    let (header_label, border_color) = match cand.target.kind() {
+        TargetKind::DefaultOutput => (" 🔊 DEFAULT SYSTEM OUTPUT ", Color::LightCyan),
+        TargetKind::DefaultInput => (" 🎤 DEFAULT MICROPHONE ", Color::LightMagenta),
+        TargetKind::Device => (" 🔈 OUTPUT ENDPOINT ", Color::Cyan),
+        TargetKind::InputDevice => (" 🎙 INPUT ENDPOINT ", Color::Magenta),
+        TargetKind::Application => match cand.target.active_audio() {
+            Some(true) => (" 🔊 APPLICATION · PLAYING ", Color::LightGreen),
+            Some(false) => (" 🔈 APPLICATION · IDLE ", Color::Yellow),
+            None => (" APPLICATION · SILENT ", Color::Gray),
+        },
+        TargetKind::Process => match cand.target.active_audio() {
+            Some(true) => (" 🔊 PROCESS · PLAYING ", Color::LightGreen),
+            Some(false) => (" 🔈 PROCESS · IDLE ", Color::Yellow),
+            None => (" PROCESS · SILENT ", Color::Gray),
+        },
+    };
+
+    let full_name = match cand.target.kind() {
+        TargetKind::DefaultOutput => "Default System Output",
+        TargetKind::DefaultInput => "Default Microphone",
+        _ => cand
+            .target
+            .name()
+            .map_or_else(|| cand.target.id().as_ref(), |n| n.as_ref()),
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    append_wrapped_kv_lines(
+        &mut lines,
+        "Name",
+        full_name,
+        val_col_w,
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    );
+    append_wrapped_kv_lines(
+        &mut lines,
+        "Target ID",
+        cand.target.id().as_ref(),
+        val_col_w,
+        Style::default().fg(Color::Cyan),
+    );
+
+    let bk_detail = format!(
+        "Pinned: {} · Available: [{}]",
+        backend_short_badge(cand.target.backend()),
+        cand.target
+            .available_backends()
+            .iter()
+            .map(|&b| backend_short_badge(Some(b)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    append_wrapped_kv_lines(
+        &mut lines,
+        "Backends",
+        &bk_detail,
+        val_col_w,
+        Style::default().fg(Color::LightCyan),
+    );
+
+    if let Some(app_id) = cand.target.app_id().map(|s| s.as_ref())
+        && !app_id.is_empty()
+    {
+        append_wrapped_kv_lines(
+            &mut lines,
+            "App ID",
+            app_id,
+            val_col_w,
+            Style::default().fg(Color::LightYellow),
+        );
+    }
+
+    if let Some(dev_id) = cand.target.clean_device_id()
+        && !dev_id.is_empty()
+    {
+        append_wrapped_kv_lines(
+            &mut lines,
+            "Device ID",
+            dev_id,
+            val_col_w,
+            Style::default().fg(Color::LightCyan),
+        );
+    }
+
+    if let Some(pid) = cand.target.pid() {
+        let pid_detail = match cand.target.process_start_time() {
+            Some(start_ts) => format!("{pid}  (start_time: {start_ts})"),
+            None => pid.to_string(),
+        };
+        append_wrapped_kv_lines(
+            &mut lines,
+            "PID / Gen",
+            &pid_detail,
+            val_col_w,
+            Style::default().fg(Color::LightGreen),
+        );
+    }
+
+    if let Some(path) = cand.target.executable_path().map(|s| s.as_ref())
+        && !path.is_empty()
+    {
+        append_wrapped_path_lines(&mut lines, "Path", path, val_col_w);
+    }
+
+    let policy_str = match cand.target.kind() {
+        TargetKind::Application | TargetKind::Process => format!(
+            "Scope: {:?} · OnExit: {:?} · Gain: {:.0}%",
+            cand.target.scope(),
+            cand.target.on_root_exit(),
+            cand.target.gain() * 100.0
+        ),
+        TargetKind::DefaultOutput
+        | TargetKind::DefaultInput
+        | TargetKind::Device
+        | TargetKind::InputDevice => format!(
+            "DeviceMode: {:?} · Gain: {:.0}%",
+            cand.target.default_device_mode(),
+            cand.target.gain() * 100.0
+        ),
+    };
+    append_wrapped_kv_lines(
+        &mut lines,
+        "Defaults",
+        &policy_str,
+        val_col_w,
+        Style::default().fg(Color::Gray),
+    );
+
+    if let Some(perm_entry) = app.target_permission_entry(&cand.target) {
+        let relaunch_tag = if perm_entry.requires_relaunch {
+            " (relaunch needed)"
+        } else {
+            ""
+        };
+        let perm_txt = format!(
+            "{} · {}{relaunch_tag}",
+            perm_entry.kind.as_str(),
+            perm_entry.state.as_str()
+        );
+        let perm_fg = match perm_entry.state {
+            PermissionState::Granted if perm_entry.requires_relaunch => Color::LightMagenta,
+            PermissionState::Granted => Color::LightGreen,
+            PermissionState::NotDetermined | PermissionState::Unknown => Color::Yellow,
+            PermissionState::Denied | PermissionState::Restricted => Color::LightRed,
+        };
+        append_wrapped_kv_lines(
+            &mut lines,
+            "Permission",
+            &perm_txt,
+            val_col_w,
+            Style::default().fg(perm_fg),
+        );
+    }
+
+    let max_popup_h = modal_rect.height.saturating_sub(2).max(4);
+    let popup_h = ((lines.len() as u16) + 2).min(max_popup_h);
+
+    let list_mid_y = list_area.y + list_area.height / 2;
+    let space_below = (modal_rect.y + modal_rect.height)
+        .saturating_sub(hovered_row_y + 1)
+        .saturating_sub(1);
+    let space_above = hovered_row_y.saturating_sub(modal_rect.y + 1);
+
+    let popup_y =
+        if space_below >= popup_h && (hovered_row_y <= list_mid_y || space_below >= space_above) {
+            hovered_row_y + 1
+        } else if space_above >= popup_h {
+            hovered_row_y.saturating_sub(popup_h)
+        } else if space_below >= space_above {
+            (hovered_row_y + 1)
+                .min((modal_rect.y + modal_rect.height).saturating_sub(popup_h.saturating_add(1)))
+        } else {
+            hovered_row_y
+                .saturating_sub(popup_h)
+                .max(modal_rect.y.saturating_add(1))
+        };
+
+    let min_x = modal_rect.x.saturating_add(2);
+    let max_x = (modal_rect.x + modal_rect.width)
+        .saturating_sub(popup_w.saturating_add(1))
+        .max(min_x);
+    let desired_x = mouse_col.saturating_sub(popup_w / 3);
+    let popup_x = desired_x.clamp(min_x, max_x);
+
+    let popup_rect = Rect {
+        x: popup_x,
+        y: popup_y,
+        width: popup_w,
+        height: popup_h,
+    };
+
+    let status_badge = if cand.selected {
+        " [Selected ✓] "
+    } else {
+        " [Click to Toggle] "
+    };
+
+    frame.render_widget(Clear, popup_rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color))
+        .style(Style::default().bg(Color::Rgb(14, 20, 28)))
+        .title(
+            Line::from(Span::styled(
+                header_label,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(border_color)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .alignment(Alignment::Left),
+        )
+        .title(
+            Line::from(Span::styled(
+                status_badge,
+                Style::default()
+                    .fg(if cand.selected {
+                        Color::LightCyan
+                    } else {
+                        Color::Gray
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .alignment(Alignment::Right),
+        );
+    let inner = block.inner(popup_rect);
+    frame.render_widget(block, popup_rect);
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(Color::Rgb(14, 20, 28))),
+        inner,
+    );
+}
+
+fn render_permissions_modal(frame: &mut Frame, full_area: Rect, app: &App, hit_map: &mut HitMap) {
+    let modal_w = (full_area.width * 84 / 100).clamp(48, full_area.width.saturating_sub(2));
+    let modal_h = 20u16.min(full_area.height.saturating_sub(2)).max(12);
+    let modal_rect = Rect {
+        x: full_area.x + (full_area.width.saturating_sub(modal_w)) / 2,
+        y: full_area.y + (full_area.height.saturating_sub(modal_h)) / 2,
+        width: modal_w,
+        height: modal_h,
+    };
+
+    let os_label = match app.effective_permission_os() {
+        PlatformOs::Windows => "Windows",
+        PlatformOs::Linux => "Linux",
+        PlatformOs::MacOs => "macOS",
+    };
+
+    frame.render_widget(Clear, modal_rect);
+    let block = Block::default()
+        .title(Span::styled(
+            format!(" OS Recording Permissions & Consent ({os_label}) "),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(modal_rect);
+    frame.render_widget(block, modal_rect);
+
+    if inner.height < 8 || inner.width < 36 {
+        return;
+    }
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let top_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(27),
+            Constraint::Min(22),
+            Constraint::Length(13),
+        ])
+        .split(rows[0]);
+
+    let (pol_txt, pol_fg) = match app.permission_policy {
+        PermissionPolicy::AutoRequest => ("[Policy: AutoRequest (P)]", Color::LightGreen),
+        PermissionPolicy::CheckOnly => ("[Policy: CheckOnly   (P)]", Color::Yellow),
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            pol_txt,
+            Style::default().fg(pol_fg).add_modifier(Modifier::BOLD),
+        )),
+        top_cols[0],
+    );
+    hit_map.register(top_cols[0], ClickAction::TogglePermissionPolicy);
+
+    let set_txt = if app.open_settings_if_denied {
+        "[x] Open OS Settings on Denial (O)"
+    } else {
+        "[ ] Open OS Settings on Denial (O)"
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(set_txt, Style::default().fg(Color::Cyan))),
+        top_cols[1],
+    );
+    hit_map.register(top_cols[1], ClickAction::ToggleOpenSettingsFallback);
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "[Close (Esc)]",
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .alignment(Alignment::Right),
+        top_cols[2],
+    );
+    hit_map.register(top_cols[2], ClickAction::ClosePermissionsModal);
+
