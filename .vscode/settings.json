@@ -1,0 +1,11 @@
+{
+    "rust-analyzer.linkedProjects": [
+        "crates/capture-core/Cargo.toml",
+        "crates/capture-windows/Cargo.toml",
+        "crates/capture-linux/Cargo.toml",
+        "crates/capture-macos/Cargo.toml",
+        "crates/capture-ffi/Cargo.toml",
+        "crates/capture-python/Cargo.toml",
+        "tools/cspa-tui-demo/Cargo.toml"
+    ]
+}
