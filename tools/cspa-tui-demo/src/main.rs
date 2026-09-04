@@ -709,3 +709,476 @@ mod tests {
             "tools/cspa-tui-demo/src/backend.rs must have 0 #[cfg] attributes"
         );
 
+        let backend = TestBackend::new(120, 36);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::new();
+        app.synthetic_mode = true;
+        let mut hit_map = HitMap::default();
+
+        app.open_add_source_modal();
+        app.handle_click_action(ClickAction::SwitchModalTab(ModalTab::Microphones));
+        assert_eq!(app.modal.tab, ModalTab::Microphones);
+        assert!(
+            app.modal
+                .candidates
+                .iter()
+                .any(|c| c.target.kind() == TargetKind::DefaultInput),
+            "Microphones tab must surface Default Microphone"
+        );
+
+        app.handle_click_action(ClickAction::ToggleModalDedupe);
+        assert_eq!(app.modal.dedupe, DiscoveryDedupe::PerBackend);
+        app.handle_click_action(ClickAction::ToggleModalOrder);
+        assert_eq!(app.modal.order, DiscoveryOrder::BackendThenKind);
+        app.handle_click_action(ClickAction::CycleModalBackendFilter);
+        assert!(app.modal.backend_filter.is_some());
+        // Stage the logical microphone rather than a backend-specific target.
+        while app.modal.backend_filter.is_some() {
+            app.handle_click_action(ClickAction::CycleModalBackendFilter);
+        }
+        app.handle_click_action(ClickAction::ToggleModalDedupe);
+        assert_eq!(app.modal.dedupe, DiscoveryDedupe::ByLogicalTarget);
+
+        app.apply_discovery_event(&DiscoveryEvent {
+            revision: 77,
+            kind: DiscoveryEventKind::DefaultInputChanged {
+                device_id: "mic-usb-01".into(),
+            },
+        });
+        assert!(
+            app.modal
+                .last_event_note
+                .contains("Default mic -> mic-usb-01")
+        );
+
+        terminal
+            .draw(|f| ui::render(f, &app, &mut hit_map))
+            .expect("draw microphones modal");
+
+        let mic_idx = app
+            .modal
+            .candidates
+            .iter()
+            .position(|c| c.target.kind() == TargetKind::DefaultInput)
+            .expect("DefaultInput candidate");
+        app.handle_click_action(ClickAction::ToggleModalCandidate(mic_idx));
+        app.handle_click_action(ClickAction::ConfirmAddModalCandidates);
+        assert_eq!(app.staged_sources.len(), 2);
+        assert_eq!(app.staged_sources[1].kind_badge(), "MIC");
+
+        assert_eq!(
+            app.staged_sources[1].target.default_device_mode(),
+            DefaultDeviceMode::Follow
+        );
+        app.handle_click_action(ClickAction::CycleStagedDeviceMode(1));
+        assert_eq!(
+            app.staged_sources[1].target.default_device_mode(),
+            DefaultDeviceMode::Pin
+        );
+        app.handle_click_action(ClickAction::CycleStagedDeviceMode(1));
+        assert_eq!(
+            app.staged_sources[1].target.default_device_mode(),
+            DefaultDeviceMode::Follow
+        );
+
+        app.handle_click_action(ClickAction::CycleStagedBackend(1));
+        assert!(app.staged_sources[1].target.backend().is_some());
+        while app.staged_sources[1].target.backend().is_some() {
+            app.handle_click_action(ClickAction::CycleStagedBackend(1));
+        }
+
+        app.handle_click_action(ClickAction::CycleStagedGain(1));
+        assert!((app.staged_sources[1].target.gain() - 0.5).abs() < 1e-4);
+        for _ in 0..3 {
+            app.handle_click_action(ClickAction::CycleStagedGain(1));
+        }
+        assert!((app.staged_sources[1].target.gain() - 1.0).abs() < 1e-4);
+
+        assert_eq!(
+            app.current_plan.as_ref().unwrap().combine_resolution,
+            CombineResolution::CspaMixer
+        );
+        app.handle_click_action(ClickAction::CycleCombineMode);
+        assert_eq!(app.combine_mode, CombineMode::NativeOnly);
+        assert!(
+            app.current_plan.is_err(),
+            "CombineMode::NativeOnly must reject [DefaultOutput + Microphone]"
+        );
+        app.handle_click_action(ClickAction::CycleCombineMode);
+        assert_eq!(app.combine_mode, CombineMode::CspaMixer);
+        assert!(app.current_plan.is_ok());
+        app.handle_click_action(ClickAction::CycleCombineMode);
+        assert_eq!(app.combine_mode, CombineMode::Auto);
+
+        app.handle_click_action(ClickAction::ToggleInputConversion);
+        assert_eq!(
+            app.input_conversion,
+            InputConversionPolicy::StrictNoResample
+        );
+        app.handle_click_action(ClickAction::ToggleInputConversion);
+        assert_eq!(app.input_conversion, InputConversionPolicy::AutoWhenMixing);
+
+        app.start_recording();
+        for _ in 0..6 {
+            std::thread::sleep(Duration::from_millis(12));
+            app.on_tick();
+        }
+        terminal
+            .draw(|f| ui::render(f, &app, &mut hit_map))
+            .expect("draw active heterogeneous recording");
+
+        let buf = terminal.backend().buffer();
+        let mut screen = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                screen.push_str(buf[(x, y)].symbol());
+            }
+            screen.push('\n');
+        }
+        assert!(
+            screen.contains("48k->48k BYPASS") && screen.contains("16k 1ch->48k 2ch SYNC"),
+            "Telemetry panel must render both BYPASS and SYNC normalizer badges:\n{screen}"
+        );
+        assert!(
+            screen.contains("Skew cross-clock"),
+            "Cross-clock [DefaultOutput + Microphone] must report Skew cross-clock:\n{screen}"
+        );
+
+        app.stop_recording();
+        for _ in 0..10 {
+            std::thread::sleep(Duration::from_millis(12));
+            app.on_tick();
+            if !app.takes.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(app.takes.len(), 1);
+
+        // Playback mutes the live monitor to prevent acoustic feedback.
+        app.playback_status.active = true;
+        app.playback_status.paused = false;
+        app.sync_worker_monitor();
+        std::thread::sleep(Duration::from_millis(30));
+        while app.worker.try_recv().is_some() {}
+        let frames_before = app.live_frames;
+        std::thread::sleep(Duration::from_millis(35));
+        app.on_tick();
+        assert_eq!(
+            app.live_frames, frames_before,
+            "live capture monitor must remain parked while playback is active"
+        );
+    }
+
+    fn collect_screen_text(terminal: &Terminal<TestBackend>) -> String {
+        let buf = terminal.backend().buffer();
+        let mut screen = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                screen.push_str(buf[(x, y)].symbol());
+            }
+            screen.push('\n');
+        }
+        screen
+    }
+
+    #[test]
+    fn permissions_surfaces_and_modal_render_across_os_profiles_and_recover_on_grant() {
+        use crate::app::StagedSource;
+        use crate::backend::PermissionJobOutcome;
+        use capture_system_or_process_audio::{
+            CaptureTarget, DefaultDeviceMode, OnRootExit, PermissionEntry, PermissionKind,
+            PermissionPolicy, PermissionReport, PermissionState, PlatformOs, ProcessIdentity,
+            ProcessScope,
+        };
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        for width in [100u16, 120u16] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 36)).expect("test terminal");
+            let mut app = App::new();
+            app.synthetic_mode = true;
+            let mut hit_map = HitMap::default();
+
+            app.staged_sources.push(StagedSource {
+                enabled: true,
+                target: CaptureTarget::microphone(DefaultDeviceMode::Follow),
+            });
+            app.staged_sources.push(StagedSource {
+                enabled: true,
+                target: CaptureTarget::application(
+                    ProcessIdentity {
+                        pid: 9001,
+                        generation: 12345,
+                    },
+                    Some("com.example.SynthApp".into()),
+                    Some("SynthApp".into()),
+                    Some("/Applications/SynthApp.app/Contents/MacOS/SynthApp".into()),
+                    ProcessScope::Exact,
+                    OnRootExit::Stop,
+                )
+                .expect("valid exact app"),
+            });
+
+            let mac_initial = PermissionReport::new(
+                PlatformOs::MacOs,
+                PermissionEntry {
+                    kind: PermissionKind::Microphone,
+                    state: PermissionState::NotDetermined,
+                    required: true,
+                    can_prompt: true,
+                    requires_relaunch: false,
+                },
+                PermissionEntry {
+                    kind: PermissionKind::SystemAudio,
+                    state: PermissionState::Unknown,
+                    required: true,
+                    can_prompt: true,
+                    requires_relaunch: false,
+                },
+                PermissionEntry {
+                    kind: PermissionKind::ScreenRecording,
+                    state: PermissionState::Denied,
+                    required: true,
+                    can_prompt: false,
+                    requires_relaunch: true,
+                },
+            );
+            app.set_permission_report_for_test(mac_initial);
+
+            terminal
+                .draw(|f| ui::render(f, &app, &mut hit_map))
+                .expect("draw macos main view");
+            let screen = collect_screen_text(&terminal);
+
+            assert!(
+                screen.contains("[Perms:DENY!(K)]"),
+                "width {width} header must show DENY! pill:\n{screen}"
+            );
+            assert!(
+                screen.contains("Mic:ASK*")
+                    && screen.contains("Sys:UNK*")
+                    && screen.contains("Scr:DNY*")
+                    && screen.contains("[Pol:AutoRq]"),
+                "width {width} panel [2] must show Mic/Sys/Scr chips and Policy toggle:\n{screen}"
+            );
+            assert!(
+                screen.contains("[APP!]"),
+                "width {width} staged sources must mark denied exact app with [APP!]:\n{screen}"
+            );
+
+            for action in [
+                ClickAction::TogglePermissionPolicy,
+                ClickAction::RefreshPermissions,
+                ClickAction::RequestRequiredPermissions,
+                ClickAction::OpenPermissionsModal,
+            ] {
+                let (rect, _) = hit_map
+                    .regions()
+                    .iter()
+                    .find(|(_, act)| *act == action)
+                    .unwrap_or_else(|| panic!("width {width}: missing hitbox for {action:?}"));
+                assert!(rect.width > 0 && rect.height > 0);
+            }
+
+            app.handle_click_action(ClickAction::TogglePermissionPolicy);
+            assert_eq!(app.permission_policy, PermissionPolicy::CheckOnly);
+            assert_eq!(
+                app.build_capture_request().unwrap().permission_policy(),
+                PermissionPolicy::CheckOnly
+            );
+
+            app.open_add_source_modal();
+            app.set_permission_report_for_test(mac_initial);
+            terminal
+                .draw(|f| ui::render(f, &app, &mut hit_map))
+                .expect("draw add source modal with permissions");
+            let modal_screen = collect_screen_text(&terminal);
+            assert!(
+                modal_screen.contains("[ScreenRec:Settings (G)]"),
+                "Applications tab on macOS with denied SCK must offer Settings pill:\n{modal_screen}"
+            );
+
+            app.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+            assert!(!app.modal.open);
+            assert!(app.permissions_modal.open);
+
+            terminal
+                .draw(|f| ui::render(f, &app, &mut hit_map))
+                .expect("draw permissions modal");
+            let perm_modal_screen = collect_screen_text(&terminal);
+            assert!(
+                perm_modal_screen.contains("OS Recording Permissions & Consent (macOS)")
+                    && perm_modal_screen.contains("[Policy: CheckOnly   (P)]")
+                    && perm_modal_screen.contains("[Ask OS (1)]")
+                    && perm_modal_screen.contains("[Settgs (3)]")
+                    && perm_modal_screen.contains("CoreAudio CATap"),
+                "macOS Permissions modal must render per-domain actions and diagnostics:\n{perm_modal_screen}"
+            );
+
+            // Modal hitboxes mask background controls.
+            assert!(
+                !hit_map
+                    .regions()
+                    .iter()
+                    .any(|(_, act)| *act == ClickAction::CycleCombineMode),
+                "background hitboxes must be masked while PermissionsModal is open"
+            );
+            assert!(hit_map.regions().iter().any(|(_, act)| {
+                *act == ClickAction::RequestDomainPermission(PermissionKind::Microphone)
+            }));
+            assert!(hit_map.regions().iter().any(|(_, act)| {
+                *act == ClickAction::OpenDomainSettings(PermissionKind::ScreenRecording)
+            }));
+
+            app.handle_key_event(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+            assert!(!app.open_settings_if_denied);
+            app.handle_key_event(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+            assert_eq!(app.permission_policy, PermissionPolicy::AutoRequest);
+            app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert!(!app.permissions_modal.open);
+
+            let mac_relaunch = PermissionReport::new(
+                PlatformOs::MacOs,
+                PermissionEntry {
+                    kind: PermissionKind::Microphone,
+                    state: PermissionState::Granted,
+                    required: true,
+                    can_prompt: false,
+                    requires_relaunch: false,
+                },
+                PermissionEntry {
+                    kind: PermissionKind::SystemAudio,
+                    state: PermissionState::Granted,
+                    required: true,
+                    can_prompt: false,
+                    requires_relaunch: false,
+                },
+                PermissionEntry {
+                    kind: PermissionKind::ScreenRecording,
+                    state: PermissionState::Granted,
+                    required: true,
+                    can_prompt: false,
+                    requires_relaunch: true,
+                },
+            );
+            app.permission_runner.inject_outcome(PermissionJobOutcome {
+                label: "Request screen_recording".to_owned(),
+                result: Ok(mac_relaunch),
+            });
+            app.on_tick();
+            terminal
+                .draw(|f| ui::render(f, &app, &mut hit_map))
+                .expect("draw relaunch state");
+            let rel_screen = collect_screen_text(&terminal);
+            assert!(rel_screen.contains("[Perms:RLNCH(K)]"));
+            assert!(rel_screen.contains("[APP~]"));
+
+            app.error_banner = Some("Live monitor open failed: permission denied".to_owned());
+            let mac_all_ok = PermissionReport::new(
+                PlatformOs::MacOs,
+                PermissionEntry {
+                    kind: PermissionKind::Microphone,
+                    state: PermissionState::Granted,
+                    required: true,
+                    can_prompt: false,
+                    requires_relaunch: false,
+                },
+                PermissionEntry {
+                    kind: PermissionKind::SystemAudio,
+                    state: PermissionState::Granted,
+                    required: true,
+                    can_prompt: false,
+                    requires_relaunch: false,
+                },
+                PermissionEntry {
+                    kind: PermissionKind::ScreenRecording,
+                    state: PermissionState::Granted,
+                    required: true,
+                    can_prompt: false,
+                    requires_relaunch: false,
+                },
+            );
+            app.permission_runner.inject_outcome(PermissionJobOutcome {
+                label: "Re-verify permissions".to_owned(),
+                result: Ok(mac_all_ok),
+            });
+            app.on_tick();
+            assert!(
+                app.error_banner.is_none(),
+                "permission grant must clear stale permission error banner"
+            );
+
+            let win_denied = PermissionReport::new(
+                PlatformOs::Windows,
+                PermissionEntry {
+                    kind: PermissionKind::Microphone,
+                    state: PermissionState::Denied,
+                    required: true,
+                    can_prompt: false,
+                    requires_relaunch: false,
+                },
+                PermissionEntry {
+                    kind: PermissionKind::SystemAudio,
+                    state: PermissionState::Granted,
+                    required: true,
+                    can_prompt: false,
+                    requires_relaunch: false,
+                },
+                PermissionEntry {
+                    kind: PermissionKind::ScreenRecording,
+                    state: PermissionState::Granted,
+                    required: false,
+                    can_prompt: false,
+                    requires_relaunch: false,
+                },
+            );
+            app.set_permission_report_for_test(win_denied);
+            app.permissions_modal.open = true;
+            terminal
+                .draw(|f| ui::render(f, &app, &mut hit_map))
+                .expect("draw windows modal");
+            let win_screen = collect_screen_text(&terminal);
+            assert!(
+                win_screen.contains("OS Recording Permissions & Consent (Windows)")
+                    && win_screen.contains("[Settgs (1)]")
+                    && win_screen.contains("ms-settings:privacy-microphone"),
+                "Windows denied mic must offer [Settgs (1)] and ms-settings URI:\n{win_screen}"
+            );
+
+            let linux_restricted = PermissionReport::new(
+                PlatformOs::Linux,
+                PermissionEntry {
+                    kind: PermissionKind::Microphone,
+                    state: PermissionState::Restricted,
+                    required: true,
+                    can_prompt: false,
+                    requires_relaunch: false,
+                },
+                PermissionEntry {
+                    kind: PermissionKind::SystemAudio,
+                    state: PermissionState::Restricted,
+                    required: true,
+                    can_prompt: false,
+                    requires_relaunch: false,
+                },
+                PermissionEntry {
+                    kind: PermissionKind::ScreenRecording,
+                    state: PermissionState::Restricted,
+                    required: false,
+                    can_prompt: false,
+                    requires_relaunch: false,
+                },
+            );
+            app.set_permission_report_for_test(linux_restricted);
+            terminal
+                .draw(|f| ui::render(f, &app, &mut hit_map))
+                .expect("draw linux modal");
+            let linux_screen = collect_screen_text(&terminal);
+            assert!(
+                linux_screen.contains("OS Recording Permissions & Consent (Linux)")
+                    && linux_screen.contains("Flatpak")
+                    && !linux_screen.contains("[Settgs"),
+                "Linux restricted state must explain Flatpak/socket remediation without fake Settings buttons:\n{linux_screen}"
+            );
+        }
+    }
+}

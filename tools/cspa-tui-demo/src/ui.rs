@@ -2823,3 +2823,539 @@ fn render_permissions_modal(frame: &mut Frame, full_area: Rect, app: &App, hit_m
     );
     hit_map.register(top_cols[2], ClickAction::ClosePermissionsModal);
 
+    let act_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(22), Constraint::Min(24)])
+        .split(rows[1]);
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "[Re-Check States (C)]",
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        act_cols[0],
+    );
+    hit_map.register(act_cols[0], ClickAction::RefreshPermissions);
+
+    let (req_all_lbl, req_all_style) = if app.permission_runner.is_in_flight() {
+        (
+            "[ Requesting OS Consent... ]",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (
+            "[ Request Required for Staged (R / Enter) ]",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(req_all_lbl, req_all_style)),
+        act_cols[1],
+    );
+    hit_map.register(act_cols[1], ClickAction::RequestRequiredPermissions);
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            " #  Domain            Required    State                Prompt  Relaunch  Action",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )),
+        rows[3],
+    );
+
+    match &app.permission_report {
+        Ok(rep) => {
+            for (idx, entry) in rep.entries().iter().copied().enumerate() {
+                if idx as u16 >= rows[4].height {
+                    break;
+                }
+                let r_rect = Rect {
+                    x: rows[4].x,
+                    y: rows[4].y + idx as u16,
+                    width: rows[4].width,
+                    height: 1,
+                };
+                let row_cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Min(30), Constraint::Length(14)])
+                    .split(r_rect);
+
+                let dom_name = match entry.kind {
+                    PermissionKind::Microphone => "Microphone      ",
+                    PermissionKind::SystemAudio => "SystemAudio     ",
+                    PermissionKind::ScreenRecording => "ScreenRecording ",
+                };
+                let (req_txt, req_style) = if entry.required {
+                    (
+                        "* REQUIRED  ",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    ("  optional  ", Style::default().fg(Color::DarkGray))
+                };
+                let (state_txt, state_fg) = match entry.state {
+                    PermissionState::Granted => ("GRANTED             ", Color::LightGreen),
+                    PermissionState::NotDetermined => ("NOT DETERMINED      ", Color::Yellow),
+                    PermissionState::Denied => ("DENIED              ", Color::LightRed),
+                    PermissionState::Restricted => ("RESTRICTED          ", Color::LightRed),
+                    PermissionState::Unknown => ("UNKNOWN (Unprobed)  ", Color::Yellow),
+                };
+                let prompt_txt = if entry.can_prompt {
+                    "Yes     "
+                } else {
+                    "No      "
+                };
+                let (rel_txt, rel_fg) = if entry.requires_relaunch {
+                    ("YES     ", Color::LightMagenta)
+                } else {
+                    ("No      ", Color::DarkGray)
+                };
+
+                let left_line = Line::from(vec![
+                    Span::styled(format!(" {}  ", idx + 1), Style::default().fg(Color::Cyan)),
+                    Span::styled(dom_name, Style::default().fg(Color::White)),
+                    Span::styled(req_txt, req_style),
+                    Span::styled(
+                        state_txt,
+                        Style::default().fg(state_fg).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(prompt_txt, Style::default().fg(Color::Gray)),
+                    Span::styled(rel_txt, Style::default().fg(rel_fg)),
+                ]);
+                frame.render_widget(Paragraph::new(left_line), row_cols[0]);
+
+                let key_num = idx + 1;
+                if entry.can_prompt {
+                    let lbl = format!("[Ask OS ({key_num})]");
+                    frame.render_widget(
+                        Paragraph::new(Span::styled(
+                            lbl,
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ))
+                        .alignment(Alignment::Right),
+                        row_cols[1],
+                    );
+                    hit_map.register(
+                        row_cols[1],
+                        ClickAction::RequestDomainPermission(entry.kind),
+                    );
+                } else if rep.os == PlatformOs::MacOs
+                    && entry.kind == PermissionKind::SystemAudio
+                    && entry.state == PermissionState::Unknown
+                {
+                    let lbl = format!("[Probe  ({key_num})]");
+                    frame.render_widget(
+                        Paragraph::new(Span::styled(
+                            lbl,
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ))
+                        .alignment(Alignment::Right),
+                        row_cols[1],
+                    );
+                    hit_map.register(
+                        row_cols[1],
+                        ClickAction::RequestDomainPermission(entry.kind),
+                    );
+                } else if entry.state.is_denied_or_restricted()
+                    && domain_supports_open_settings(rep.os, entry.kind)
+                {
+                    let lbl = format!("[Settgs ({key_num})]");
+                    frame.render_widget(
+                        Paragraph::new(Span::styled(
+                            lbl,
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::LightRed)
+                                .add_modifier(Modifier::BOLD),
+                        ))
+                        .alignment(Alignment::Right),
+                        row_cols[1],
+                    );
+                    hit_map.register(row_cols[1], ClickAction::OpenDomainSettings(entry.kind));
+                } else {
+                    frame.render_widget(
+                        Paragraph::new(Span::styled(
+                            "[    --    ]",
+                            Style::default().fg(Color::DarkGray),
+                        ))
+                        .alignment(Alignment::Right),
+                        row_cols[1],
+                    );
+                }
+            }
+
+            let diag_lines = build_permission_diagnostics(rep, rows[6].width as usize);
+            frame.render_widget(Paragraph::new(diag_lines), rows[6]);
+        }
+        Err(err) => {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    format!(" Failed to inspect OS permissions: {err}"),
+                    Style::default().fg(Color::LightRed),
+                )),
+                rows[4],
+            );
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            truncate_str(
+                &format!(" Note: {}", app.permissions_modal.last_action_note),
+                rows[7].width as usize,
+            ),
+            Style::default().fg(Color::Cyan),
+        )),
+        rows[7],
+    );
+}
+
+fn build_permission_diagnostics(report: &PermissionReport, max_width: usize) -> Vec<Line<'static>> {
+    let mut raw_notes: Vec<(Color, String)> = Vec::new();
+    match report.os {
+        PlatformOs::Windows => {
+            let mic = report.microphone();
+            match mic.state {
+                PermissionState::Granted => raw_notes.push((
+                    Color::LightGreen,
+                    "Microphone: Allowed in Windows Privacy ConsentStore (WASAPI eCapture ready)."
+                        .to_owned(),
+                )),
+                PermissionState::Denied => raw_notes.push((
+                    Color::LightRed,
+                    "Microphone: Denied in Windows Settings -> Privacy & security -> Microphone. Click [Settgs (1)] for ms-settings:privacy-microphone."
+                        .to_owned(),
+                )),
+                PermissionState::Restricted => raw_notes.push((
+                    Color::LightRed,
+                    "Microphone: Restricted by Group Policy / MDM (LetAppsAccessMicrophone=2) or OS build floor."
+                        .to_owned(),
+                )),
+                other => raw_notes.push((
+                    Color::Yellow,
+                    format!("Microphone: state={}.", other.as_str()),
+                )),
+            }
+            raw_notes.push((
+                Color::Gray,
+                "SystemAudio / ScreenRecording: WASAPI loopback & process-tree capture require no separate privacy toggle on Windows."
+                    .to_owned(),
+            ));
+        }
+        PlatformOs::MacOs => {
+            let mic = report.microphone();
+            match mic.state {
+                PermissionState::Granted => raw_notes.push((
+                    Color::LightGreen,
+                    "Microphone (AVMediaTypeAudio): TCC consent granted.".to_owned(),
+                )),
+                PermissionState::NotDetermined => raw_notes.push((
+                    Color::Yellow,
+                    "Microphone (AVMediaTypeAudio): Not yet requested; click [Ask OS (1)] to trigger macOS TCC prompt."
+                        .to_owned(),
+                )),
+                PermissionState::Denied => raw_notes.push((
+                    Color::LightRed,
+                    "Microphone (AVMediaTypeAudio): Denied in TCC. Click [Settgs (1)] -> Privacy & Security -> Microphone."
+                        .to_owned(),
+                )),
+                PermissionState::Restricted => raw_notes.push((
+                    Color::LightRed,
+                    "Microphone (AVMediaTypeAudio): Restricted (SSH session, MDM, or .app missing NSMicrophoneUsageDescription)."
+                        .to_owned(),
+                )),
+                PermissionState::Unknown => raw_notes.push((
+                    Color::Yellow,
+                    "Microphone (AVMediaTypeAudio): Status unknown.".to_owned(),
+                )),
+            }
+
+            let sys = report.system_audio();
+            match sys.state {
+                PermissionState::Granted => raw_notes.push((
+                    Color::LightGreen,
+                    "SystemAudio (CoreAudio CATap 14.2+): Verified granted ('wat?'/'!hog' probe clean)."
+                        .to_owned(),
+                )),
+                PermissionState::Unknown => raw_notes.push((
+                    Color::Yellow,
+                    "SystemAudio (CoreAudio CATap 14.2+): Unprobed (never faked as Granted). Click [Probe (2)] or open stream."
+                        .to_owned(),
+                )),
+                PermissionState::Denied => raw_notes.push((
+                    Color::LightRed,
+                    "SystemAudio (CoreAudio CATap 14.2+): Denied ('wat?'/'!hog'). Click [Settgs (2)] -> System Audio Recording Only."
+                        .to_owned(),
+                )),
+                PermissionState::Restricted => raw_notes.push((
+                    Color::LightRed,
+                    "SystemAudio (CoreAudio CATap): Restricted (macOS < 14.2 or .app missing NSAudioCaptureUsageDescription)."
+                        .to_owned(),
+                )),
+                PermissionState::NotDetermined => raw_notes.push((
+                    Color::Yellow,
+                    "SystemAudio (CoreAudio CATap 14.2+): Click [Ask OS (2)] to request consent."
+                        .to_owned(),
+                )),
+            }
+
+            let scr = report.screen_recording();
+            if scr.state == PermissionState::Granted && scr.requires_relaunch {
+                raw_notes.push((
+                    Color::LightMagenta,
+                    "ScreenRecording (ScreenCaptureKit): Newly granted! Relaunch app for SCShareableContent/SCK audio to activate."
+                        .to_owned(),
+                ));
+            } else {
+                match scr.state {
+                    PermissionState::Granted => raw_notes.push((
+                        Color::LightGreen,
+                        "ScreenRecording (ScreenCaptureKit): TCC consent granted.".to_owned(),
+                    )),
+                    PermissionState::NotDetermined => raw_notes.push((
+                        Color::Yellow,
+                        "ScreenRecording (ScreenCaptureKit): Not yet requested; click [Ask OS (3)] (granting requires relaunch)."
+                            .to_owned(),
+                    )),
+                    PermissionState::Denied => raw_notes.push((
+                        Color::LightRed,
+                        "ScreenRecording (ScreenCaptureKit): Denied in TCC. Click [Settgs (3)] -> Screen & System Audio Recording, then relaunch."
+                            .to_owned(),
+                    )),
+                    PermissionState::Restricted => raw_notes.push((
+                        Color::LightRed,
+                        "ScreenRecording (ScreenCaptureKit): Restricted (macOS < 13.0 or headless session)."
+                            .to_owned(),
+                    )),
+                    PermissionState::Unknown => raw_notes.push((
+                        Color::Yellow,
+                        "ScreenRecording (ScreenCaptureKit): Status unknown.".to_owned(),
+                    )),
+                }
+            }
+        }
+        PlatformOs::Linux => {
+            let sys = report.system_audio();
+            match sys.state {
+                PermissionState::Granted => raw_notes.push((
+                    Color::LightGreen,
+                    "PipeWire / PulseAudio: Audio server UNIX socket reachable (no interactive TCC prompt required)."
+                        .to_owned(),
+                )),
+                PermissionState::Restricted => raw_notes.push((
+                    Color::LightRed,
+                    "Linux Sandbox / Socket Denied: EACCES or Flatpak missing --socket=pulseaudio / --filesystem=xdg-run/pipewire-0."
+                        .to_owned(),
+                )),
+                PermissionState::Unknown => raw_notes.push((
+                    Color::Yellow,
+                    "Audio Server Unreachable: Neither PipeWire nor PulseAudio socket responded in XDG_RUNTIME_DIR."
+                        .to_owned(),
+                )),
+                other => raw_notes.push((
+                    Color::Yellow,
+                    format!("Linux Audio Socket: state={}.", other.as_str()),
+                )),
+            }
+        }
+    }
+
+    let mut lines = Vec::new();
+    let wrap_w = max_width.saturating_sub(4).max(16);
+    for (color, note) in raw_notes {
+        for (idx, chunk) in wrap_text_chunks(&note, wrap_w).into_iter().enumerate() {
+            let bullet = if idx == 0 { " * " } else { "   " };
+            lines.push(Line::from(vec![
+                Span::styled(bullet, Style::default().fg(color)),
+                Span::styled(chunk, Style::default().fg(color)),
+            ]));
+        }
+    }
+    lines
+}
+
+fn append_wrapped_kv_lines(
+    lines: &mut Vec<Line<'static>>,
+    label: &str,
+    value: &str,
+    val_col_w: usize,
+    val_style: Style,
+) {
+    let chunks = wrap_text_chunks(value, val_col_w);
+    for (idx, chunk) in chunks.into_iter().enumerate() {
+        let prefix = if idx == 0 {
+            format!(" {:<10} ", label)
+        } else {
+            "            ".to_owned()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+            Span::styled(chunk, val_style),
+        ]));
+    }
+}
+
+fn append_wrapped_path_lines(
+    lines: &mut Vec<Line<'static>>,
+    label: &str,
+    path: &str,
+    val_col_w: usize,
+) {
+    let sep_pos = path.rfind(['\\', '/']);
+    if let Some(pos) = sep_pos {
+        let (dir_part, file_part) = path.split_at(pos + 1);
+        if !file_part.is_empty() {
+            let dir_chunks = wrap_text_chunks(dir_part, val_col_w);
+            for (idx, chunk) in dir_chunks.into_iter().enumerate() {
+                let prefix = if idx == 0 {
+                    format!(" {:<10} ", label)
+                } else {
+                    "            ".to_owned()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+                    Span::styled(chunk, Style::default().fg(Color::Gray)),
+                ]));
+            }
+            let file_chunks = wrap_text_chunks(file_part, val_col_w.saturating_sub(2).max(8));
+            for (idx, chunk) in file_chunks.into_iter().enumerate() {
+                let arrow = if idx == 0 { "↳ " } else { "  " };
+                lines.push(Line::from(vec![
+                    Span::styled("            ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(arrow, Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        chunk,
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+            }
+            return;
+        }
+    }
+    append_wrapped_kv_lines(
+        lines,
+        label,
+        path,
+        val_col_w,
+        Style::default().fg(Color::White),
+    );
+}
+
+fn wrap_text_chunks(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return vec!["-".to_owned()];
+    }
+    chars
+        .chunks(width)
+        .map(|chunk| chunk.iter().collect())
+        .collect()
+}
+
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let count = s.chars().count();
+    if count <= max_chars {
+        s.to_owned()
+    } else if max_chars <= 3 {
+        s.chars().take(max_chars).collect()
+    } else {
+        let prefix: String = s.chars().take(max_chars - 3).collect();
+        format!("{prefix}...")
+    }
+}
+
+#[cfg(test)]
+mod layout_regressions {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn panel_fit_half_threshold_checks_both_dimensions() {
+        assert!(!panel_below_half(Rect::new(0, 0, 50, 5), 100, 10));
+        assert!(panel_below_half(Rect::new(0, 0, 49, 5), 100, 10));
+        assert!(panel_below_half(Rect::new(0, 0, 50, 4), 100, 10));
+        assert!(!panel_below_half(Rect::new(0, 0, 50, 5), 100, 9));
+        assert!(panel_below_half(Rect::new(0, 0, 50, 4), 100, 9));
+    }
+
+    #[test]
+    fn narrow_config_chips_remain_visible_and_clickable() {
+        for width in [38, 44, 60] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
+            let app = App::new();
+            let mut hit_map = HitMap::default();
+            terminal
+                .draw(|frame| render_config_and_plan(frame, frame.area(), &app, &mut hit_map))
+                .unwrap();
+            for (action, label) in [
+                (ClickAction::CycleCombineMode, "[Comb:Auto]"),
+                (ClickAction::CycleTreeStrategy, "[Tree:Krn..Sw]"),
+                (ClickAction::ToggleInputConversion, "[In:AutoResmp]"),
+            ] {
+                let (rect, _) = hit_map
+                    .regions()
+                    .iter()
+                    .find(|(_, candidate)| *candidate == action)
+                    .unwrap();
+                assert!(
+                    usize::from(rect.width) >= label.len(),
+                    "width {width}: {label}"
+                );
+                let rendered: String = (0..label.len())
+                    .map(|offset| {
+                        terminal.backend().buffer()[(rect.x + offset as u16, rect.y)].symbol()
+                    })
+                    .collect();
+                assert_eq!(rendered, label, "width {width}");
+                assert_eq!(hit_map.resolve(rect.x, rect.y), Some(action));
+            }
+        }
+    }
+
+    #[test]
+    fn spectrum_ruler_spans_resized_plot() {
+        for width in [42, 100, 160] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
+            let app = App::new();
+            let mut hit_map = HitMap::default();
+            terminal
+                .draw(|frame| render_spectroscope(frame, frame.area(), &app, &mut hit_map))
+                .unwrap();
+            let ruler: String = (1..width - 1)
+                .map(|x| terminal.backend().buffer()[(x, 7)].symbol())
+                .collect();
+            assert!(ruler.starts_with("20Hz"), "width {width}: {ruler}");
+            assert!(ruler.ends_with("20kHz"), "width {width}: {ruler}");
+            let position = ruler.find("1kHz").unwrap();
+            let expected =
+                ((f64::from(width - 3)) * (50.0_f64.ln() / 1000.0_f64.ln())).round() as usize;
+            assert!(
+                (position as isize + 2 - expected as isize).abs() <= 1,
+                "width {width}: {ruler}"
+            );
+        }
+    }
+}

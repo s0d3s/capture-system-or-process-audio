@@ -86,3 +86,38 @@ pub enum ClickAction {
     OpenDomainSettings(PermissionKind),
 }
 
+#[derive(Default)]
+pub struct HitMap {
+    regions: Vec<(Rect, ClickAction)>,
+}
+
+impl HitMap {
+    pub fn clear(&mut self) {
+        self.regions.clear();
+    }
+
+    pub fn register(&mut self, rect: Rect, action: ClickAction) {
+        if rect.width > 0 && rect.height > 0 {
+            self.regions.push((rect, action));
+        }
+    }
+
+    pub fn remove_overlapping(&mut self, area: Rect) {
+        self.regions
+            .retain(|(rect, _)| rect.intersection(area).is_empty());
+    }
+
+    pub fn resolve(&self, column: u16, row: u16) -> Option<ClickAction> {
+        let pos = Position::new(column, row);
+        for (rect, action) in self.regions.iter().rev() {
+            if rect.contains(pos) {
+                return Some(action.clone());
+            }
+        }
+        None
+    }
+
+    pub fn regions(&self) -> &[(Rect, ClickAction)] {
+        &self.regions
+    }
+}
