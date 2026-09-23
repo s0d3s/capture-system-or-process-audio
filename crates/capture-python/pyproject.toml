@@ -52,3 +52,23 @@ Repository = "https://github.com/s0d3s/capture-system-or-process-audio"
 Issues = "https://github.com/s0d3s/capture-system-or-process-audio/issues"
 Releases = "https://github.com/s0d3s/capture-system-or-process-audio/releases"
 
+[project.optional-dependencies]
+numpy = [
+    "numpy>=2.4.6; python_version == '3.11'",
+    "numpy>=2.5.5; python_version >= '3.12'",
+]
+
+[tool.maturin]
+python-source = "python"
+module-name = "capture_system_or_process_audio.capture_system_or_process_audio"
+bindings = "pyo3"
+include = [
+    { path = "README.md", format = ["sdist", "wheel"] },
+    { path = "THIRD_PARTY_NOTICES.md", format = ["sdist", "wheel"] },
+]
+exclude = [
+    { path = "website/**/*", format = "sdist" },
+    { path = "tools/docs/**/*", format = "sdist" },
+    { path = "**/__pycache__/**/*", format = ["sdist", "wheel"] },
+    { path = "**/*.pyc", format = ["sdist", "wheel"] },
+]
