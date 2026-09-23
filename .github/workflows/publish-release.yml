@@ -1,0 +1,410 @@
+name: Release & Dry-Run Artifacts
+
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_retention_days:
+        description: "Days to retain downloadable workflow artifacts"
+        required: false
+        type: number
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  preflight:
+    name: Preflight & Version Parity
+    runs-on: ubuntu-24.04
+    outputs:
+      is_release: ${{ steps.meta.outputs.is_release }}
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      version: ${{ steps.meta.outputs.version }}
+      is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
+      retention_days: ${{ steps.meta.outputs.retention_days }}
+      matrix: ${{ steps.meta.outputs.matrix }}
+      maturin_version: ${{ steps.meta.outputs.maturin_version }}
+      python_specs: ${{ steps.meta.outputs.python_specs }}
+      host_python: ${{ steps.meta.outputs.host_python }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain (rustfmt)
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          components: rustfmt
+
+      - name: Test release tooling
+        run: python3 -m unittest discover -s tools/release -p 'test_*.py'
+
+      - name: Verify manifest versions, tag parity, and formatting
+        id: meta
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF_VALUE: ${{ github.ref }}
+          INPUT_RETENTION: ${{ inputs.artifact_retention_days }}
+        run: |
+          set -euo pipefail
+          python3 tools/release/preflight.py
+
+  package-rust-crates:
+    name: Package & Verify Rust Crates
+    needs: preflight
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+
+      - name: Cache Cargo registry and build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            crates/capture-core
+            crates/capture
+
+      - name: Package 5 publishable crates and verify out-of-tree extracted .crate archives
+        env:
+          EXPECTED_VERSION: ${{ needs.preflight.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/release/package_crates.py
+
+      - name: Upload Rust .crate artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rust-crates
+          path: dist/crates/*.crate
+          if-no-files-found: error
+          retention-days: ${{ needs.preflight.outputs.retention_days }}
+
+  package-python-sdist:
+    name: Package & Verify Python sdist
+    needs: preflight
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: false
+
+      - name: Cache Cargo registry and build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            crates/capture-python
+
+      - name: Verify .pyi stub parity, build sdist, and test wheel build from sdist
+        shell: bash
+        env:
+          MATURIN_VERSION: ${{ needs.preflight.outputs.maturin_version }}
+          HOST_PYTHON: ${{ needs.preflight.outputs.host_python }}
+        run: bash tools/release/build_sdist.sh
+
+      - name: Upload Python sdist artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: python-sdist
+          path: dist/sdist/*.tar.gz
+          if-no-files-found: error
+          retention-days: ${{ needs.preflight.outputs.retention_days }}
+
+  build-target-artifacts:
+    name: Build & Verify (${{ matrix.label }})
+    needs: preflight
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.preflight.outputs.matrix) }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Linux build dependencies (ALSA headers for TUI demoplayback & patchelf)
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev patchelf binutils
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: false
+
+      - name: Cache Cargo registry and build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.label }}
+          workspaces: |
+            crates/capture-core
+            crates/capture
+            crates/capture-ffi
+            crates/capture-python
+            tools/cspa-tui-demo
+
+      - name: Provision managed CPython runtimes & maturin
+        shell: bash
+        env:
+          MATRIX_PLATFORM: ${{ matrix.platform }}
+          MATURIN_VERSION: ${{ needs.preflight.outputs.maturin_version }}
+          PYTHON_SPECS: ${{ needs.preflight.outputs.python_specs }}
+        run: |
+          set -euo pipefail
+          uv python install $PYTHON_SPECS
+          if [ "$MATRIX_PLATFORM" = "linux" ]; then
+            uv tool install "maturin[zig]==$MATURIN_VERSION"
+          else
+            uv tool install "maturin==$MATURIN_VERSION"
+          fi
+
+      - name: Run Rust unit, Clippy, and cross-platform facade tests
+        shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.target }}
+          BACKEND_MANIFEST: ${{ matrix.backend_crate }}
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: |
+          set -euo pipefail
+          cargo clippy --locked --manifest-path crates/capture-core/Cargo.toml --target "$RUST_TARGET" --features test-hooks --all-targets -- -D warnings
+          cargo test --locked --manifest-path crates/capture-core/Cargo.toml --target "$RUST_TARGET" --features test-hooks -- --test-threads=1
+
+          cargo clippy --locked --manifest-path "$BACKEND_MANIFEST" --target "$RUST_TARGET" --all-targets -- -D warnings
+          cargo test --locked --manifest-path "$BACKEND_MANIFEST" --target "$RUST_TARGET" --lib -- --test-threads=1
+
+          cargo clippy --locked --manifest-path crates/capture/Cargo.toml --target "$RUST_TARGET" --all-targets -- -D warnings
+          cargo test --locked --manifest-path crates/capture/Cargo.toml --target "$RUST_TARGET" --lib -- --test-threads=1
+          cargo test --locked --manifest-path crates/capture/Cargo.toml --target "$RUST_TARGET" --test cross_platform_api -- --test-threads=1
+
+          cargo clippy --locked --manifest-path crates/capture-ffi/Cargo.toml --target "$RUST_TARGET" --all-targets -- -D warnings
+          cargo test --locked --manifest-path crates/capture-ffi/Cargo.toml --target "$RUST_TARGET" --lib -- --test-threads=1
+
+      - name: Build & verify 3-wheel Python hybrid, C/C++ FFI SDK, and TUI studio demo
+        shell: bash
+        env:
+          PACKAGE_VERSION: ${{ needs.preflight.outputs.version }}
+          RUST_TARGET: ${{ matrix.target }}
+          MATRIX_PLATFORM: ${{ matrix.platform }}
+          CMAKE_ARCH: ${{ matrix.cmake_arch }}
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+          HOST_PYTHON: ${{ needs.preflight.outputs.host_python }}
+        run: |
+          set -euo pipefail
+          HOST_PY="$(uv python find --no-project --managed-python "$HOST_PYTHON")"
+          uv run --no-project --python "$HOST_PY" python tools/release/build_target.py
+
+      - name: Upload Python wheels (${{ matrix.label }})
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: python-wheels-${{ matrix.label }}
+          path: dist/wheels/*.whl
+          if-no-files-found: error
+          retention-days: ${{ needs.preflight.outputs.retention_days }}
+
+      - name: Upload C/C++ FFI SDK (${{ matrix.label }})
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cspa-ffi-sdk-${{ matrix.label }}
+          path: dist/ffi/*
+          if-no-files-found: error
+          retention-days: ${{ needs.preflight.outputs.retention_days }}
+
+      - name: Upload Studio TUI Demo (${{ matrix.label }})
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cspa-tui-demo-${{ matrix.label }}
+          path: dist/demo/*
+          if-no-files-found: error
+          retention-days: ${{ needs.preflight.outputs.retention_days }}
+
+  bundle-artifacts:
+    name: Assemble Verified Artifact Bundle & Checksums
+    needs:
+      - preflight
+      - package-rust-crates
+      - package-python-sdist
+      - build-target-artifacts
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download all built workflow artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: raw-artifacts
+
+      - name: Verify inventory completeness and write SHA256SUMS.txt
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
+          IS_RELEASE: ${{ needs.preflight.outputs.is_release }}
+        run: |
+          set -euo pipefail
+          python3 tools/release/bundle_artifacts.py
+
+      - name: Upload unified all-release-artifacts bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: all-release-artifacts-${{ needs.preflight.outputs.release_tag }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: ${{ needs.preflight.outputs.retention_days }}
+
+  github-release:
+    name: Attach Artifacts to GitHub Release
+    if: needs.preflight.outputs.is_release == 'true'
+    needs:
+      - preflight
+      - bundle-artifacts
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download verified release-assets bundle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: all-release-artifacts-${{ needs.preflight.outputs.release_tag }}
+          path: release-assets
+
+      - name: Attest build provenance for GitHub Release assets
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: "release-assets/*"
+
+      - name: Create or update GitHub Release and attach all artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
+          IS_PRERELEASE: ${{ needs.preflight.outputs.is_prerelease }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/* --clobber --repo "$GH_REPO"
+          else
+            CREATE_ARGS=(
+              release create "$RELEASE_TAG"
+              release-assets/*
+              --repo "$GH_REPO"
+              --verify-tag
+              --title "$RELEASE_TAG"
+              --generate-notes
+            )
+            if [ "$IS_PRERELEASE" = "true" ]; then
+              CREATE_ARGS+=(--prerelease)
+            fi
+            gh "${CREATE_ARGS[@]}"
+          fi
+
+  publish-crates-io:
+    name: Publish Rust Crates to crates.io (OIDC)
+    if: needs.preflight.outputs.is_release == 'true'
+    needs:
+      - preflight
+      - bundle-artifacts
+    runs-on: ubuntu-24.04
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/capture-system-or-process-audio
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+
+      - name: Authenticate with crates.io via OIDC Trusted Publishing
+        id: auth
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+
+      - name: Publish 5 Rust crates in strict topological order
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          PACKAGE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 tools/release/publish_crates.py
+
+  publish-pypi:
+    name: Publish Wheels & sdist to PyPI (OIDC + PEP 740)
+    if: needs.preflight.outputs.is_release == 'true'
+    needs:
+      - preflight
+      - bundle-artifacts
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/p/capture-system-or-process-audio
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download Python wheels and sdist
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: python-*
+          merge-multiple: true
+          path: pypi-dist
+
+      - name: Verify PyPI distribution count before upload
+        shell: bash
+        run: python3 tools/release/verify_pypi.py
+
+      - name: Publish to PyPI with Trusted Publishing & PEP 740 Attestations
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: pypi-dist
+          attestations: true
