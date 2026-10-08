@@ -29,3 +29,22 @@ temp_python
 !/.github/workflows/
 !/.github/workflows/**
 
+# Maturin / wheel outputs
+*.whl
+*.pdb
+*.ilk
+*.exp
+crates/capture-python/wheels/
+crates/capture-python/*.pyd
+crates/capture-python/*.so
+crates/capture-python/*.dylib
+
+# The MCP server is developed as its own repository colocated in this
+# workspace for convenience. It has its own .git directory and is
+# published separately; keep it out of the main repo entirely.
+/rusty-desktop-icons-mcp/
+
+# Scratch space for throwaway experiments / demo scripts.
+/c_part/
+.vscode/
+
