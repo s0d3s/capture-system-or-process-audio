@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://s0d3s.github.io/capture-system-or-process-audio/sitemap-index.xml

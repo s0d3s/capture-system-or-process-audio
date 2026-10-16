@@ -1,0 +1,164 @@
+/* Obsidian + Electric Cyan / Violet design system harmonized with assets/repo_banner.svg */
+:root {
+  --sl-font: 'Inter', 'Segoe UI', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  --sl-font-mono: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', Consolas, monospace;
+  --sl-content-width: 52rem;
+  --cspa-cyan: #22d3ee;
+  --cspa-violet: #c084fc;
+  --cspa-emerald: #34d399;
+  --cspa-amber: #fbbf24;
+}
+
+/* Dark theme (default) */
+:root,
+:root[data-theme='dark'] {
+  --sl-color-accent-low: #0e293d;
+  --sl-color-accent: #22d3ee;
+  --sl-color-accent-high: #a5f3fc;
+  --sl-color-bg: #080c15;
+  --sl-color-bg-nav: rgba(10, 15, 28, 0.88);
+  --sl-color-bg-sidebar: #0b101d;
+  --sl-color-hairline-shade: #1a243b;
+  --sl-color-hairline-light: #1e293b;
+  --cspa-card-bg: linear-gradient(180deg, rgba(17, 25, 44, 0.86), rgba(11, 16, 29, 0.94));
+  --cspa-card-border: rgba(56, 189, 248, 0.22);
+  --cspa-pill-bg: rgba(34, 211, 238, 0.1);
+}
+
+/* Light theme */
+:root[data-theme='light'] {
+  --sl-color-accent-low: #cffafe;
+  --sl-color-accent: #0284c7;
+  --sl-color-accent-high: #0c4a6e;
+  --sl-color-bg: #f8fafc;
+  --sl-color-bg-nav: rgba(248, 250, 252, 0.92);
+  --sl-color-bg-sidebar: #f1f5f9;
+  --cspa-card-bg: linear-gradient(180deg, #ffffff, #f8fafc);
+  --cspa-card-border: rgba(2, 132, 199, 0.22);
+  --cspa-pill-bg: rgba(2, 132, 199, 0.08);
+}
+
+header.header {
+  backdrop-filter: blur(12px);
+}
+
+/* Centered Landing Hero */
+.cspa-hero {
+  text-align: center;
+  margin: 0.5rem auto 2.25rem;
+  max-width: 58rem;
+}
+
+.cspa-hero-banner {
+  width: 100%;
+  height: auto;
+  border-radius: 1rem 1rem 0 0;
+  border: 1px solid var(--cspa-card-border);
+  box-shadow: 0 18px 48px -18px rgba(34, 211, 238, 0.22);
+  margin-bottom: 1.25rem;
+}
+
+.cspa-hero-lead {
+  font-size: clamp(1.08rem, 2vw, 1.28rem);
+  line-height: 1.55;
+  margin: 0.5rem auto 0.65rem;
+  max-width: 48rem;
+}
+
+.cspa-hero-sub {
+  font-size: 0.92rem;
+  opacity: 0.86;
+  margin: 0 auto 1rem;
+}
+
+.cspa-trust-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.35rem 0.9rem;
+  border-radius: 999px;
+  background: var(--cspa-pill-bg);
+  border: 1px solid var(--cspa-card-border);
+  font-size: 0.88rem;
+  margin-bottom: 1.25rem;
+}
+
+.cspa-cta-row {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+
+.cspa-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.6rem 1.2rem;
+  border-radius: 0.6rem;
+  font-weight: 600;
+  font-size: 0.94rem;
+  text-decoration: none;
+  transition: transform 0.14s ease, border-color 0.14s ease;
+}
+
+.cspa-btn:hover {
+  transform: translateY(-1px);
+}
+
+.cspa-btn-primary {
+  background: linear-gradient(135deg, #06b6d4, #8b5cf6);
+  color: #ffffff !important;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+}
+
+.cspa-btn-secondary {
+  background: var(--cspa-card-bg);
+  color: var(--sl-color-text) !important;
+  border: 1px solid var(--cspa-card-border);
+}
+
+/* Feature Grid Cards */
+.cspa-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(15.5rem, 1fr));
+  gap: 1rem;
+  margin: 1.5rem 0;
+}
+
+.cspa-card {
+  background: var(--cspa-card-bg);
+  border: 1px solid var(--cspa-card-border);
+  border-radius: 0.85rem;
+  padding: 1.15rem 1.25rem;
+}
+
+.cspa-card h3 {
+  margin-top: 0 !important;
+  font-size: 1.05rem;
+}
+
+/* Capability status badges */
+.cspa-cap-badge {
+  display: inline-block;
+  padding: 0.15rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.76rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  vertical-align: middle;
+}
+
+.cspa-cap-supported {
+  background: rgba(52, 211, 153, 0.14);
+  color: #34d399;
+  border: 1px solid rgba(52, 211, 153, 0.35);
+}
+
+.cspa-cap-gated {
+  background: rgba(56, 189, 248, 0.14);
+  color: #38bdf8;
+  border: 1px solid rgba(56, 189, 248, 0.35);
+}
+

@@ -1,0 +1,45 @@
+---
+import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
+import { CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+---
+
+<StarlightPage
+  frontmatter={{
+    title: 'Page Not Found',
+    description:
+      'The requested documentation page was not found. Jump back to the capture-system-or-process-audio manuals or SDK quick starts.',
+    template: 'splash',
+    editUrl: false,
+    pagefind: false,
+  }}
+>
+  <p>
+    The page you requested does not exist or has moved. Use the instant search bar above or jump to one of the main
+    sections below:
+  </p>
+
+  <CardGrid>
+    <LinkCard
+      title="Documentation Home"
+      description="Interactive 4-SDK switcher, capability overview, and OS matrix."
+      href={`${base}/`}
+    />
+    <LinkCard
+      title="Overview & Architecture"
+      description="Four-layer real-time design and explicit OS capability rules."
+      href={`${base}/getting-started/overview/`}
+    />
+    <LinkCard
+      title="Installation"
+      description="Install Python wheels, Rust crate, C++17/C11 SDK, or cspa-tui-demo."
+      href={`${base}/getting-started/installation/`}
+    />
+    <LinkCard
+      title="Multi-SDK API Reference"
+      description="Cross-SDK concordance for Python, Rust, C++17, and C11."
+      href={`${base}/reference/`}
+    />
+  </CardGrid>
+</StarlightPage>
