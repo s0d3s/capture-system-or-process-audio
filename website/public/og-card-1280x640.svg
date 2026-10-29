@@ -1,0 +1,25 @@
+﻿<svg width="1280" height="640" viewBox="0 0 1280 640" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1280" y2="640" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#070B14"/>
+      <stop offset="55%" stop-color="#0D1426"/>
+      <stop offset="100%" stop-color="#14112E"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="100" y1="0" x2="1180" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#22D3EE"/>
+      <stop offset="50%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#E879F9"/>
+    </linearGradient>
+  </defs>
+  <rect width="1280" height="640" fill="url(#bg)"/>
+  <rect x="28" y="28" width="1224" height="584" rx="28" fill="none" stroke="url(#accent)" stroke-width="3" opacity="0.55"/>
+  <path d="M120 150 H210 L245 96 L285 204 L330 74 L375 190 L415 126 L455 150 H1160" fill="none" stroke="url(#accent)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" opacity="0.85"/>
+  <text x="120" y="275" fill="#F8FAFC" font-family="Segoe UI, Inter, Arial, sans-serif" font-size="54" font-weight="800">capture-system-or-process-audio</text>
+  <text x="120" y="345" fill="#94A3B8" font-family="Segoe UI, Inter, Arial, sans-serif" font-size="30" font-weight="500">System Speakers · Single App/Process · Microphone PCM Capture &amp; Live Mixer</text>
+  <text x="120" y="402" fill="#22D3EE" font-family="Consolas, monospace" font-size="24" font-weight="600" textLength="1040" lengthAdjust="spacingAndGlyphs">WASAPI · PipeWire · PulseAudio · Core Audio Taps · ScreenCaptureKit — Zero Virtual Cables</text>
+  <rect x="120" y="462" width="310" height="54" rx="27" fill="#132038" stroke="#22D3EE" stroke-width="1.5"/>
+  <text x="275" y="497" text-anchor="middle" fill="#E2E8F0" font-family="Segoe UI, Arial, sans-serif" font-size="22" font-weight="700">Python · Rust · C++17 · C11</text>
+  <rect x="452" y="462" width="350" height="54" rx="27" fill="#1B1635" stroke="#C084FC" stroke-width="1.5"/>
+  <text x="627" y="497" text-anchor="middle" fill="#E2E8F0" font-family="Segoe UI, Arial, sans-serif" font-size="22" font-weight="700">Windows · Linux · macOS</text>
+  <text x="1160" y="497" text-anchor="end" fill="#CBD5E1" font-family="Segoe UI, Arial, sans-serif" font-size="22" font-style="italic">by @s0d3s (PyAudioWPatch)</text>
+</svg>

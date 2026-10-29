@@ -1,0 +1,81 @@
+---
+import { Image } from 'astro:assets';
+
+const { entry, id } = Astro.locals.starlightRoute;
+const isHome = id === '' || id === 'index';
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+---
+
+{
+  isHome ? (
+    <section class="cspa-hero">
+      <Image
+        src={`${base}/repo_banner.svg`}
+        alt="capture-system-or-process-audio — Cross-platform system speaker loopback, single application/process, and microphone PCM audio capture library for Python, Rust, C++17, and C11"
+        class="cspa-hero-banner"
+        width="1200"
+        height="400"
+        priority
+      />
+      <h1 id="_top" class="cspa-hero-h1">
+        {entry.data.title}
+      </h1>
+      <p class="cspa-hero-lead">
+        <strong>
+          Capture system speakers, isolate any single app/process, or mix microphones into one live PCM stream across
+          Windows, Linux &amp; macOS.
+        </strong>
+      </p>
+      <p class="cspa-hero-sub">
+        Native WASAPI · PipeWire · PulseAudio · Core Audio Process Taps · ScreenCaptureKit — zero virtual audio cables,
+        zero silent fallbacks.
+      </p>
+      <div class="cspa-trust-pill">
+        <span>
+          Created by <a href="https://github.com/s0d3s">@s0d3s</a> — author of{' '}
+          <a href="https://github.com/s0d3s/PyAudioWPatch">
+            <strong>PyAudioWPatch</strong>
+          </a>{' '}
+          (140,000+ monthly PyPI downloads, 340+ dependent repos) — nearly a year of ground-up safe-Rust engineering &amp; polish.
+        </span>
+      </div>
+      <div class="cspa-cta-row">
+        <a href={`${base}/getting-started/overview/`} class="cspa-btn cspa-btn-primary">
+          Read the Manual →
+        </a>
+        <a href="#live-4-sdk-quick-start" class="cspa-btn cspa-btn-secondary">
+          ⚡ 4-SDK Switcher ↓
+        </a>
+        <a href={`${base}/studio-demo/`} class="cspa-btn cspa-btn-secondary">
+          🎛️ Studio Demo
+        </a>
+        <a href={`${base}/reference/`} class="cspa-btn cspa-btn-secondary">
+          📚 API Reference
+        </a>
+      </div>
+    </section>
+  ) : (
+    <h1 id="_top" class="cspa-doc-h1">
+      {entry.data.title}
+    </h1>
+  )
+}
+
+<style>
+  .cspa-hero-h1 {
+    margin: 0.4rem 0 0.5rem;
+    font-size: clamp(1.85rem, 4vw, 2.75rem);
+    line-height: 1.15;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    color: var(--sl-color-white);
+  }
+
+  .cspa-doc-h1 {
+    margin-top: 1rem;
+    font-size: var(--sl-text-h1);
+    line-height: var(--sl-line-height-headings);
+    font-weight: 700;
+    color: var(--sl-color-white);
+  }
+</style>

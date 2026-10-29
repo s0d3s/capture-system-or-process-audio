@@ -1,0 +1,16 @@
+---
+interface Props {
+  status: 'supported' | 'gated' | 'planned';
+  label?: string;
+}
+
+const { status, label } = Astro.props;
+const defaultLabels = {
+  supported: 'Supported',
+  gated: 'OS-Version Gated',
+  planned: 'Planned — Next Release',
+};
+const text = label ?? defaultLabels[status];
+---
+
+<span class:list={['cspa-cap-badge', `cspa-cap-${status}`]}>{text}</span>

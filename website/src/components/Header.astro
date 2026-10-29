@@ -1,0 +1,134 @@
+---
+import config from 'virtual:starlight/user-config';
+import LanguageSelect from 'virtual:starlight/components/LanguageSelect';
+import Search from 'virtual:starlight/components/Search';
+import SiteTitle from 'virtual:starlight/components/SiteTitle';
+import ThemeSelect from 'virtual:starlight/components/ThemeSelect';
+
+const shouldRenderSearch =
+  config.pagefind || config.components.Search !== '@astrojs/starlight/components/Search.astro';
+
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const pathname = Astro.url.pathname;
+
+const navLinks = [
+  { label: 'Manual', href: `${base}/getting-started/overview/`, matches: ['/getting-started/', '/concepts/'] },
+  { label: 'SDKs', href: `${base}/sdks/`, matches: ['/sdks/', '/adapters/'] },
+  { label: 'Studio Demo', href: `${base}/studio-demo/`, matches: ['/studio-demo/'] },
+  { label: 'API Ref', href: `${base}/reference/`, matches: ['/reference/'] },
+];
+
+const registryPills = [
+  { label: 'PyPI', href: 'https://pypi.org/project/capture-system-or-process-audio/' },
+  { label: 'crates.io', href: 'https://crates.io/crates/capture-system-or-process-audio' },
+  { label: 'GitHub', href: 'https://github.com/s0d3s/capture-system-or-process-audio' },
+];
+---
+
+<div class="cspa-header">
+  <div class="title-wrapper sl-flex">
+    <SiteTitle />
+    <nav class="cspa-top-nav sl-hidden lg:sl-flex print:hidden" aria-label="Primary sections">
+      {
+        navLinks.map((item) => {
+          const active = item.matches.some((m) => pathname.includes(m));
+          return (
+            <a href={item.href} class:list={['cspa-nav-link', { active }]} aria-current={active ? 'page' : undefined}>
+              {item.label}
+            </a>
+          );
+        })
+      }
+    </nav>
+  </div>
+
+  <div class="sl-flex print:hidden cspa-search-slot">
+    {shouldRenderSearch && <Search />}
+  </div>
+
+  <div class="sl-hidden md:sl-flex print:hidden right-group">
+    <div class="sl-flex cspa-reg-pills">
+      {
+        registryPills.map((pill) => (
+          <a href={pill.href} class="cspa-reg-pill" target="_blank" rel="noopener noreferrer">
+            {pill.label}
+          </a>
+        ))
+      }
+    </div>
+    <ThemeSelect />
+    <LanguageSelect />
+  </div>
+</div>
+
+<style>
+  .cspa-header {
+    display: flex;
+    gap: 0.85rem;
+    justify-content: space-between;
+    align-items: center;
+    height: 100%;
+  }
+
+  .title-wrapper {
+    align-items: center;
+    gap: 1.15rem;
+    min-width: 0;
+  }
+
+  .cspa-top-nav {
+    align-items: center;
+    gap: 0.35rem;
+  }
+
+  .cspa-nav-link {
+    padding: 0.3rem 0.65rem;
+    border-radius: 0.45rem;
+    font-size: 0.88rem;
+    font-weight: 600;
+    color: var(--sl-color-gray-2);
+    text-decoration: none;
+    transition: color 0.15s ease, background 0.15s ease;
+    white-space: nowrap;
+  }
+
+  .cspa-nav-link:hover,
+  .cspa-nav-link.active {
+    color: var(--sl-color-accent-high);
+    background: var(--cspa-pill-bg);
+  }
+
+  .cspa-search-slot {
+    flex: 1;
+    justify-content: flex-end;
+    max-width: 20rem;
+  }
+
+  .right-group {
+    align-items: center;
+    gap: 0.75rem;
+  }
+
+  .cspa-reg-pills {
+    gap: 0.4rem;
+    align-items: center;
+    padding-inline-end: 0.65rem;
+    border-inline-end: 1px solid var(--sl-color-gray-5);
+  }
+
+  .cspa-reg-pill {
+    font-size: 0.76rem;
+    font-weight: 600;
+    padding: 0.2rem 0.52rem;
+    border-radius: 999px;
+    border: 1px solid var(--cspa-card-border);
+    background: var(--cspa-pill-bg);
+    color: var(--sl-color-text);
+    text-decoration: none;
+    white-space: nowrap;
+  }
+
+  .cspa-reg-pill:hover {
+    border-color: var(--sl-color-accent);
+  }
+</style>
