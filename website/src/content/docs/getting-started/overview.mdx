@@ -1,0 +1,44 @@
+---
+title: Overview & Architecture
+description: Understand what capture-system-or-process-audio captures, its four-layer real-time architecture invariant, and explicit cross-platform capability rules.
+---
+
+`capture-system-or-process-audio` is a cross-platform native audio capture and live-mixing engine written in safe Rust with first-class bindings for **Python (`3.11`–`3.15t`)**, **Rust (`1.88+`)**, **C++17 (`cspa.hpp`)**, and **C11 (`cspa_experimental.h`)**.
+
+Instead of asking end users to install kernel virtual audio cables (`VB-Cable`, `BlackHole`, `Soundflower`) or manually stitching disparate OS APIs together, you describe **what** audio target(s) you want via `CaptureTarget` and consume a deterministic stream of decoded PCM frames.
+
+---
+
+## What You Can Capture
+
+1. **System Speaker Loopback (`default_output`, `device`):** Capture audio playing on the user's speakers or headphones — automatically following OS default-endpoint changes (`DefaultDeviceMode::Follow`, default) or pinning a specific endpoint (`DefaultDeviceMode::Pin`).
+2. **Single Application or Process Tree (`find_app`, `process`):** Isolate audio from a single application (`Spotify`, `Zoom`, `Firefox`, or a game) and its audio helper child processes (`ProcessScope::Tree`) or a single exact process/bundle (`ProcessScope::Exact` where supported by the OS backend).
+3. **Microphones & Audio Input Endpoints (`microphone`, `input_device`):** Capture default or specific microphones with automatic Linux `.monitor` sink exclusion and live default-input switching.
+4. **Multi-Source Live Mixing & Format Conversion (`CspaMixer` + `OutputConverter`):** Combine heterogeneous targets — even across distinct native backends such as `[ScreenCaptureKit + CoreAudio]` on macOS or `[PipeWire + PulseAudio]` on Linux — into one synchronized PCM stream at your exact target rate, channel count, and sample format (`F32`, `I16`, `I24`, `I32`).
+
+---
+
+## The Four-Layer Architecture Invariant
+
+Every crate and language binding in this project obeys one strict architectural boundary:
+
+> **Backends capture. Core orders and buffers. Manager plans, monitors, mixes and reopens sessions. Adapters adapt.**
+
+| Layer | Responsibility | Key Guarantees |
+| --- | --- | --- |
+| **1. OS Backends** (`WASAPI`, `PipeWire`, `PulseAudio`, `Core Audio`, `ScreenCaptureKit`) | Acquire raw native audio packets from one OS session (`AudioStream`) and query OS device/process/permission state. | Never allocates unboundedly on real-time audio threads; never silently widens capture scope; Linux dynamically `dlopen`s `libpipewire-0.3.so.0` and `libpulse.so.0` (`0` compile-time `NEEDED` links). |
+| **2. Safe-Rust Core** (`#![forbid(unsafe_code)]`) | Preallocated slot pools (`StorageBudget`), lock-free SPSC packet ordering, `1025x64` polyphase `InputNormalizer + FrameReblocker`, `CspaMixer`, and `OutputConverter`. | `0` unsafe blocks in core; warmed `read_into` performs **0 steady-state heap allocations**. |
+| **3. Capture Manager** (`CaptureManager` / `ManagedStream`) | Side-effect-free `inspect()` planning, single-target zero-extra-copy `PassThrough`, `SharedNativeGraphMix` / `CspaMixer` orchestration, `Follow` endpoint switching, `OnRootExit::Wait` relaunch tracking, and two-tier live `update_targets` hot-swap. | Enforces aggregate budgets (`16` active streams, `16 MiB` PCM pool cap, `2000 ms` bounded cleanup). |
+| **4. Language Bindings & Adapters** (`Python`, `Rust`, `C++17`, `C11`) | Zero-copy PEP 3118 `memoryview` & NumPy views, `asyncio`, callbacks, C11 `#[repr(C)]` wire ABI (`catch_unwind`), and C++17 RAII (`Result<T>` & `*_or_throw()`). | Zero OS-specific `#[cfg]` leaks in binding crates; native Free-Threaded Python `3.14t`/`3.15t` (`Py_MOD_GIL_NOT_USED`) safety. |
+
+---
+
+## Explicit Capability & Non-Fallback Contract
+
+Audio capture capabilities differ fundamentally across operating systems:
+
+- **Zero silent scope broadening:** Requesting `scope="exact"` on Windows WASAPI (whose kernel process loopback is strictly tree-scoped) fails immediately with `CapabilityError::UnsupportedScope` rather than silently capturing child processes or full system audio.
+- **Identity-safe process tracking:** Process targets validate `(pid, process_start_time)` (`FILETIME` on Windows, `/proc/<pid>/stat` `starttime` on Linux, `proc_pidinfo` `pbi_start_tvsec` on macOS) so recycled OS PIDs are never misidentified.
+- **Side-effect-free inspection:** Calling `request.inspect()` resolves backends, mixing strategy (`PassThrough`, `SharedNativeGraphMix`, or `CspaMixer`), and memory budgets **without** opening audio streams or triggering OS permission dialogs.
+
+Next, head to [Installation](/capture-system-or-process-audio/getting-started/installation/) or [Choosing an API](/capture-system-or-process-audio/getting-started/choosing-an-api/).

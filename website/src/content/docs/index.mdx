@@ -1,0 +1,190 @@
+---
+title: capture-system-or-process-audio
+description: Cross-platform system speaker loopback, single application/process, and microphone PCM audio capture & live mixer for Python, Rust, C++17, and C11.
+template: splash
+editUrl: false
+---
+
+import { Card, CardGrid, LinkCard, TabItem } from '@astrojs/starlight/components';
+import SdkTabs from '../../components/SdkTabs.astro';
+import CapabilityBadge from '../../components/CapabilityBadge.astro';
+
+## Live 4-SDK Quick Start
+
+Pick your language — your selection stays synced across every guide on this site:
+
+<SdkTabs>
+  <TabItem label="Python (3.11–3.15t)">
+    ```bash
+    pip install "capture-system-or-process-audio[numpy]"
+    python -m capture_system_or_process_audio
+    ```
+
+    ```python
+    import capture_system_or_process_audio as cspa
+
+    # List & filter active audio apps deterministically (or use cspa.find_app("Zoom")):
+    apps = [a for a in cspa.discover().applications if a.active_audio is True]
+    app_target = apps[0].with_gain(0.9) if apps else cspa.default_output()
+
+    # Mix default microphone + app into one 16 kHz mono float32 stream for Whisper / STT:
+    converter = cspa.OutputConverter(rate=16000, channels=1, sample_format="f32")
+
+    with cspa.capture(
+        [cspa.microphone(), app_target],
+        output_converter=converter,
+        silence_on_idle=True,
+    ) as stream:
+        outcome = stream.read(frames=1600, timeout_ms=200)  # 100 ms @ 16 kHz
+        for block in outcome.blocks:
+            samples = block.to_numpy()  # zero-copy view, shape: (frames, 1), dtype: float32
+    ```
+  </TabItem>
+  <TabItem label="Rust (1.88+)">
+    ```bash
+    cargo add capture-system-or-process-audio
+    ```
+
+    ```rust
+    use capture_system_or_process_audio::{
+        CapabilityError, CaptureTarget, DefaultDeviceMode, Stop, capture_single,
+    };
+    use std::time::Duration;
+
+    fn main() -> Result<(), CapabilityError> {
+        let target = CaptureTarget::default_output(DefaultDeviceMode::Follow);
+        let mut manager = capture_single(target)?;
+
+        let fmt = manager.output_format().expect("active output format").clone();
+        let mut pcm_buf = vec![0u8; 480 * fmt.bytes_per_frame()];
+
+        // Zero-allocation steady-state pull into caller-owned buffer:
+        let res = manager
+            .read_into(&mut pcm_buf, 480, Duration::from_millis(200))
+            .expect("read PCM frames");
+        println!("Captured {} frames @ {} Hz", res.frames, fmt.rate());
+
+        manager.stop(Stop::Drain);
+        manager.wait_cleanup(Duration::from_secs(2));
+        Ok(())
+    }
+    ```
+  </TabItem>
+  <TabItem label="C++17 RAII">
+    ```cmake
+    cmake_minimum_required(VERSION 3.20)
+    project(audio_example LANGUAGES CXX)
+
+    find_package(Cspa REQUIRED CONFIG)
+    add_executable(example main.cpp)
+    target_compile_features(example PRIVATE cxx_std_17)
+    target_link_libraries(example PRIVATE Cspa::cspa_ffi)
+    ```
+
+    ```cpp
+    #include <cspa.hpp>
+    #include <cstdio>
+    #include <vector>
+
+    int main() {
+        auto speaker = cspa::Target::default_output(cspa::DefaultDeviceMode::Follow).take_value();
+        auto mic     = cspa::Target::microphone(cspa::DefaultDeviceMode::Follow).take_value();
+
+        cspa::MixerConfig mixer;
+        mixer.set_silence_on_idle(true);
+
+        cspa::CaptureRequest req({speaker, mic});
+        req.set_mixer_config(mixer)
+           .set_output_converter(cspa::OutputConverter(48000, 2, cspa::SampleFormat::F32));
+
+        auto stream_res = cspa::ManagedStream::open(req);
+        if (!stream_res.is_ok()) return 1;
+        cspa::ManagedStream stream = stream_res.take_value();
+
+        std::vector<uint8_t> pcm(480 * 2 * sizeof(float));
+        auto rd = stream.read_into(pcm.data(), pcm.size(), 480, 200);
+        if (rd.is_ok()) {
+            std::printf("Captured %llu mixed frames\n", static_cast<unsigned long long>(rd.value().frames));
+        }
+
+        stream.stop(false);
+        stream.wait_cleanup(2000);
+        return 0;
+    }
+    ```
+  </TabItem>
+  <TabItem label="C11 ABI">
+    ```c
+    #include <cspa_experimental.h>
+    #include <stdint.h>
+    #include <stdio.h>
+
+    int main(void) {
+        if (cspa_abi_check(CSPA_EXPERIMENTAL_ABI_MAJOR, CSPA_EXPERIMENTAL_SCHEMA_REVISION) != CSPA_STATUS_OK) {
+            return 1;
+        }
+
+        cspa_capture_target_record target = {0};
+        target.struct_size = (uint32_t)sizeof(target);
+        target.schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+        if (cspa_target_default_output(CSPA_DEFAULT_DEVICE_FOLLOW, 1.0f, &target) != CSPA_STATUS_OK) {
+            return 1;
+        }
+
+        cspa_stream *stream = NULL;
+        if (cspa_stream_open(&target, CSPA_OVERFLOW_DROP_OLDEST, &stream) != CSPA_STATUS_OK) {
+            return 1;
+        }
+
+        uint8_t buffer[480 * 8];
+        cspa_managed_read_outcome_record out = {0};
+        out.struct_size = (uint32_t)sizeof(out);
+        out.schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+
+        if (cspa_stream_read_into(stream, buffer, sizeof(buffer), 480u, 200u, NULL, &out) == CSPA_STATUS_OK) {
+            printf("Read %llu frames (%llu bytes)\n",
+                   (unsigned long long)out.actual_frames,
+                   (unsigned long long)out.copy_bytes);
+        }
+
+        cspa_stream_stop(stream, 0u);
+        uint32_t cleaned = 0;
+        cspa_stream_wait_cleanup(stream, 2000u, &cleaned);
+        cspa_stream_release(stream);
+        return 0;
+    }
+    ```
+  </TabItem>
+</SdkTabs>
+
+---
+
+## Core Capabilities
+
+<CardGrid>
+  <Card title="System Speaker Loopback" icon="rocket">
+    Capture whatever is playing on speakers or headphones without installing VB-Cable, BlackHole, or Soundflower — automatically tracking OS default-endpoint switches in `Follow` mode.
+  </Card>
+  <Card title="Single App & Process Isolation" icon="puzzle">
+    Record audio from *only* `Spotify`, `Zoom`, `Firefox`, or a game (including helper child processes where supported) without capturing unrelated desktop notifications.
+  </Card>
+  <Card title="Microphones & Audio Inputs" icon="setting">
+    Capture default or specific microphones with automatic Linux `.monitor` sink exclusion and event-driven default-input handover.
+  </Card>
+  <Card title="Drift-Synced Live Mixer & Resampler" icon="list-format">
+    Combine `[microphone(), find_app("Zoom")]` via `CspaMixer` into one clock-drift-compensated PCM stream converted on the fly to `16 kHz` mono `f32`/`i16`, `44.1 kHz`, or `48 kHz` stereo.
+  </Card>
+  <Card title="Honest 5-State OS Permissions" icon="approve-check-circle">
+    Preflight or prompt macOS TCC (`Microphone`, `SystemAudio`, `ScreenRecording`) and Windows `ConsentStore` / GPO with macOS missing-`Info.plist` `SIGABRT` protection.
+  </Card>
+  <Card title="Zero-Allocation Real-Time Core" icon="star">
+    Preallocated bounded slot pools perform **0 heap allocations** on warmed `read_into` loops across Rust, Free-Threaded Python `3.14t`/`3.15t` (`-Xgil=0`), C++17, and C11.
+  </Card>
+</CardGrid>
+
+---
+
+## Why Beyond `PyAudioWPatch`?
+
+Four years ago, [`@s0d3s`](https://github.com/s0d3s) created **[`PyAudioWPatch`](https://github.com/s0d3s/PyAudioWPatch)** to bring Windows WASAPI speaker loopback to Python's `PyAudio`. Today it is the standard Windows loopback package in the Python ecosystem — serving **140,000+ monthly PyPI downloads** (`~1.6M+` annually) and powering **340+ open-source repositories** across AI meeting copilots, live Whisper/STT transcription bots, voice agents, and desktop recorders.
+

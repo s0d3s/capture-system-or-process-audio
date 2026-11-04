@@ -1,0 +1,144 @@
+---
+title: Choosing an API
+description: Decide between CaptureManager and AudioStream, Follow vs Pin device modes, Tree vs Exact process scopes, and owned vs zero-allocation read_into loops.
+---
+
+import { TabItem } from '@astrojs/starlight/components';
+import SdkTabs from '../../../components/SdkTabs.astro';
+
+Every SDK exposes the same core building blocks. Use the decision tables below to pick the cleanest path for your workload.
+
+---
+
+## 1. `CaptureManager` (`capture`) vs `AudioStream` (`open_stream`)
+
+| Question | Use `CaptureManager` / `ManagedStream` *(Recommended Default)* | Use `AudioStream` *(Advanced Single-Session)* |
+| --- | --- | --- |
+| **Single speaker, mic, or app?** | ✅ Uses zero-extra-copy `PassThrough` automatically when no mixing/conversion is needed. | ✅ Opens one raw OS session directly. |
+| **Follow OS default speaker/mic switches?** | ✅ `DefaultDeviceMode::Follow` seamlessly closes old and opens new endpoints. | ❌ Never monitors device switches (`Follow` requires `CaptureManager`). |
+| **Mix multiple sources (`[mic, app]`)?** | ✅ Orchestrates `SharedNativeGraphMix` or `CspaMixer` automatically. | ❌ Single target only. |
+| **Resample / convert format (`16 kHz` `i16`/`f32`)?** | ✅ Built-in `OutputConverter` + `silence_on_idle`. | ❌ Native OS device format only. |
+| **Wait for app relaunch (`OnRootExit::Wait`) or hot-swap targets?** | ✅ Supported (`update_targets`). | ❌ Ends on session exit. |
+
+---
+
+## 2. `Follow` vs `Pin` Default Endpoints
+
+- **`Follow` *(Default)*:** When a user plugs in USB/Bluetooth headphones or changes their default microphone in OS settings, `CaptureManager` detects the change via native event listeners (`IMMNotificationClient`, PipeWire/Pulse metadata, `AudioObjectAddPropertyListener`) and transitions the stream automatically, emitting a `Boundary` marker so downstream consumers know when hardware changed.
+- **`Pin`:** Resolves the current default output or microphone ID once at open time and stays bound to that specific endpoint even if the OS default changes later.
+
+---
+
+## 3. Read Delivery Patterns (`read` vs `read_into` vs `asyncio` vs Callbacks)
+
+<SdkTabs>
+  <TabItem label="Python">
+    ```python
+    import capture_system_or_process_audio as cspa
+
+    # Pattern A — Zero-copy PcmBlock views (great for NumPy / batch consumers):
+    with cspa.capture(cspa.default_output(), silence_on_idle=True) as stream:
+        outcome = stream.read(frames=480, timeout_ms=200)
+        for block in outcome.blocks:
+            view = memoryview(block)  # PEP 3118 zero-copy read-only view
+
+    # Pattern B — Zero-allocation read_into (0 steady-state heap allocs, safe on 3.14t/3.15t -Xgil=0):
+    conv = cspa.OutputConverter(rate=48000, channels=2, sample_format="i16")
+    with cspa.capture(cspa.default_output(), output_converter=conv, silence_on_idle=True) as stream:
+        reusable = bytearray(480 * 2 * 2)
+        into_res = stream.read_into(reusable, frames=480, timeout_ms=200)
+        print("Frames written:", into_res.frames)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use capture_system_or_process_audio::{
+        CapabilityError, CaptureTarget, DefaultDeviceMode, MixerConfig, Stop, CaptureManager, request,
+    };
+    use std::time::Duration;
+
+    fn main() -> Result<(), CapabilityError> {
+        let target = CaptureTarget::default_output(DefaultDeviceMode::Follow);
+        let req = request(vec![target]).with_mixer_config(MixerConfig {
+            silence_on_idle: true,
+            ..MixerConfig::default()
+        });
+        let mut mgr = CaptureManager::open(req)?;
+
+        let fmt = mgr.output_format().expect("format").clone();
+        let mut buf = vec![0u8; 480 * fmt.bytes_per_frame()];
+        let _ = mgr.read_into(&mut buf, 480, Duration::from_millis(200));
+
+        mgr.stop(Stop::Drain);
+        mgr.wait_cleanup(Duration::from_secs(2));
+        Ok(())
+    }
+    ```
+  </TabItem>
+  <TabItem label="C++17">
+    ```cpp
+    #include <cspa.hpp>
+    #include <vector>
+
+    int main() {
+        auto target = cspa::Target::default_output(cspa::DefaultDeviceMode::Follow).take_value();
+        cspa::MixerConfig mixer;
+        mixer.set_silence_on_idle(true);
+
+        cspa::CaptureRequest req({target});
+        req.set_mixer_config(mixer);
+
+        auto mgr_res = cspa::ManagedStream::open(req);
+        if (!mgr_res.is_ok()) return 1;
+        auto mgr = mgr_res.take_value();
+
+        std::vector<uint8_t> buf(480 * 8);
+        auto _ = mgr.read_into(buf.data(), buf.size(), 480, 200);
+        mgr.stop(false);
+        mgr.wait_cleanup(2000);
+        return 0;
+    }
+    ```
+  </TabItem>
+  <TabItem label="C11">
+    ```c
+    #include <cspa_experimental.h>
+    #include <stdint.h>
+
+    int main(void) {
+        cspa_capture_target_record t = {0};
+        t.struct_size = (uint32_t)sizeof(t);
+        t.schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+        if (cspa_target_default_output(CSPA_DEFAULT_DEVICE_FOLLOW, 1.0f, &t) != CSPA_STATUS_OK) return 1;
+
+        cspa_capture_request_record req = {0};
+        cspa_capture_request_init(&req, &t, 1u);
+
+        cspa_manager *mgr = NULL;
+        if (cspa_manager_open(&req, &mgr) != CSPA_STATUS_OK) return 1;
+
+        uint8_t buf[480 * 8];
+        cspa_managed_read_outcome_record out = {0};
+        out.struct_size = (uint32_t)sizeof(out);
+        out.schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+        (void)cspa_manager_read_into(mgr, buf, sizeof(buf), 480u, 200u, NULL, &out);
+
+        cspa_manager_stop(mgr, 0u);
+        uint32_t cleaned = 0;
+        cspa_manager_wait_cleanup(mgr, 2000u, &cleaned);
+        cspa_manager_release(mgr);
+        return 0;
+    }
+    ```
+  </TabItem>
+</SdkTabs>
+
+---
+
+## 4. When Should You Enable `silence_on_idle`?
+
+On Windows WASAPI loopback and per-process taps, the OS emits **zero packets** while all audio playback is paused.
+- Leave `silence_on_idle=False` *(default)* when recording only active audio bursts or event-driven streams.
+- Set **`silence_on_idle=True`** whenever feeding continuous wall-clock consumers (WebRTC, Discord bots, VADs, or `PyAudio`-style blocking loops) so idle periods emit metadata-flagged silent frames (`synthesized_silence = true`) instead of timing out.
+
+Explore [SDK Overview & Quick Starts](/capture-system-or-process-audio/sdks/) or [Multi-SDK API Reference](/capture-system-or-process-audio/reference/) next.

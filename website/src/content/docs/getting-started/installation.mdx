@@ -1,0 +1,156 @@
+---
+title: Installation
+description: Install prebuilt Python wheels (3.11-3.15t), the safe-Rust Cargo crate, the C11/C++17 CMake FFI SDK, or the standalone cspa-tui-demo binary.
+---
+
+import { FileTree, Steps, TabItem } from '@astrojs/starlight/components';
+import SdkTabs from '../../../components/SdkTabs.astro';
+
+Choose your target SDK or download the standalone terminal studio demo:
+
+<SdkTabs>
+  <TabItem label="Python (3.11–3.15t)">
+    Prebuilt binary wheels (`cp311-abi3`, `cp314-cp314t`, and PEP 803 `cp315-abi3.abi3t`) are published on PyPI for **Windows (`x64`, `ARM64`)**, **Linux (`x86_64`, `aarch64` `manylinux_2_28`)**, and **macOS (`Apple Silicon arm64`)** with **zero mandatory runtime dependencies**:
+
+    ```bash
+    pip install capture-system-or-process-audio
+
+    # Optional: enable zero-copy 2D NumPy views via block.to_numpy(copy=False)
+    pip install "capture-system-or-process-audio[numpy]"
+    ```
+
+    Using `uv`:
+
+    ```bash
+    uv add capture-system-or-process-audio
+    ```
+
+    Inspect your current OS platform, active audio backends, permissions, and live `CaptureTarget` table directly from the terminal:
+
+    ```bash
+    python -m capture_system_or_process_audio
+    ```
+
+    Or verify OS recording permissions programmatically without opening a stream:
+
+    ```python
+    import capture_system_or_process_audio as cspa
+
+    report = cspa.check_permissions()
+    print("OS:", report.os.value, "All granted:", report.is_granted)
+    ```
+  </TabItem>
+  <TabItem label="Rust (1.88+)">
+    Add the unified `#![forbid(unsafe_code)]` facade crate (`MSRV 1.88`) from `crates.io`:
+
+    ```bash
+    cargo add capture-system-or-process-audio
+    ```
+
+    Verify plan resolution with zero hardware side effects:
+
+    ```rust
+    use capture_system_or_process_audio::{
+        CaptureTarget, DefaultDeviceMode, check_permissions, request,
+    };
+
+    let speaker = CaptureTarget::default_output(DefaultDeviceMode::Follow);
+    let plan = request(vec![speaker.clone()]).inspect()?;
+    let perms = check_permissions(&[speaker])?;
+    println!(
+        "Combine: {:?}, SystemAudio granted: {}",
+        plan.combine_resolution,
+        perms.system_audio().is_granted()
+    );
+    ```
+  </TabItem>
+  <TabItem label="C++17 (CMake SDK)">
+    <Steps>
+      1. Download `cspa-ffi-<version>-<target>.zip` (Windows) or `.tar.gz` (Linux / macOS) from [GitHub Releases](https://github.com/s0d3s/capture-system-or-process-audio/releases/latest) and extract the archive:
+
+         <FileTree>
+         - cspa-ffi-1.3.1-target/
+           - include/
+             - cspa.hpp
+             - cspa_experimental.h
+           - lib/
+             - cmake/
+               - Cspa/
+                 - CspaConfig.cmake
+                 - CspaConfigVersion.cmake
+             - cspa_ffi.dll.lib / libcspa_ffi.so / libcspa_ffi.dylib
+           - bin/
+             - cspa_ffi.dll *(Windows)*
+           - LICENSE-MIT
+           - LICENSE-APACHE
+           - THIRD_PARTY_NOTICES.md
+         </FileTree>
+
+      2. Point `CMAKE_PREFIX_PATH` or `Cspa_DIR` at the extracted SDK root in your `CMakeLists.txt`:
+
+         ```cmake
+         cmake_minimum_required(VERSION 3.20)
+         project(my_audio_app LANGUAGES CXX)
+
+         find_package(Cspa REQUIRED CONFIG)
+
+         add_executable(my_audio_app main.cpp)
+         target_compile_features(my_audio_app PRIVATE cxx_std_17)
+         target_link_libraries(my_audio_app PRIVATE Cspa::cspa_ffi)
+
+         if(WIN32)
+           add_custom_command(TARGET my_audio_app POST_BUILD
+             COMMAND ${CMAKE_COMMAND} -E copy_if_different
+               $<TARGET_FILE:Cspa::cspa_ffi>
+               $<TARGET_FILE_DIR:my_audio_app>)
+         endif()
+         ```
+
+      3. Configure & build:
+
+         ```bash
+         cmake -B build -DCMAKE_PREFIX_PATH=/path/to/cspa-ffi-sdk
+         cmake --build build --config Release
+         ```
+    </Steps>
+  </TabItem>
+  <TabItem label="C11 (FFI SDK)">
+    Link `Cspa::cspa_ffi` via CMake (or pass `-Iinclude` and link `cspa_ffi` directly) and validate the wire schema revision at startup:
+
+    ```c
+    #include <cspa_experimental.h>
+    #include <stdio.h>
+
+    int main(void) {
+        if (cspa_abi_check(CSPA_EXPERIMENTAL_ABI_MAJOR, CSPA_EXPERIMENTAL_SCHEMA_REVISION) != CSPA_STATUS_OK) {
+            fprintf(stderr, "ABI mismatch\n");
+            return 1;
+        }
+        cspa_permission_report_record report = {0};
+        cspa_permission_report_init(&report);
+        if (cspa_permissions_check(NULL, 0, NULL, &report) == CSPA_STATUS_OK) {
+            printf("Permissions checked (is_granted=%u)\n", report.is_granted);
+        }
+        return 0;
+    }
+    ```
+  </TabItem>
+</SdkTabs>
+
+---
+
+## Linux Runtime Shared Libraries :badge[0 NEEDED Links]{variant=success}
+
+Prebuilt Linux wheels, Rust binaries, and `libcspa_ffi.so` dynamically load `libpipewire-0.3.so.0` (`>= 0.3.65`) and/or `libpulse.so.0` (`>= 15.0`) at runtime via `dlopen`. Your binary starts cleanly even on minimal containers where neither audio server is installed, and activates whichever server is running on desktop hosts.
+
+---
+
+## Prebuilt Interactive Studio Demo (`cspa-tui-demo`)
+
+Want to explore live applications, processes, microphones, execution plans, and real-time FFT/Waterfall/Oscilloscope views before writing code? Download `cspa-tui-demo-<version>-<target>` from [GitHub Releases](https://github.com/s0d3s/capture-system-or-process-audio/releases/latest) or run from source:
+
+```bash
+cargo run --release --manifest-path tools/cspa-tui-demo/Cargo.toml
+```
+
+Continue to [Choosing an API](/capture-system-or-process-audio/getting-started/choosing-an-api/).
