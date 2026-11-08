@@ -1,0 +1,239 @@
+---
+title: Live Target Discovery & Subscriptions
+description: Enumerate audio-producing applications, processes, speakers, and microphones with parent-tree roll-up, PerBackend vs ByLogicalTarget queries, and 256-event cursor subscriptions.
+---
+
+import { Aside, TabItem } from '@astrojs/starlight/components';
+import SdkTabs from '../../../components/SdkTabs.astro';
+
+`Discovery` provides both zero-background-thread snapshots (`discover`, `discover_query`, `find_app`) and bounded real-time change streams (`subscribe_discovery` / `subscribe_query`).
+
+---
+
+## 1. Parent-Tree Application Roll-Up
+
+Desktop apps frequently spawn multiple child processes (`chrome.exe` audio service utility, `firefox` `plugin-container`, macOS `.app/Contents/Frameworks/... Helper.app`, or Linux Flatpak/D-Bus scopes). Naive PID listing floods pickers with cryptic helper processes or merges unrelated scripts.
+
+`Discovery` solves this deterministically across Windows, Linux, and macOS:
+
+1. **Collapses helpers into their owning application root:** Child audio helpers roll up into the top-level application (`Google Chrome`, `Spotify`, `Zoom`) using outermost `.app` bundle identity on macOS (canonicalizing `.code_sign_clone` paths), install-directory & executable hierarchy on Windows, and `/proc/<pid>/cmdline` + `cgroup` (`app-flatpak-*`, `dbus-*`) entrypoints on Linux.
+2. **Stops before OS shells, session hosts, and runtime interpreters:** Upward traversal halts before `explorer.exe`, `svchost.exe`, `cmd.exe`, `pwsh.exe`, `systemd`, `gnome-shell`, `launchd`, `Finder`, `Dock`, or shared interpreters (`python3`, `node`, `gjs-console`), so launching Chrome from VS Code's terminal never merges Chrome's audio into VS Code, and two unrelated Python apps never merge together.
+3. **Excludes `.monitor` loopback sinks from microphones:** On Linux PipeWire and PulseAudio, virtual monitor sources (`*.monitor` and internal `cspa-mix-*` nodes) are automatically excluded from `input_devices` so microphone pickers only list real physical or virtual capture inputs.
+
+---
+
+## 2. Deterministic Target Filtering vs `find_app(NAME)`
+
+`find_app("Spotify")` is a convenient single-match helper, but string matching alone is **not deterministic** when multiple instances share a name (for example, two browser profiles or Python/Java workers — where `find_app` rejects an ambiguous match rather than guessing) or when display names differ across OS locales and Flatpak/bundle IDs.
+
+For deterministic production selection, enumerate `CaptureTarget`s via `discover` / `discover_query`, filter explicitly on `active_audio`, `pid`, `executable_path`, `app_id`, or `device_id`, optionally refine with `with_gain(...)` or `with_backend(...)`, and pass those exact `CaptureTarget` records directly into `capture` / `CaptureManager`:
+
+<SdkTabs>
+  <TabItem label="Python">
+    ```python
+    import os
+    import capture_system_or_process_audio as cspa
+
+    catalog = cspa.discover(active_only=False)
+    my_pid = os.getpid()
+
+    # Filter deterministically by audio state, PID, executable_path, or app_id:
+    selected = [
+        app.with_gain(0.9)
+        for app in catalog.applications
+        if app.active_audio is True and app.pid != my_pid
+    ][:2] or [cspa.default_output()]
+
+    with cspa.capture(selected, silence_on_idle=True) as stream:
+        outcome = stream.read(480, timeout_ms=200)
+        print("Captured frames:", outcome.frames)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use capture_system_or_process_audio::{
+        CapabilityError, CaptureManager, CaptureTarget, DefaultDeviceMode, DiscoveryQuery,
+        Stop, discover_query, request,
+    };
+    use std::time::Duration;
+
+    fn capture_filtered() -> Result<(), CapabilityError> {
+        let catalog = discover_query(&DiscoveryQuery::default())?;
+        let self_pid = std::process::id();
+
+        let mut selected: Vec<CaptureTarget> = catalog
+            .applications
+            .iter()
+            .filter(|app| app.active_audio() == Some(true) && app.pid() != Some(self_pid))
+            .take(2)
+            .filter_map(|app| app.clone().with_gain(0.9).ok())
+            .collect();
+        if selected.is_empty() {
+            selected.push(CaptureTarget::default_output(DefaultDeviceMode::Follow));
+        }
+
+        let mut mgr = CaptureManager::open(request(selected))?;
+        let _ = mgr.read(480, Duration::from_millis(200));
+        mgr.stop(Stop::Drain);
+        mgr.wait_cleanup(Duration::from_secs(2));
+        Ok(())
+    }
+    let _ = capture_filtered();
+    ```
+  </TabItem>
+  <TabItem label="C++17">
+    ```cpp
+    #include <cspa.hpp>
+    #include <vector>
+
+    int main() {
+        auto disc_res = cspa::Discovery::create();
+        if (!disc_res.is_ok()) return 1;
+        cspa::Discovery disc = disc_res.take_value();
+
+        cspa::DiscoveryQuery q;
+        auto targets_res = disc.query(q);
+        if (!targets_res.is_ok()) return 1;
+
+        std::vector<cspa::Target> selected;
+        for (const cspa::Target &t : targets_res.value()) {
+            if (t.kind() == cspa::TargetKind::Application &&
+                t.raw().active_audio == CSPA_ACTIVE_AUDIO_ACTIVE &&
+                selected.size() < 2) {
+                auto scaled = t.with_gain(0.9f);
+                if (scaled.is_ok()) selected.push_back(scaled.take_value());
+            }
+        }
+        if (selected.empty()) {
+            selected.push_back(cspa::Target::default_output().take_value());
+        }
+
+        cspa::CaptureRequest req(std::move(selected));
+        auto mgr_res = cspa::ManagedStream::open(req);
+        if (mgr_res.is_ok()) {
+            cspa::ManagedStream mgr = mgr_res.take_value();
+            mgr.stop(false);
+            mgr.wait_cleanup(2000);
+        }
+        return 0;
+    }
+    ```
+  </TabItem>
+  <TabItem label="C11">
+    ```c
+    #include <cspa_experimental.h>
+
+    int main(void) {
+        cspa_discovery_query_record q = {0};
+        cspa_discovery_query_init(&q);
+
+        cspa_capture_target_record items[32];
+        size_t count = 0;
+        if (cspa_discover_query(&q, items, 32u, &count) == CSPA_STATUS_OK) {
+            size_t n = count < 32u ? count : 32u;
+            for (size_t i = 0; i < n; ++i) {
+                if (items[i].kind == CSPA_TARGET_KIND_APPLICATION &&
+                    items[i].active_audio == CSPA_ACTIVE_AUDIO_ACTIVE) {
+                    cspa_capture_request_record req = {0};
+                    cspa_capture_request_init(&req, &items[i], 1u);
+                    cspa_manager *mgr = NULL;
+                    if (cspa_manager_open(&req, &mgr) == CSPA_STATUS_OK) {
+                        cspa_manager_stop(mgr, 1u);
+                        cspa_manager_release(mgr);
+                    }
+                    break;
+                }
+            }
+        }
+        return 0;
+    }
+    ```
+  </TabItem>
+</SdkTabs>
+
+---
+
+## 3. Structured `DiscoveryQuery`: Deduplication & Ordering
+
+On Linux (`PipeWire` + `PulseAudio`) and macOS (`CoreAudio` + `ScreenCaptureKit`), the same logical app or device may be visible through two native backends simultaneously. `DiscoveryQuery` lets you control how multi-backend inventories are presented:
+
+- **`DiscoveryDedupe::ByLogicalTarget` *(Default)*:** Deduplicates identical targets across backends, keeping the highest-priority backend while populating `target.available_backends` (e.g. `[CoreAudio, ScreenCaptureKit]`) so UIs can offer per-source backend overrides.
+- **`DiscoveryDedupe::PerBackend`:** Emits separate `<backend>:<kind>:...` entries for each backend so diagnostic tools can compare raw per-backend inventories side-by-side.
+- **`DiscoveryOrder`:** Sort results `KindThenBackend` *(default)* or `BackendThenKind`, and filter with `active_only` (currently playing audio) or `include_non_audio`.
+
+<SdkTabs>
+  <TabItem label="Python">
+    ```python
+    import capture_system_or_process_audio as cspa
+
+    # Quick snapshot (zero background threads):
+    catalog = cspa.discover(active_only=False)
+    print("Apps:", len(catalog.applications), "Mics:", len(catalog.input_devices))
+
+    # Structured per-backend query:
+    query = cspa.DiscoveryQuery(
+        dedupe=cspa.DiscoveryDedupe.PER_BACKEND,
+        order=cspa.DiscoveryOrder.BACKEND_THEN_KIND,
+        active_only=True,
+    )
+    per_bk = cspa.discover_query(query)
+    for t in per_bk.targets:
+        print(t.id, t.backend, t.available_backends)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use capture_system_or_process_audio::{
+        CapabilityError, DiscoveryDedupe, DiscoveryOrder, DiscoveryQuery, discover_query,
+    };
+
+    fn inspect_inventory() -> Result<(), CapabilityError> {
+        let mut query = DiscoveryQuery::default();
+        query.dedupe = DiscoveryDedupe::PerBackend;
+        query.order = DiscoveryOrder::BackendThenKind;
+        query.active_only = true;
+
+        let catalog = discover_query(&query)?;
+        for target in &catalog.targets {
+            println!("{} -> {:?}", target.id(), target.available_backends());
+        }
+        Ok(())
+    }
+    let _ = inspect_inventory();
+    ```
+  </TabItem>
+  <TabItem label="C++17">
+    ```cpp
+    #include <cspa.hpp>
+    #include <cstdio>
+
+    int main() {
+        auto disc_res = cspa::Discovery::create();
+        if (!disc_res.is_ok()) return 1;
+        auto disc = disc_res.take_value();
+
+        cspa::DiscoveryQuery q;
+        q.set_dedupe(cspa::DiscoveryDedupe::PerBackend)
+         .set_order(cspa::DiscoveryOrder::BackendThenKind)
+         .set_active_only(true);
+
+        auto targets = disc.query(q);
+        if (targets.is_ok()) {
+            std::printf("Matched %zu targets\n", targets.value().size());
+        }
+        return 0;
+    }
+    ```
+  </TabItem>
+  <TabItem label="C11">
+    ```c
+    #include <cspa_experimental.h>
+    #include <stdio.h>
+
+    int main(void) {
+        cspa_discovery_query_record q = {0};
+        cspa_discovery_query_init(&q);
+        q.dedupe = CSPA_DISCOVERY_DEDUPE_PER_BACKEND;
+        q.order = CSPA_DISCOVERY_ORDER_BACKEND_THEN_KIND;
+        q.active_only = 1u;
+

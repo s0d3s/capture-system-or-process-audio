@@ -1,0 +1,123 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1160 540" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1160" y2="540" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#070B14"/>
+      <stop offset="100%" stop-color="#0F172A"/>
+    </linearGradient>
+    <linearGradient id="cyanViolet" x1="0" y1="0" x2="1160" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#22D3EE"/>
+      <stop offset="55%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#C084FC"/>
+    </linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#38BDF8"/>
+    </marker>
+  </defs>
+
+  <rect width="1160" height="540" rx="20" fill="url(#bg)"/>
+  <rect x="12" y="12" width="1136" height="516" rx="16" stroke="url(#cyanViolet)" stroke-width="2" opacity="0.45"/>
+
+  <text x="580" y="48" text-anchor="middle" fill="#F8FAFC" font-family="Segoe UI, Inter, Arial, sans-serif" font-size="22" font-weight="800">
+    Four-Layer Real-Time Capture, Mixing &amp; Delivery Pipeline
+  </text>
+  <text x="580" y="72" text-anchor="middle" fill="#94A3B8" font-family="Consolas, monospace" font-size="13">
+    Backends capture. Core orders and buffers. Manager plans, monitors, mixes and reopens sessions. Adapters adapt.
+  </text>
+
+  <!-- Layer 1 -->
+  <rect x="36" y="102" width="240" height="398" rx="14" fill="#0D1628" stroke="#22D3EE" stroke-width="1.8"/>
+  <text x="156" y="132" text-anchor="middle" fill="#22D3EE" font-family="Segoe UI, Arial, sans-serif" font-size="15" font-weight="700">1. Native OS Backends</text>
+  <rect x="54" y="150" width="204" height="62" rx="8" fill="#13213B" stroke="#1E3A5F"/>
+  <text x="156" y="175" text-anchor="middle" fill="#F1F5F9" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">Windows WASAPI</text>
+  <text x="156" y="196" text-anchor="middle" fill="#94A3B8" font-family="Consolas, monospace" font-size="11">eRender · eCapture · Tree</text>
+
+  <rect x="54" y="226" width="204" height="68" rx="8" fill="#13213B" stroke="#1E3A5F"/>
+  <text x="156" y="250" text-anchor="middle" fill="#F1F5F9" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">Linux PipeWire &amp; Pulse</text>
+  <text x="156" y="270" text-anchor="middle" fill="#94A3B8" font-family="Consolas, monospace" font-size="11">Runtime dlopen (0 NEEDED)</text>
+  <text x="156" y="286" text-anchor="middle" fill="#34D399" font-family="Consolas, monospace" font-size="10">Virtual Sink Fan-In + Monitor</text>
+
+  <rect x="54" y="308" width="204" height="68" rx="8" fill="#13213B" stroke="#1E3A5F"/>
+  <text x="156" y="332" text-anchor="middle" fill="#F1F5F9" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">macOS Apple Silicon</text>
+  <text x="156" y="352" text-anchor="middle" fill="#94A3B8" font-family="Consolas, monospace" font-size="11">Core Audio Taps · SCK · HAL</text>
+  <text x="156" y="368" text-anchor="middle" fill="#38BDF8" font-family="Consolas, monospace" font-size="10">Info.plist SIGABRT Guard</text>
+
+  <rect x="54" y="392" width="204" height="90" rx="8" fill="#101B30" stroke="#334155" stroke-dasharray="4 3"/>
+  <text x="156" y="418" text-anchor="middle" fill="#E2E8F0" font-family="Consolas, monospace" font-size="12" font-weight="700">AudioStream&lt;B&gt;</text>
+  <text x="156" y="440" text-anchor="middle" fill="#94A3B8" font-family="Segoe UI, Arial, sans-serif" font-size="11">1 OS session, 0 locks/allocs</text>
+  <text x="156" y="460" text-anchor="middle" fill="#94A3B8" font-family="Segoe UI, Arial, sans-serif" font-size="11">on RT audio callback thread</text>
+
+  <!-- Arrow 1->2 -->
+  <line x1="276" y1="300" x2="308" y2="300" stroke="#38BDF8" stroke-width="2.5" marker-end="url(#arrow)"/>
+
+  <!-- Layer 2 -->
+  <rect x="312" y="102" width="256" height="398" rx="14" fill="#0D1628" stroke="#38BDF8" stroke-width="1.8"/>
+  <text x="440" y="132" text-anchor="middle" fill="#38BDF8" font-family="Segoe UI, Arial, sans-serif" font-size="15" font-weight="700">2. Safe-Rust Core</text>
+  <text x="440" y="150" text-anchor="middle" fill="#34D399" font-family="Consolas, monospace" font-size="11">#![forbid(unsafe_code)]</text>
+
+  <rect x="330" y="168" width="220" height="84" rx="8" fill="#13213B" stroke="#1E3A5F"/>
+  <text x="440" y="193" text-anchor="middle" fill="#F1F5F9" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">Preallocated Slot Pool</text>
+  <text x="440" y="214" text-anchor="middle" fill="#94A3B8" font-family="Consolas, monospace" font-size="11">StorageBudget (16 MiB cap)</text>
+  <text x="440" y="234" text-anchor="middle" fill="#94A3B8" font-family="Consolas, monospace" font-size="11">Ticket/Watermark SPSC Queue</text>
+
+  <rect x="330" y="268" width="220" height="102" rx="8" fill="#13213B" stroke="#1E3A5F"/>
+  <text x="440" y="294" text-anchor="middle" fill="#F1F5F9" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">InputNormalizer + Reblocker</text>
+  <text x="440" y="316" text-anchor="middle" fill="#94A3B8" font-family="Consolas, monospace" font-size="11">1025x64 Blackman-Harris FIR</text>
+  <text x="440" y="336" text-anchor="middle" fill="#94A3B8" font-family="Consolas, monospace" font-size="11">BYPASS when format matches</text>
+  <text x="440" y="354" text-anchor="middle" fill="#22D3EE" font-family="Consolas, monospace" font-size="10">Exact 20 ms frame blocks</text>
+
+  <rect x="330" y="386" width="220" height="96" rx="8" fill="#13213B" stroke="#1E3A5F"/>
+  <text x="440" y="412" text-anchor="middle" fill="#F1F5F9" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">OutputConverter</text>
+  <text x="440" y="434" text-anchor="middle" fill="#94A3B8" font-family="Consolas, monospace" font-size="11">16k / 24k / 44.1k / 48k Hz</text>
+  <text x="440" y="454" text-anchor="middle" fill="#94A3B8" font-family="Consolas, monospace" font-size="11">F32 · I16 · I24 · I32</text>
+  <text x="440" y="471" text-anchor="middle" fill="#C084FC" font-family="Consolas, monospace" font-size="10">SplitMix64 TPDF Dither</text>
+
+  <!-- Arrow 2->3 -->
+  <line x1="568" y1="300" x2="600" y2="300" stroke="#38BDF8" stroke-width="2.5" marker-end="url(#arrow)"/>
+
+  <!-- Layer 3 -->
+  <rect x="604" y="102" width="256" height="398" rx="14" fill="#0D1628" stroke="#A855F7" stroke-width="1.8"/>
+  <text x="732" y="132" text-anchor="middle" fill="#C084FC" font-family="Segoe UI, Arial, sans-serif" font-size="15" font-weight="700">3. CaptureManager&lt;B&gt;</text>
+
+  <rect x="622" y="152" width="220" height="68" rx="8" fill="#171633" stroke="#3B2D66"/>
+  <text x="732" y="176" text-anchor="middle" fill="#F1F5F9" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">Planner &amp; inspect()</text>
+  <text x="732" y="198" text-anchor="middle" fill="#94A3B8" font-family="Consolas, monospace" font-size="11">Side-effect-free PlanReport</text>
+
+  <rect x="622" y="234" width="220" height="136" rx="8" fill="#171633" stroke="#3B2D66"/>
+  <text x="732" y="258" text-anchor="middle" fill="#F1F5F9" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">Combine Engine Waterfall</text>
+  <text x="732" y="282" text-anchor="middle" fill="#34D399" font-family="Consolas, monospace" font-size="11">1. PassThrough (0 extra copy)</text>
+  <text x="732" y="304" text-anchor="middle" fill="#38BDF8" font-family="Consolas, monospace" font-size="11">2. SharedNativeGraphMix</text>
+  <text x="732" y="326" text-anchor="middle" fill="#C084FC" font-family="Consolas, monospace" font-size="11">3. CspaMixer (Drift + NaN guard)</text>
+  <text x="732" y="350" text-anchor="middle" fill="#94A3B8" font-family="Segoe UI, Arial, sans-serif" font-size="11">silence_on_idle · 64f crossfade</text>
+
+  <rect x="622" y="384" width="220" height="98" rx="8" fill="#171633" stroke="#3B2D66"/>
+  <text x="732" y="408" text-anchor="middle" fill="#F1F5F9" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">Live Lifecycle &amp; Hot-Swap</text>
+  <text x="732" y="430" text-anchor="middle" fill="#94A3B8" font-family="Consolas, monospace" font-size="11">Follow endpoint handover</text>
+  <text x="732" y="450" text-anchor="middle" fill="#94A3B8" font-family="Consolas, monospace" font-size="11">OnRootExit::Wait relaunch</text>
+  <text x="732" y="470" text-anchor="middle" fill="#FBBF24" font-family="Consolas, monospace" font-size="11">Tier 1 &amp; 2 update_targets()</text>
+
+  <!-- Arrow 3->4 -->
+  <line x1="860" y1="300" x2="892" y2="300" stroke="#38BDF8" stroke-width="2.5" marker-end="url(#arrow)"/>
+
+  <!-- Layer 4 -->
+  <rect x="896" y="102" width="228" height="398" rx="14" fill="#0D1628" stroke="#34D399" stroke-width="1.8"/>
+  <text x="1010" y="132" text-anchor="middle" fill="#34D399" font-family="Segoe UI, Arial, sans-serif" font-size="15" font-weight="700">4. SDKs &amp; Delivery</text>
+
+  <rect x="914" y="156" width="192" height="72" rx="8" fill="#112627" stroke="#1E4E4A"/>
+  <text x="1010" y="182" text-anchor="middle" fill="#F1F5F9" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">Python 3.11–3.15t</text>
+  <text x="1010" y="204" text-anchor="middle" fill="#94A3B8" font-family="Consolas, monospace" font-size="11">memoryview · to_numpy</text>
+  <text x="1010" y="220" text-anchor="middle" fill="#34D399" font-family="Consolas, monospace" font-size="10">-Xgil=0 Py_MOD_GIL_NOT_USED</text>
+
+  <rect x="914" y="242" width="192" height="64" rx="8" fill="#112627" stroke="#1E4E4A"/>
+  <text x="1010" y="268" text-anchor="middle" fill="#F1F5F9" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">Safe-Rust Facade</text>
+  <text x="1010" y="290" text-anchor="middle" fill="#94A3B8" font-family="Consolas, monospace" font-size="11">0-alloc read_into(&amp;mut)</text>
+
+  <rect x="914" y="320" width="192" height="72" rx="8" fill="#112627" stroke="#1E4E4A"/>
+  <text x="1010" y="346" text-anchor="middle" fill="#F1F5F9" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">C++17 &amp; C11 FFI</text>
+  <text x="1010" y="368" text-anchor="middle" fill="#94A3B8" font-family="Consolas, monospace" font-size="11">cspa::Result / *_or_throw</text>
+  <text x="1010" y="384" text-anchor="middle" fill="#94A3B8" font-family="Consolas, monospace" font-size="10">catch_unwind ABI boundary</text>
+
+  <rect x="914" y="406" width="192" height="76" rx="8" fill="#1E1836" stroke="#C084FC" stroke-dasharray="4 3"/>
+  <text x="1010" y="432" text-anchor="middle" fill="#E9D5FF" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">cspa-tui-demo &amp; Adapters</text>
+  <text x="1010" y="454" text-anchor="middle" fill="#C084FC" font-family="Consolas, monospace" font-size="10">Live Ratatui Studio (Shipped)</text>
+  <text x="1010" y="470" text-anchor="middle" fill="#94A3B8" font-family="Consolas, monospace" font-size="10">Drop-In Shims (Next Release)</text>
+</svg>

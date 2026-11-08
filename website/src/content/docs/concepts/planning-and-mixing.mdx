@@ -1,0 +1,188 @@
+---
+title: Execution Planning, CspaMixer & Live Hot-Swap
+description: Preview execution plans side-effect-free with inspect(), control CombineMode and ProcessTreeRange, understand CspaMixer clock-drift sync, and hot-swap targets mid-stream.
+---
+
+import { Aside, TabItem } from '@astrojs/starlight/components';
+import SdkTabs from '../../../components/SdkTabs.astro';
+
+Before opening a single native audio stream, `CaptureRequest::inspect()` evaluates your targets, OS capabilities, mixing mode, and memory budgets into a deterministic `CapturePlanReport`.
+
+![Four-Layer Real-Time Capture, Mixing & Delivery Pipeline](/capture-system-or-process-audio/diagrams/architecture-pipeline.svg)
+
+---
+
+## 1. Two-Stage Strategy Resolution: `ProcessTreeRange` & `CombineMode`
+
+Planning separates **how an individual process tree is acquired** from **how multiple targets are combined**:
+
+### Stage A — Per-Target `ProcessTreeRange` (`Process` & `Application` targets)
+Ordered waterfall from lowest overhead to broadest software fallback (`start_level..=fallback_limit`):
+1. **`NativeKernelCapture`:** Single OS kernel stream captures the entire process tree directly (Windows `WASAPI` process-tree loopback).
+2. **`NativeGraphMix`:** `CaptureManager` maintains dynamic process membership on a single native audio-server graph node (Linux `PipeWire` `support.null-audio-sink` passive port links; macOS `CoreAudio` `CATapDescription` process-object list).
+3. **`SoftwareStreamMix`:** `CaptureManager` opens per-process/per-sink-input streams (e.g., Linux `PulseAudio` `pa_stream_set_monitor_stream`) and combines them in `CspaMixer`.
+
+> Lowering `fallback_limit` (or setting `None` in Python/Rust) opts out of software mixing when you require strictly native OS capture!
+
+### Stage B — Session `CombineMode`
+- **`Auto` *(Default)*:**
+  - Single target with unity gain (`gain == 1.0`) and no `OutputConverter` $\rightarrow$ **`PassThrough`** (`0` extra copies, `0` mixer latency).
+  - Multiple `PipeWire` or `CoreAudio` tap targets combinable on one native graph $\rightarrow$ **`SharedNativeGraphMix`**.
+  - Heterogeneous targets (`[microphone(), find_app("Zoom")]`, cross-backend `[ScreenCaptureKit + CoreAudio]`, `[PipeWire + PulseAudio]`, non-unity `gain`, or `OutputConverter`) $\rightarrow$ **`CspaMixer`**.
+- **`NativeOnly`:** Requires `PassThrough` or `SharedNativeGraphMix`; fails explicitly if software mixing would be needed.
+- **`CspaMixer` (`CSPA_MIXER` in Python/C11 wire enums):** Forces software mixing even for targets that could share a native graph (useful when you want per-target static `gain`, `InputStatusHandle` telemetry, or `SoftwareSummation` duplicate-target summing).
+
+---
+
+## 2. Caller-Owned Target Overlap
+
+If you pass overlapping targets (for example, `[default_output(), find_app("Spotify")]` or two copies of the same target), `capture-system-or-process-audio` never silently drops your targets:
+- **`SoftwareSummation` (`CspaMixer`):** Sums each stream's contribution (`2x` amplitude for an exact duplicate).
+- **`NativeSetUnion` (`SharedNativeGraphMix`):** Deduplicates native PipeWire port links or Core Audio `AudioObjectID`s on the shared native node while tracking target reference counts so removing one target keeps shared links alive for remaining targets.
+
+---
+
+## 3. Inside `CspaMixer`: Normalizer, `20 ms` Grid & Clock-Drift Sync :badge[0 Steady-State Allocs]{variant=success}
+
+Mixing a USB microphone (`16 kHz` or `44.1 kHz` mono `I16` on its own crystal oscillator) with system speakers (`48 kHz` stereo `F32` on motherboard audio) breaks naive sample-summing loops within seconds. `CspaMixer` handles every edge case deterministically off the real-time callback thread:
+
+1. **Order-Independent Working Format:** Promotes to `max(input_rates)` (e.g. `48000 Hz`) + `Stereo` `F32` regardless of target list order.
+2. **Preallocated `InputNormalizer + FrameReblocker`:**
+   - When an input already matches the mixer's working rate and stereo `F32` layout, normalization enters **`BYPASS`** (`is_identity_bypass == true`).
+   - Otherwise (`InputConversionPolicy::AutoWhenMixing`, or rejected if `StrictNoResample`), a preallocated **`1025x64` 4-term Blackman-Harris polyphase windowed-sinc resampler** (`122.9 dB` stopband attenuation, exact integer modulo `P/Q` phase tracking) + ring `FrameReblocker` slices normalized audio into exact **`20 ms`** (`alignment_window_ms = 20`) blocks (`SYNC`).
+3. **Clock-Domain-Gated Slip/Repeat Drift Compensation:**
+   - Each backend stamps `Stamp.clock_domain`. When independent hardware clocks drift beyond `drift_threshold_ms` (`5 ms` default, `2 ms` hysteresis, `500 ms` hold), `CspaMixer` performs a **`64`-frame linear crossfade** slip/repeat adjustment (`drift_slips` counter) without pitch-warping or audible clicks.
+4. **Non-Finite Sample Sanitization & Idle Parking:**
+   - Sanitizes any `NaN` or `±Inf` float sample from misbehaving drivers to `0.0` (`nonfinite_samples` counter), leaves `F32` headroom unclamped by default (`clamp_f32 = false`), and either parks cleanly when all inputs are silent or synthesizes continuous silent blocks (`synthesized_silence = true`) when `silence_on_idle = true`.
+
+---
+
+## 4. Inspecting Plans & Live Two-Tier Hot-Swap (`update_targets`)
+
+`update_targets(...)` reconfigures an active `CaptureManager` session **mid-recording** without losing queued audio:
+- **Tier 1 (`SharedNativeGraphMix` in-place):** Updates PipeWire passive links or macOS `CATapDescription` process lists in place (`0 ms` mixer buffering).
+- **Tier 2 (`CspaMixer` differential reconciliation):** Keeps unchanged input streams, normalizer phases, and drift state running untouched while opening only newly added targets and draining removed ones (`0` heap allocations when slot capacity suffices).
+
+<SdkTabs>
+  <TabItem label="Python">
+    ```python
+    import capture_system_or_process_audio as cspa
+
+    mic = cspa.microphone()
+    spk = cspa.default_output()
+
+    # 1. Side-effect-free plan inspection:
+    mixer = cspa.MixerConfig(alignment_window_ms=20, drift_threshold_ms=5, silence_on_idle=True)
+    req = cspa.request([mic, spk], combine_mode=cspa.CombineMode.CSPA_MIXER, mixer_config=mixer)
+    plan = req.inspect()
+    print("Combine:", plan.combine_resolution.value, "PCM RAM:", plan.estimated_pcm_bytes)
+
+    # 2. Open & live hot-swap targets mid-session:
+    if False:  # illustrative runtime session
+        with req.open() as stream:
+            rev = stream.update_targets([mic])
+            for h in stream.input_handles():
+                print(h.target_id, h.participation_state.value, "bypass=", h.is_identity_bypass)
+            print("Updated membership version:", rev)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use capture_system_or_process_audio::{
+        CapabilityError, CaptureManager, CaptureTarget, CombineMode, DefaultDeviceMode, MixerConfig,
+        Stop, request,
+    };
+    use std::time::Duration;
+
+    fn plan_and_swap() -> Result<(), CapabilityError> {
+        let mic = CaptureTarget::microphone(DefaultDeviceMode::Follow);
+        let spk = CaptureTarget::default_output(DefaultDeviceMode::Follow);
+
+        let req = request(vec![mic.clone(), spk])
+            .with_combine_mode(CombineMode::CspaMixer)
+            .with_mixer_config(MixerConfig {
+                silence_on_idle: true,
+                ..MixerConfig::default()
+            });
+
+        let plan = req.inspect()?;
+        println!("Resolution: {:?}, bytes: {}", plan.combine_resolution, plan.estimated_pcm_bytes);
+
+        if false {
+            let mut mgr = CaptureManager::open(req)?;
+            let version = mgr.update_targets(vec![mic])?;
+            println!("Hot-swapped to membership version {version}");
+            mgr.stop(Stop::Drain);
+            mgr.wait_cleanup(Duration::from_secs(2));
+        }
+        Ok(())
+    }
+    let _ = plan_and_swap();
+    ```
+  </TabItem>
+  <TabItem label="C++17">
+    ```cpp
+    #include <cspa.hpp>
+    #include <cstdio>
+
+    int main() {
+        auto mic = cspa::Target::microphone().take_value();
+        auto spk = cspa::Target::default_output().take_value();
+
+        cspa::MixerConfig mixer;
+        mixer.set_silence_on_idle(true);
+
+        cspa::CaptureRequest req({mic, spk});
+        req.set_combine_mode(cspa::CombineMode::CspaMixer)
+           .set_mixer_config(mixer);
+
+        auto plan = req.inspect();
+        if (plan.is_ok()) {
+            std::printf("Streams: %llu\n",
+                        static_cast<unsigned long long>(plan.value().estimated_active_streams));
+        }
+        return 0;
+    }
+    ```
+  </TabItem>
+  <TabItem label="C11">
+    ```c
+    #include <cspa_experimental.h>
+    #include <stdio.h>
+
+    int main(void) {
+        cspa_capture_target_record targets[2] = {{0}, {0}};
+        targets[0].struct_size = (uint32_t)sizeof(targets[0]);
+        targets[0].schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+        targets[1].struct_size = (uint32_t)sizeof(targets[1]);
+        targets[1].schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+
+        if (cspa_target_microphone(CSPA_DEFAULT_DEVICE_FOLLOW, 1.0f, &targets[0]) != CSPA_STATUS_OK) return 1;
+        if (cspa_target_default_output(CSPA_DEFAULT_DEVICE_FOLLOW, 1.0f, &targets[1]) != CSPA_STATUS_OK) return 1;
+
+        cspa_mixer_config_record mixer = {0};
+        cspa_mixer_config_init(&mixer);
+        mixer.silence_on_idle = 1u;
+
+        cspa_capture_request_record req = {0};
+        cspa_capture_request_init(&req, targets, 2u);
+        req.combine_mode = CSPA_COMBINE_MODE_CSPA_MIXER;
+        req.mixer_config = &mixer;
+
+        cspa_plan_report_record report = {0};
+        report.struct_size = (uint32_t)sizeof(report);
+        report.schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+        if (cspa_request_inspect(&req, &report) == CSPA_STATUS_OK) {
+            printf("Estimated PCM bytes: %llu\n", (unsigned long long)report.estimated_pcm_bytes);
+        }
+        return 0;
+    }
+    ```
+  </TabItem>
+</SdkTabs>
+
+<Aside type="caution" title="Working-format upward promotion on hot-swap">
+If a live `CspaMixer` session is running at `44.1 kHz` and `update_targets` adds a `48 kHz` target, the mixer's working rate must promote upward (`ManagerError::WorkingFormatChanged`), which `CaptureManager` handles cleanly at a session boundary. Adding a `16 kHz` mic to an existing `48 kHz` mix stays in-place with `0` session interruption!
+</Aside>
+
+Continue to [Format Conversion, Layouts & TPDF Dither](/capture-system-or-process-audio/concepts/format-conversion/).

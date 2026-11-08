@@ -1,0 +1,166 @@
+---
+title: Real-Time Safety, Zero-Alloc Reads & Lifecycle
+description: Understand preallocated StorageBudget pools, Overflow policies, zero-steady-state-allocation read_into, asyncio & worker callbacks, and Drain vs Abort shutdown.
+---
+
+import { Aside, TabItem } from '@astrojs/starlight/components';
+import SdkTabs from '../../../components/SdkTabs.astro';
+
+Audio capture runs alongside OS real-time audio threads (`WASAPI` MMCSS `Capture`, `PipeWire` `PW_STREAM_FLAG_RT_PROCESS`, `Core Audio` HAL IOProcs). A single mutex wait or unbounded heap allocation on the acquisition thread can glitch audio system-wide.
+
+---
+
+## 1. Bounded Slot Pools & `AggregateManagerBudgets`
+
+Every session reserves fixed PCM slot pools upfront under `AggregateManagerBudgets`:
+
+| Budget Parameter | Default | Role |
+| --- | --- | --- |
+| `max_targets` | `16` (`1..=64`) | Maximum targets in a single `CaptureRequest`. |
+| `max_active_streams` | `16` (`1..=64`) | Maximum concurrent native OS streams managed in one session. |
+| `max_total_pcm_memory` | `16 MiB` | Hard ceiling across all input slot pools **plus** `MultiInputManager`'s auxiliary `out_pool`. |
+| `max_discovery_queue` | `256` (`32..=4096`) | Bounded cursor queue capacity for live discovery subscriptions. |
+| `cleanup_timeout_ms` | `2000 ms` | Default bounded teardown wait on `with` / `async with` / RAII scope exit. |
+
+### `Overflow` Policies When a Consumer Falls Behind
+
+Because native acquisition never blocks waiting for a slow caller, `Overflow` governs what happens when all preallocated queue slots are full:
+- **`DropOldest` *(Default)*:** Evicts the oldest unread packet so the consumer always receives the freshest live audio (recording dropped counts in `InputStatusHandle.dropped_frames`).
+- **`DropNewest`:** Preserves queued contiguous history and discards incoming packets until the consumer drains space.
+- **`Fail`:** Marks the stream failed with `FailureKind::QueueOverflow` (`CSPA_STATUS_NO_MEMORY` / `ReadError`) so strict lossless test harnesses detect consumer stalls immediately.
+
+---
+
+## 2. Four Delivery Surfaces Compared
+
+| Delivery Mode | Steady-State Allocations | Best For |
+| --- | --- | --- |
+| **`read_into(buf, frames)`** | **`0` heap allocations** across Rust, Python (`3.11`–`3.15t` `-Xgil=0`), C++17, & C11 | Low-latency DSP, WebRTC/LiveKit frames, real-time visualizers, game engines, and preallocated NumPy/ring buffers. |
+| **`read(frames)` $\rightarrow$ `PcmBlock`** | Zero-copy slot retention (`memoryview` / `to_numpy(copy=False)` / `cspa::PcmBlock`) | Python NumPy/Whisper pipelines and batch encoders; retained `PcmBlock` views stay valid even after `stop()`! |
+| **`read_async(frames)` / `async for`** | Releases thread to Python `asyncio` event loop; cancellable via `Cancellation` | FastAPI / WebSocket / `asyncio` voice bots. |
+| **`start_callback(fn)`** | Dedicated off-acquisition worker thread (`catch_unwind` + single-shot exception containment) | Push-oriented PortAudio/`sounddevice`-style event pipelines (user callbacks never run on the OS RT audio thread!). |
+
+<Aside type="tip" title="Free-Threaded Python 3.14t & 3.15t (-Xgil=0) Soundness">
+In `crates/capture-python`, every `#[pyclass]` is `frozen`, the extension declares `Py_MOD_GIL_NOT_USED`, and `read_into` writes into a preallocated Rust scratch slice while detached, then copies bytes into `Py_buffer` inside `pyo3::sync::critical_section::with_critical_section` — achieving **0 steady-state allocations** without ever forming an aliased `&mut [u8]` slice over Python memory!
+</Aside>
+
+---
+
+## 3. Cancellation, Callbacks & Clean Shutdown (`Drain` vs `Abort`)
+
+Two distinct shutdown modes give you deterministic control over queued audio:
+
+1. **`Stop::Drain` (`stream.stop("drain")` / `stream.stop(false)`):** Signals native acquisition to stop while keeping all already-captured packets readable until `PartialReason::Eof` — ideal for saving complete recordings without clipping the final syllable.
+2. **`Stop::Abort` (`with` / `async with` exit, `Drop`, or `stream.stop("abort")` / `stream.stop(true)`):** Discards unread queued packets immediately and waits up to `cleanup_timeout` (`2000 ms`) for OS audio handles and worker threads to join cleanly.
+
+<SdkTabs>
+  <TabItem label="Python">
+    ```python
+    import asyncio
+    import capture_system_or_process_audio as cspa
+
+    async def stream_with_cancellation() -> None:
+        cancel = cspa.Cancellation()
+        budgets = cspa.AggregateManagerBudgets(max_total_pcm_memory=8 * 1024 * 1024)
+
+        async with cspa.capture(
+            cspa.default_output(),
+            budgets=budgets,
+            overflow=cspa.Overflow.DROP_OLDEST,
+            silence_on_idle=True,
+        ) as stream:
+            outcome = await stream.read_async(frames=480, timeout_ms=100, cancel=cancel)
+            print("Read frames:", outcome.frames, "reason:", outcome.reason.value)
+            cancel.cancel()
+            stream.stop(cspa.StopMode.DRAIN)
+            stream.wait_cleanup()
+
+    if False:
+        asyncio.run(stream_with_cancellation())
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use capture_system_or_process_audio::{
+        AggregateManagerBudgets, CapabilityError, CaptureManager, CaptureTarget, DefaultDeviceMode,
+        Overflow, Stop, TimingRequirement, request,
+    };
+    use std::time::Duration;
+
+    fn run_zero_alloc_loop() -> Result<(), CapabilityError> {
+        let budgets = AggregateManagerBudgets {
+            max_total_pcm_memory: 8 * 1024 * 1024,
+            ..AggregateManagerBudgets::default()
+        };
+        let req = request(vec![CaptureTarget::default_output(DefaultDeviceMode::Follow)])
+            .with_budgets(budgets);
+
+        if false {
+            let mut mgr = CaptureManager::open_with_options(
+                req,
+                Overflow::DropOldest,
+                TimingRequirement::Raw,
+            )?;
+            let cancel = mgr.default_cancel();
+            let mut pcm = vec![0u8; 480 * 8];
+            let _ = mgr.read_into_with_cancel(&mut pcm, 480, Duration::from_millis(100), cancel);
+
+            mgr.stop(Stop::Drain);
+            assert!(mgr.wait_cleanup(Duration::from_secs(2)));
+        }
+        Ok(())
+    }
+    let _ = run_zero_alloc_loop();
+    ```
+  </TabItem>
+  <TabItem label="C++17">
+    ```cpp
+    #include <cspa.hpp>
+    #include <vector>
+
+    int main() {
+        auto cancel_res = cspa::CancelToken::create();
+        if (!cancel_res.is_ok()) return 1;
+        auto cancel = cancel_res.take_value();
+
+        auto spk = cspa::Target::default_output().take_value();
+        cspa::CaptureRequest req({spk});
+        req.set_overflow(cspa::Overflow::DropOldest);
+
+        if (false) {
+            auto mgr = cspa::ManagedStream::open(req).take_value();
+            std::vector<uint8_t> pcm(480 * 8);
+            (void)mgr.read_into(pcm.data(), pcm.size(), 480, 100, &cancel);
+            cancel.cancel();
+            mgr.stop(false); // false = Drain, true = Abort
+            mgr.wait_cleanup(2000);
+        }
+        return 0;
+    }
+    ```
+  </TabItem>
+  <TabItem label="C11">
+    ```c
+    #include <cspa_experimental.h>
+
+    int main(void) {
+        cspa_cancel *cancel = NULL;
+        if (cspa_cancel_create(&cancel) != CSPA_STATUS_OK) return 1;
+
+        cspa_aggregate_budgets_record budgets = {0};
+        cspa_aggregate_budgets_init(&budgets);
+        budgets.max_total_pcm_memory = 8ull * 1024ull * 1024ull;
+
+        cspa_cancel_trigger(cancel);
+        if (cspa_cancel_is_cancelled(cancel) == 0u) {
+            cspa_cancel_release(cancel);
+            return 1;
+        }
+        cspa_cancel_release(cancel);
+        return 0;
+    }
+    ```
+  </TabItem>
+</SdkTabs>
+
+Continue to [Platform Backends & Capability Matrix](/capture-system-or-process-audio/concepts/platforms/).

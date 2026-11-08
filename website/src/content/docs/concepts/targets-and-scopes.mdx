@@ -1,0 +1,162 @@
+---
+title: Capture Targets, Scopes & Endpoint Tracking
+description: Master all six CaptureTarget kinds, Tree vs Exact process scopes, Follow vs Pin default-endpoint switching, OnRootExit relaunch tracking, backend pinning, and per-target gain.
+---
+
+import { Aside, TabItem } from '@astrojs/starlight/components';
+import SdkTabs from '../../../components/SdkTabs.astro';
+
+`CaptureTarget` is the single deterministic value type used across discovery, plan inspection (`inspect()`), single-session `AudioStream`s, and managed multi-source `CaptureManager` sessions.
+
+---
+
+## 1. The Six `TargetKind`s
+
+| `TargetKind` | Factory Helper | What It Captures |
+| --- | --- | --- |
+| **`DefaultOutput`** | `default_output` | Audio playing on the OS default speakers or headphones (`Follow` default or `Pin`). |
+| **`Device`** | `device(id)` | Loopback output from a specific named render endpoint (`device:<id>`). |
+| **`Application`** | `find_app(name, ...)` / `application(...)` | Audio produced by a top-level desktop application (`Spotify`, `Zoom`, `Firefox`), resolved with parent-tree roll-up. |
+| **`Process`** | `process(pid, ...)` | Audio produced by an explicit OS process ID (`(pid, process_start_time)` validated). |
+| **`DefaultInput`** | `microphone` | Audio from the OS default microphone / capture input (`Follow` default or `Pin`). |
+| **`InputDevice`** | `input_device(id)` | Audio from a specific physical or virtual input endpoint (`input_device:<id>`, excluding `.monitor` loopback sinks). |
+
+<Aside type="note" title="Why is there no per-window target kind?">
+Desktop operating systems route audio per process, audio session, or application bundle — not per GUI window (`HWND` / `NSWindow` / Wayland surface). `capture-system-or-process-audio` exposes only capabilities backed by real OS isolation rather than pretending to isolate individual browser tabs or windows.
+</Aside>
+
+---
+
+## 2. Constructing Targets Across All 4 SDKs
+
+<SdkTabs>
+  <TabItem label="Python">
+    ```python
+    import capture_system_or_process_audio as cspa
+
+    # 1. Default speakers & default microphone (Follow OS switches automatically):
+    speakers = cspa.default_output(default_device_mode=cspa.DefaultDeviceMode.FOLLOW)
+    mic = cspa.microphone(default_device_mode="follow", gain=1.25)
+
+    # 2. Specific output or input device by ID (e.g., from cspa.discover()):
+    pinned_spk = cspa.device("speakers-endpoint-id")
+    pinned_mic = cspa.input_device("usb-mic-id", gain=0.8)
+
+    # 3. Application or PID target with scope & root-exit policy:
+    proc = cspa.process(
+        4242,
+        scope=cspa.ProcessScope.TREE,
+        on_root_exit=cspa.RootExitPolicy.WAIT,
+        wait_timeout_ms=5000,
+    )
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use capture_system_or_process_audio::{
+        CaptureTarget, DefaultDeviceMode, OnRootExit, PlanError, ProcessIdentity, ProcessScope,
+    };
+
+    fn build_targets() -> Result<Vec<CaptureTarget>, PlanError> {
+        let speakers = CaptureTarget::default_output(DefaultDeviceMode::Follow);
+        let mic = CaptureTarget::microphone(DefaultDeviceMode::Follow).with_gain(1.25)?;
+        let pinned_spk = CaptureTarget::device("speakers-endpoint-id")?;
+        let pinned_mic = CaptureTarget::input_device("usb-mic-id")?.with_gain(0.8)?;
+
+        let proc_target = CaptureTarget::process(
+            ProcessIdentity { pid: 4242, generation: 0 },
+            ProcessScope::Tree,
+            OnRootExit::Wait { wait_timeout_ns: 5_000_000_000 },
+        )?;
+
+        Ok(vec![speakers, mic, pinned_spk, pinned_mic, proc_target])
+    }
+    let _ = build_targets()?;
+    ```
+  </TabItem>
+  <TabItem label="C++17">
+    ```cpp
+    #include <cspa.hpp>
+
+    int main() {
+        auto speakers = cspa::Target::default_output(cspa::DefaultDeviceMode::Follow);
+        auto mic = cspa::Target::microphone(cspa::DefaultDeviceMode::Follow, 1.25f);
+        auto pinned_spk = cspa::Target::device("speakers-endpoint-id");
+        auto pinned_mic = cspa::Target::input_device("usb-mic-id", 0.8f);
+        auto proc = cspa::Target::process(
+            4242u,
+            0ull,
+            cspa::ProcessScope::Tree,
+            cspa::OnRootExitMode::Wait,
+            5000000000ull
+        );
+        return (speakers.is_ok() && mic.is_ok() && pinned_spk.is_ok() && pinned_mic.is_ok() && proc.is_ok()) ? 0 : 1;
+    }
+    ```
+  </TabItem>
+  <TabItem label="C11">
+    ```c
+    #include <cspa_experimental.h>
+
+    int main(void) {
+        cspa_capture_target_record speakers = {0};
+        speakers.struct_size = (uint32_t)sizeof(speakers);
+        speakers.schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+        if (cspa_target_default_output(CSPA_DEFAULT_DEVICE_FOLLOW, 1.0f, &speakers) != CSPA_STATUS_OK) {
+            return 1;
+        }
+
+        cspa_capture_target_record proc = {0};
+        proc.struct_size = (uint32_t)sizeof(proc);
+        proc.schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+        if (cspa_target_process(4242u, 0ull, CSPA_SCOPE_TREE, CSPA_ON_ROOT_EXIT_WAIT, 5000000000ull, 1.0f, &proc) != CSPA_STATUS_OK) {
+            return 1;
+        }
+        return 0;
+    }
+    ```
+  </TabItem>
+</SdkTabs>
+
+---
+
+## 3. Process Scopes: `Tree` vs `Exact` :badge[Zero Silent Fallback]{variant=tip}
+
+Modern desktop apps (Chromium/Electron apps, Firefox `plugin-container`, Zoom, games with launcher helpers) often render audio from a child helper process rather than the root UI PID.
+
+- **`ProcessScope::Tree` *(Default)*:** Captures the target process **and** its descendant audio helper processes:
+  - **Windows (`WASAPI` Build `20348+`):** Uses native kernel include-tree loopback (`PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE`).
+  - **Linux (`PipeWire` / `PulseAudio`):** Dynamically tracks `/proc/<pid>/stat` ancestry and links all matching streams into a PipeWire `support.null-audio-sink` (`SharedNativeGraphMix`) or `CspaMixer`.
+  - **macOS (`Core Audio` `14.2+`):** Dynamically maintains `[parent_obj, child_obj, ...]` `AudioObjectID` sets on the `CATapDescription`.
+- **`ProcessScope::Exact`:** Captures strictly the specified PID or non-tree application bundle without descendant expansion:
+  - Supported on **Linux** (`PipeWire` & `PulseAudio`), **macOS Core Audio (`14.2+`)**, and **macOS `ScreenCaptureKit` (`13.0+`, `Application` targets)**.
+  - **Explicitly rejected on Windows WASAPI:** Because Microsoft's `ActivateAudioInterfaceAsync` process loopback API only exposes tree inclusion/exclusion in the kernel, requesting `scope="exact"` on Windows fails deterministically with `CapabilityError::UnsupportedScope` (`PlanErrorCode.UNSUPPORTED_SCOPE`) — never silently broadening to `Tree` or system loopback.
+
+---
+
+## 4. Endpoint Tracking: `Follow` vs `Pin`
+
+Both `default_output(...)` and `microphone(...)` accept `DefaultDeviceMode`:
+
+| Mode | Behavior When User Plugs In USB/Bluetooth Audio or Switches OS Default |
+| --- | --- |
+| **`Follow`** *(Default)* | `CaptureManager` subscribes to native OS default-device notifications off the real-time audio thread (`IMMNotificationClient` on Windows, `PipeWire`/`PulseAudio` default metadata on Linux, `AudioObjectAddPropertyListener` on macOS). On change, it cleanly drains/closes the old endpoint, opens the new default endpoint, and flags `BoundaryKind::DeviceChanged` on the transition read. |
+| **`Pin`** | Resolves the current default endpoint ID once when opening the session (`device(current_default_id)` / `input_device(current_default_id)`) and stays locked to that hardware device even if the user later changes the OS default. |
+
+---
+
+## 5. Root Process Exit & Identity-Safe Relaunch (`OnRootExit`)
+
+Every `Process` and `Application` target carries an `OnRootExit` policy plus `(pid, process_start_time)` generation metadata:
+
+- **`Stop` *(Default)*:** When the target root process exits, `CaptureManager` drains all already-captured frames and cleanly ends that target's stream (or degrades gracefully in multi-input mixes when `OnInputFailure::Degrade` is active).
+- **`Wait { wait_timeout }` (`"wait"` + `wait_timeout_ms`):** If an application restarts (for example, an auto-updating desktop client or a game transitioning from launcher to engine), `CaptureManager` waits up to `wait_timeout` for a unique successor matching the application identity created *after* the exit timestamp, revalidating `(pid, process_start_time)` so OS PID recycling never hijacks an unrelated process.
+
+---
+
+## 6. Per-Target Backend Pinning & Static Gain
+
+- **Backend Pinning (`target.with_backend(...)`):** On multi-backend platforms (Linux `pipewire` + `pulseaudio`; macOS `coreaudio` + `screencapturekit`), a target defaults to `backend = None` (allowing the planner to pick the highest-fidelity backend in `request.backends`). Calling `with_backend(...)` pins that specific target to one backend and prefixes its canonical ID (`<backend>:<kind>:...`), enabling intentional cross-backend mixes such as `[app.with_backend("screencapturekit"), mic.with_backend("coreaudio")]`.
+- **Static Gain (`target.with_gain(gain)`):** Applies a finite non-negative linear gain multiplier (`0.0 <= gain <= 16.0`, default `1.0`). Setting non-unity gain (`gain != 1.0`) automatically routes single-target or multi-target sessions through `CspaMixer` (`f32` accumulation).
+
+Continue to [Live Target Discovery & Subscriptions](/capture-system-or-process-audio/concepts/discovery/).

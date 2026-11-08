@@ -1,0 +1,165 @@
+---
+title: Format Conversion, Layouts & TPDF Dither
+description: Convert live captured audio on the fly to 16 kHz mono float32/int16 for Whisper & STT, 24 kHz for Voice AI, or 48 kHz stereo with SplitMix64 TPDF dither.
+---
+
+import { Aside, TabItem } from '@astrojs/starlight/components';
+import SdkTabs from '../../../components/SdkTabs.astro';
+
+Native OS endpoints typically stream at `48 kHz` or `44.1 kHz` stereo `float32` (or packed `24-in-32` PCM), whereas speech-to-text models (`faster-whisper`, `openai-whisper`), VADs (`Silero`, `WebRTC`), and Realtime Voice AI SDKs require **`16 kHz` mono `float32`/`int16`** or **`24 kHz` `int16`**.
+
+`OutputConverter` performs resampling, channel downmix/upmix, endianness conversion, and integer quantization inside the safe-Rust pipeline with **zero steady-state heap allocations**.
+
+---
+
+## 1. Supported Sample Formats & Presets
+
+| Downstream Consumer | Recommended `OutputConverter` Settings | Frame Stride |
+| --- | --- | --- |
+| **`faster-whisper` / `openai-whisper` / Silero VAD** | `rate=16000`, `channels=1`, `sample_format=F32` | `4 B` / frame |
+| **WebRTC VAD / SpeechRecognition / Picovoice** | `rate=16000`, `channels=1`, `sample_format=I16`, `dither=TPDF` | `2 B` / frame |
+| **OpenAI Realtime / LiveKit Voice Agents** | `rate=24000`, `channels=1`, `sample_format=I16`, `dither=TPDF` | `2 B` / frame |
+| **Discord Bots / Broadcast / WAV Mastering** | `rate=48000`, `channels=2`, `sample_format=I16` or `I24` or `F32` | `4–8 B` / frame |
+
+Supported `SampleType`s:
+- **`F32`** (`32`-bit IEEE 754 float, nominal `[-1.0, +1.0]`)
+- **`I16`** (`16`-bit signed PCM)
+- **`I24`** (packed `3`-byte `24`-bit signed PCM; `PcmBlock.to_numpy(unpack_i24=True)` sign-extends to `int32` in Python when needed!)
+- **`I32`** (`32`-bit signed PCM)
+
+---
+
+## 2. Canonical Speaker Layouts & Early Validation
+
+`OutputConverter` validates channel layouts during `request.inspect()` **before** opening any OS audio device:
+- **`1` channel:** `[Channel::Mono]`
+- **`2` channels:** `[Channel::FrontLeft, Channel::FrontRight]`
+- **`4` / `6` channels:** Validated `Layout::Known` speaker masks (`Identity` pass-through when matching native multichannel endpoints; incompatible multichannel downmixes reject early at `inspect()` with `PlanError::UnsupportedCapturePlan`).
+
+---
+
+## 3. Stateless SplitMix64 `TPDF` Dither vs `None`
+
+Quantizing `32`-bit floating-point audio directly to `I16` or `I24` by truncation introduces correlated harmonic distortion on quiet decays.
+- **`DitherMode::Tpdf` *(Default for integer outputs)*:** Applies stateless, deterministic SplitMix64 **Triangular Probability Density Function** (`TPDF`) dither prior to integer rounding, linearizing quantization noise with zero state drift.
+- **`DitherMode::None`:** Disables dithering for bit-exact zero-silence integer tests.
+
+---
+
+## 4. Mid-Stream Native Format Changes (`OnFormatChange`)
+
+What happens if a user changes their Windows speaker sample rate from `48 kHz` to `96 kHz` in Control Panel, or `Follow` mode switches from `48 kHz` speakers to a `44.1 kHz` Bluetooth headset?
+- **`OnFormatChange::Adapt` *(Default)*:** When `OutputConverter` is configured, `CaptureManager` transparently updates the input resampler ratio so your downstream consumer continues receiving uninterrupted `16 kHz` (or `48 kHz`) frames! Without `OutputConverter`, it emits `BoundaryKind::FormatChanged` so callers see the new `Format`.
+- **`OnFormatChange::Fail`:** Immediately terminates the read with a typed format-change error (`CSPA_STATUS_FORMAT_CHANGED` / `CapabilityError::FormatChangeRejected`) for pipelines that forbid mid-session sample-rate transitions.
+
+<SdkTabs>
+  <TabItem label="Python">
+    ```python
+    import capture_system_or_process_audio as cspa
+
+    conv = cspa.OutputConverter(
+        rate=16000,
+        channels=1,
+        sample_format=cspa.SampleType.I16,
+        dither=cspa.DitherMode.TPDF,
+    )
+    req = cspa.request(
+        cspa.default_output(),
+        output_converter=conv,
+        on_format_change=cspa.OnFormatChange.ADAPT,
+        silence_on_idle=True,
+    )
+    plan = req.inspect()
+    print("Uses OutputConverter:", plan.uses_output_converter)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use capture_system_or_process_audio::{
+        ByteOrder, CapabilityError, CaptureTarget, Channel, DefaultDeviceMode, DitherMode, Format,
+        Layout, OnFormatChange, OutputConverterConfig, SampleType, request,
+    };
+
+    fn configure_16k_mono() -> Result<(), CapabilityError> {
+        let fmt = Format::new(
+            SampleType::I16,
+            ByteOrder::Little,
+            16_000,
+            1,
+            Layout::Known([Channel::Mono].into()),
+        )
+        .expect("valid 16kHz mono format");
+
+        let conv = OutputConverterConfig::new(fmt, DitherMode::Tpdf);
+        let plan = request(vec![CaptureTarget::default_output(DefaultDeviceMode::Follow)])
+            .with_output_converter(Some(conv))
+            .with_on_format_change(OnFormatChange::Adapt)
+            .inspect()?;
+
+        assert!(plan.uses_output_converter);
+        Ok(())
+    }
+    let _ = configure_16k_mono();
+    ```
+  </TabItem>
+  <TabItem label="C++17">
+    ```cpp
+    #include <cspa.hpp>
+
+    int main() {
+        auto spk = cspa::Target::default_output().take_value();
+        cspa::OutputConverter conv(
+            16000u,
+            1u,
+            cspa::SampleFormat::I16,
+            cspa::ByteOrder::Little,
+            cspa::DitherMode::Tpdf
+        );
+
+        cspa::CaptureRequest req({spk});
+        req.set_output_converter(conv)
+           .set_on_format_change(cspa::OnFormatChange::Adapt);
+
+        auto plan = req.inspect();
+        return (plan.is_ok() && plan.value().uses_output_converter) ? 0 : 1;
+    }
+    ```
+  </TabItem>
+  <TabItem label="C11">
+    ```c
+    #include <cspa_experimental.h>
+
+    int main(void) {
+        cspa_capture_target_record spk = {0};
+        spk.struct_size = (uint32_t)sizeof(spk);
+        spk.schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+        if (cspa_target_default_output(CSPA_DEFAULT_DEVICE_FOLLOW, 1.0f, &spk) != CSPA_STATUS_OK) return 1;
+
+        cspa_output_converter_record conv = {0};
+        conv.struct_size = (uint32_t)sizeof(conv);
+        conv.schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+        conv.rate_hz = 16000u;
+        conv.channels = 1u;
+        conv.sample_format = CSPA_SAMPLE_FORMAT_I16;
+        conv.byte_order = CSPA_BYTE_ORDER_LITTLE;
+        conv.dither = CSPA_DITHER_TPDF;
+
+        cspa_capture_request_record req = {0};
+        cspa_capture_request_init(&req, &spk, 1u);
+        req.converter = &conv;
+        req.on_format_change = CSPA_ON_FORMAT_CHANGE_ADAPT;
+
+        cspa_plan_report_record rep = {0};
+        rep.struct_size = (uint32_t)sizeof(rep);
+        rep.schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+        return cspa_request_inspect(&req, &rep) == CSPA_STATUS_OK ? 0 : 1;
+    }
+    ```
+  </TabItem>
+</SdkTabs>
+
+<Aside type="tip" title="Unpacking 24-bit PCM in NumPy">
+Because NumPy has no native 3-byte `int24` dtype, `block.to_numpy()` returns shape `(frames, channels, 3)` `uint8` by default on `I24` streams, while `block.to_numpy(unpack_i24=True)` unpacks and sign-extends directly into a 2D `(frames, channels)` `int32` array!
+</Aside>
+
+Continue to [Real-Time Safety, Zero-Alloc Reads & Lifecycle](/capture-system-or-process-audio/concepts/realtime-and-lifecycle/).
