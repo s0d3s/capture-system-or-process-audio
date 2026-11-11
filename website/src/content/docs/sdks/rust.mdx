@@ -1,0 +1,327 @@
+---
+title: Safe-Rust SDK Handbook (crates/capture)
+description: Safe-Rust 1.88+ (#![forbid(unsafe_code)]) handbook for capture-system-or-process-audio — 0-alloc read_into, CspaMixer, Discovery, and AudioStream.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+The [`capture-system-or-process-audio`](https://crates.io/crates/capture-system-or-process-audio) crate (`MSRV 1.88+`) is a **`#![forbid(unsafe_code)]`** unified cross-platform facade. It binds the active OS backend (`WASAPI` on Windows, `PipeWire` & `PulseAudio` on Linux, `Core Audio` & `ScreenCaptureKit` on Apple Silicon macOS) via `#[repr(transparent)]` static dispatch in **one single place**, so your Rust crate never needs per-OS `#[cfg]` audio branches or `dyn` vtable overhead.
+
+---
+
+## 1. Installation & Facade Architecture
+
+```bash
+cargo add capture-system-or-process-audio
+```
+
+| Facade Type | Role | When to Choose |
+| --- | --- | --- |
+| **`CaptureManager`** (`capture`, `capture_single`, `CaptureManager::open`) | Zero-extra-copy `PassThrough` for single targets + `SharedNativeGraphMix` + `CspaMixer` + `OutputConverter` + `Follow` endpoint switching + `OnRootExit::Wait` + live `update_targets` hot-swap. | **Recommended for 99% of applications.** |
+| **`AudioStream`** (`open_stream`, `AudioStream::open`) | Lightweight single-session native backend stream with zero background discovery/watcher threads. | Pinning a single static endpoint or PID for one session only. |
+| **`Discovery`** (`discover`, `discover_query`, `subscribe_discovery`) | Lazy OS target snapshots, parent-tree application roll-up, and bounded `256`-event cursor subscriptions. | Building target pickers or reacting to app/device changes. |
+| **`Permissions`** (`check_permissions`, `request_permissions`) | Non-prompting `PermissionReport` inspection and interactive OS consent requests. | UI permission banners, CLI preflights, and headless services. |
+
+---
+
+## 2. Seven Compile-Verified Rust Examples
+
+### Example 1 — Single-Target Speaker Capture & Clean Drain :badge[Quick Start]{variant=success}
+
+```rust title="src/bin/speaker_capture.rs"
+use capture_system_or_process_audio::{
+    CapabilityError, CaptureTarget, DefaultDeviceMode, Stop, capture_single,
+};
+use std::time::Duration;
+
+fn main() -> Result<(), CapabilityError> {
+    let target = CaptureTarget::default_output(DefaultDeviceMode::Follow);
+    let mut manager = capture_single(target)?;
+
+    let res = manager
+        .read(480, Duration::from_millis(200))
+        .expect("read PCM slices");
+    for slice in &res.chunks {
+        println!(
+            "Slice: {} frames ({} bytes, seq={})",
+            slice.frames,
+            slice.bytes().len(),
+            slice.header().sequence
+        );
+    }
+
+    // Drain preserves already-accepted frames before releasing OS handles:
+    manager.stop(Stop::Drain);
+    manager.wait_cleanup(Duration::from_secs(2));
+    Ok(())
+}
+```
+
+### Example 2 — List, Filter & Capture `CaptureTarget`s Deterministically (`discover_query`) :badge[Discovery]{variant=success}
+
+`Discovery::find_app("Name", ...)` is a single-match convenience helper that fails if multiple instances run or names vary by locale/bundle. Enumerating `discover_query` lets you inspect every available `CaptureTarget`, filter deterministically on `active_audio()`, `pid()`, `app_id()`, `executable_path()`, or `clean_device_id()`, refine with `.with_gain(...)` / `.with_backend(...)`, and pass them directly to `CaptureManager`:
+
+```rust title="src/bin/list_and_filter_targets.rs"
+use capture_system_or_process_audio::{
+    CapabilityError, CaptureManager, CaptureTarget, DefaultDeviceMode, DiscoveryQuery,
+    MixerConfig, Stop, discover_query, request,
+};
+use std::time::Duration;
+
+fn main() -> Result<(), CapabilityError> {
+    let catalog = discover_query(&DiscoveryQuery::default())?;
+    for target in &catalog.targets {
+        println!(
+            "kind={:?} name={:?} pid={:?} active={:?} id={}",
+            target.kind(),
+            target.name().map(|s| s.as_ref()),
+            target.pid(),
+            target.active_audio(),
+            target.logical_id()
+        );
+    }
+
+    let self_pid = std::process::id();
+    let mut selected: Vec<CaptureTarget> = catalog
+        .applications
+        .iter()
+        .filter(|app| app.active_audio() == Some(true) && app.pid() != Some(self_pid))
+        .take(2)
+        .filter_map(|app| app.clone().with_gain(0.85).ok())
+        .collect();
+    if selected.is_empty() {
+        selected.push(CaptureTarget::default_output(DefaultDeviceMode::Follow));
+    }
+
+    let req = request(selected).with_mixer_config(MixerConfig {
+        silence_on_idle: true,
+        ..MixerConfig::default()
+    });
+    let mut manager = CaptureManager::open(req)?;
+    let block = manager
+        .read(480, Duration::from_millis(200))
+        .expect("read filtered targets");
+    println!("Captured {} frames", block.frames);
+
+    manager.stop(Stop::Drain);
+    manager.wait_cleanup(Duration::from_secs(2));
+    Ok(())
+}
+```
+
+### Example 3 — Zero-Allocation Steady-State `read_into` Loop :badge[0 Alloc]{variant=success}
+
+```rust title="src/bin/zero_alloc_loop.rs"
+use capture_system_or_process_audio::{
+    CapabilityError, CaptureTarget, DefaultDeviceMode, MixerConfig, Stop, request,
+    CaptureManager,
+};
+use std::time::Duration;
+
+fn main() -> Result<(), CapabilityError> {
+    let req = request(vec![CaptureTarget::default_output(DefaultDeviceMode::Follow)])
+        .with_mixer_config(MixerConfig {
+            silence_on_idle: true,
+            ..MixerConfig::default()
+        });
+
+    let mut manager = CaptureManager::open(req)?;
+    let fmt = manager.output_format().expect("active output format").clone();
+
+    let chunk_frames = 480usize;
+    let mut pcm_bytes = vec![0u8; chunk_frames * fmt.bytes_per_frame()];
+
+    for _ in 0..50 {
+        // Warmed read_into performs 0 steady-state heap allocations:
+        let res = manager
+            .read_into(&mut pcm_bytes, chunk_frames, Duration::from_millis(200))
+            .expect("read_into buffer");
+        let valid_bytes = &pcm_bytes[..res.frames * fmt.bytes_per_frame()];
+        std::hint::black_box(valid_bytes);
+    }
+
+    manager.stop(Stop::Drain);
+    manager.wait_cleanup(Duration::from_secs(2));
+    Ok(())
+}
+```
+
+### Example 4 — Multi-Source `[Microphone + App]` `CspaMixer` + `16 kHz` `OutputConverter` + Telemetry
+
+```rust title="src/bin/mix_mic_and_app.rs"
+use capture_system_or_process_audio::{
+    ByteOrder, CapabilityError, CaptureManager, CaptureTarget, Channel, DefaultDeviceMode,
+    Discovery, DitherMode, Format, Layout, MixerConfig, OnRootExit, OutputConverterConfig,
+    ProcessScope, SampleType, Stop, request,
+};
+use std::{sync::Arc, time::Duration};
+
+fn main() -> Result<(), CapabilityError> {
+    let mic = CaptureTarget::microphone(DefaultDeviceMode::Follow);
+    let app = Discovery::new()
+        .find_app(
+            "Firefox",
+            ProcessScope::Tree,
+            OnRootExit::Wait {
+                wait_timeout_ns: 5_000_000_000,
+            },
+        )
+        .map_err(|_| CapabilityError::NoSuchProcess)?
+        .with_gain(0.8)?;
+
+    let stt_fmt = Format::new(
+        SampleType::I16,
+        ByteOrder::Little,
+        16_000,
+        1,
+        Layout::Known(Arc::from([Channel::Mono])),
+    )
+    .expect("valid 16 kHz mono format");
+
+    let req = request(vec![mic, app])
+        .with_mixer_config(MixerConfig {
+            silence_on_idle: true,
+            clamp_f32: true,
+            ..MixerConfig::default()
+        })
+        .with_output_converter(Some(OutputConverterConfig::new(stt_fmt, DitherMode::Tpdf)));
+
+    let mut manager = CaptureManager::open(req)?;
+    let block = manager
+        .read(1600, Duration::from_millis(250))
+        .expect("100 ms @ 16 kHz");
+    println!("Mixed {} frames", block.frames);
+
+    // Inspect per-input InputNormalizer (BYPASS vs SYNC) and drift telemetry:
+    for handle in manager.input_handles() {
+        if let Some(snap) = handle.snapshot() {
+            println!(
+                "Input #{} ({}): state={:?}, bypass={}, slips={}",
+                handle.target_index(),
+                handle.target_id(),
+                snap.participation_state,
+                handle.is_identity_bypass(),
+                snap.drift_slips
+            );
+        }
+    }
+
+    manager.stop(Stop::Drain);
+    manager.wait_cleanup(Duration::from_secs(2));
+    Ok(())
+}
+```
+
+### Example 5 — Structured `DiscoveryQuery`, `subscribe_discovery` & Live `update_targets`
+
+```rust title="src/bin/discovery_and_hotswap.rs"
+use capture_system_or_process_audio::{
+    CapabilityError, CaptureTarget, DefaultDeviceMode, DiscoveryDedupe, DiscoveryEventKind,
+    DiscoveryOrder, DiscoveryQuery, Stop, capture, discover_query, subscribe_discovery,
+};
+use std::time::Duration;
+
+fn main() -> Result<(), CapabilityError> {
+    let query = DiscoveryQuery::default()
+        .with_dedupe(DiscoveryDedupe::ByLogicalTarget)
+        .with_order(DiscoveryOrder::KindThenBackend);
+
+    let catalog = discover_query(&query)?;
+    println!(
+        "Apps: {}, Output Devs: {}, Mics: {}",
+        catalog.applications.len(),
+        catalog.output_devices.len(),
+        catalog.input_devices.len()
+    );
+
+    let sub = subscribe_discovery(query, 256)?;
+    while let Some(ev) = sub.poll_event() {
+        if matches!(ev.kind, DiscoveryEventKind::ResnapshotRequired { .. }) {
+            let _fresh = sub.resnapshot_catalog().map_err(CapabilityError::from)?;
+        }
+    }
+
+    let mut manager = capture(vec![CaptureTarget::default_output(DefaultDeviceMode::Follow)])?;
+    let rev = manager.update_targets(vec![
+        CaptureTarget::default_output(DefaultDeviceMode::Follow),
+        CaptureTarget::microphone(DefaultDeviceMode::Follow),
+    ])?;
+    println!("Hot-swapped to membership revision {rev}");
+
+    manager.stop(Stop::Abort);
+    manager.wait_cleanup(Duration::from_secs(2));
+    Ok(())
+}
+```
+
+### Example 6 — Side-Effect-Free `request.inspect()` & Permissions Preflight
+
+```rust title="src/bin/plan_and_permissions.rs"
+use capture_system_or_process_audio::{
+    CapabilityError, CaptureTarget, CombineMode, DefaultDeviceMode, PermissionPolicy,
+    check_request_permissions, request, request_for_capture_request,
+};
+use std::time::Duration;
+
+fn main() -> Result<(), CapabilityError> {
+    let req = request(vec![
+        CaptureTarget::microphone(DefaultDeviceMode::Follow),
+        CaptureTarget::default_output(DefaultDeviceMode::Follow),
+    ])
+    .with_combine_mode(CombineMode::Auto)
+    .with_permission_policy(PermissionPolicy::CheckOnly);
+
+    // 1. Preview backend resolution & RAM budget without opening OS audio handles:
+    let plan = req.inspect()?;
+    println!(
+        "Plan: {:?} | active_streams={} | pcm_bytes={}",
+        plan.combine_resolution, plan.estimated_active_streams, plan.estimated_pcm_bytes
+    );
+
+    // 2. Non-prompting OS consent inspection:
+    let perms = check_request_permissions(&req)?;
+    if !perms.is_granted() && !perms.has_denial() {
+        let _updated = request_for_capture_request(&req, Duration::from_secs(30), false)?;
+    }
+    Ok(())
+}
+```
+
+### Example 7 — Direct Single-Session `AudioStream::open_with_permission_policy`
+
+```rust title="src/bin/direct_audio_stream.rs"
+use capture_system_or_process_audio::{
+    Backends, CapabilityError, CaptureTarget, DefaultDeviceMode, Overflow, PermissionPolicy,
+    ProcessTreeRange, Stop, TimingRequirement, open_stream_with_permission_policy,
+};
+use std::time::Duration;
+
+fn main() -> Result<(), CapabilityError> {
+    // Pin resolves the current OS default speaker snapshot once without spawning a Follow watcher:
+    let target = CaptureTarget::default_output(DefaultDeviceMode::Pin);
+
+    let mut stream = open_stream_with_permission_policy(
+        &target,
+        ProcessTreeRange::default(),
+        &Backends::default(),
+        Overflow::DropOldest,
+        TimingRequirement::Raw,
+        PermissionPolicy::CheckOnly,
+    )?;
+
+    let fmt = stream.format().clone();
+    let mut buf = vec![0u8; 480 * fmt.bytes_per_frame()];
+    let res = stream
+        .read_into(&mut buf, 480, Duration::from_millis(100))
+        .expect("direct single-session read");
+    println!("Direct stream read {} frames", res.frames);
+
+    stream.stop(Stop::Abort);
+    stream.wait_cleanup(Duration::from_secs(2));
+    Ok(())
+}
+```
+
+<Aside type="note" title="Zero Linux Dynamic-Linker Dependencies">
+On Linux, `capture-system-or-process-audio-linux` loads `libpipewire-0.3.so.0` and `libpulse.so.0` dynamically via `dlopen` at stream open time (`0` compile-time `DT_NEEDED` entries in `readelf -d`), so your compiled Rust binary starts cleanly even on minimal server or container images without audio libraries installed.
+</Aside>

@@ -1,0 +1,167 @@
+---
+title: Ecosystem Integrations & Drop-In Adapters
+description: Verified NumPy, faster-whisper, wave, and asyncio recipes today plus Planned drop-in PyAudioWPatch, sounddevice, SoundCard, and Node.js adapters.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import CapabilityBadge from '../../../components/CapabilityBadge.astro';
+
+`capture-system-or-process-audio` is designed around a strict 4-layer boundary: **Backends capture. Core orders and buffers. Manager plans, monitors, mixes and reopens sessions. Adapters adapt.**
+
+This guide is organized into two clearly separated parts:
+1. **Works Today (`v1.3.1`):** Zero-overhead direct integration recipes for **`NumPy` / `SciPy`**, **`faster-whisper` / STT**, **stdlib `wave`**, and **`asyncio` / Realtime WebSockets** using the shipped `1.3.1` API.
+2. **Planned — Next Release:** Architectural overview, cross-library representation rules, and roadmap for zero-rewrite **Drop-In Python `Adapters`** (`PyAudio` / `PyAudioWPatch`, `python-sounddevice`, `SoundCard`, `SpeechRecognition`) and the **`Node.js / TypeScript / Electron` (`napi-rs`) SDK**.
+
+---
+
+## Part 1 — Works Today: Direct Ecosystem Recipes :badge[Shipped v1.3.1]{variant=success}
+
+Every recipe below runs directly on the current `capture-system-or-process-audio` `1.3.1` wheel with zero wrapper packages needed.
+
+### 1. `NumPy` & `SciPy` Zero-Copy 2D `(frames, channels)` Views
+
+`PcmBlock.to_numpy(copy=False)` exposes a C-contiguous `(frames, channels)` `numpy.ndarray` pinned directly to the reference-counted Rust pool slot (safe even after `stream.stop()`):
+
+```python title="numpy_zero_copy.py"
+import capture_system_or_process_audio as cspa
+
+conv = cspa.OutputConverter(rate=48000, channels=2, sample_format=cspa.SampleType.F32)
+
+with cspa.capture(cspa.default_output(), output_converter=conv, silence_on_idle=True) as stream:
+    outcome = stream.read(960, timeout_ms=200)
+    for block in outcome.blocks:
+        # Always 2D (frames, channels) — even mono is (frames, 1):
+        arr = block.to_numpy(copy=False)
+        rms_per_channel = (arr**2).mean(axis=0) ** 0.5
+        print("Stereo RMS:", rms_per_channel)
+
+# Note on 24-bit PCM (`SampleType.I24`):
+# NumPy has no native 3-byte scalar dtype. Pass `unpack_i24=True` to sign-extend
+# packed 24-bit samples into `int32` (`[-8_388_608, 8_388_607]` full scale).
+```
+
+### 2. `faster-whisper` / Local Speech-to-Text (`16 kHz` Mono `1D float32`)
+
+`openai-whisper` and `faster-whisper` expect a **1D `(samples,)` `float32`** array normalized to `[-1.0, 1.0]` at `16000 Hz`. Configure `OutputConverter` in Rust and call `.reshape(-1)`:
+
+```python title="faster_whisper_chunks.py"
+import capture_system_or_process_audio as cspa
+
+stt_conv = cspa.OutputConverter(
+    rate=16000,
+    channels=1,
+    sample_format=cspa.SampleType.F32,
+)
+
+# Mixes user microphone + Zoom call audio in Rust with 64-frame crossfade drift sync:
+targets = [cspa.microphone(), cspa.find_app("Zoom", scope="tree")]
+
+with cspa.capture(targets, output_converter=stt_conv, silence_on_idle=True) as stream:
+    window_1d = []
+    outcome = stream.read(8000, timeout_ms=600)  # 0.5 s @ 16 kHz
+    for block in outcome.blocks:
+        # Reshape (frames, 1) -> 1D (frames,) for WhisperModel.transcribe(...):
+        window_1d.append(block.to_numpy(copy=True).reshape(-1))
+    print("Collected", len(window_1d), "16 kHz 1D float32 slices")
+```
+
+### 3. Standard Library `wave` Writer (`I16` + Zero-Copy `memoryview`)
+
+```python title="record_to_wav.py"
+import wave
+import capture_system_or_process_audio as cspa
+
+wav_conv = cspa.OutputConverter(
+    rate=48000,
+    channels=2,
+    sample_format=cspa.SampleType.I16,
+    dither=cspa.DitherMode.TPDF,
+)
+
+with wave.open("system_capture.wav", "wb") as wf:
+    wf.setnchannels(2)
+    wf.setsampwidth(2)  # 16-bit signed little-endian PCM
+    wf.setframerate(48000)
+
+    with cspa.capture(cspa.default_output(), output_converter=wav_conv, silence_on_idle=True) as stream:
+        for _ in range(25):  # ~0.5 s @ 20 ms reads
+            outcome = stream.read(960, timeout_ms=250)
+            for block in outcome.blocks:
+                wf.writeframesraw(memoryview(block))
+        stream.stop("drain")
+        stream.wait_cleanup()
+```
+
+### 4. Realtime Voice AI WebSockets (`24 kHz` Mono `pcm16` via `asyncio`)
+
+Realtime multimodal APIs (such as OpenAI Realtime `pcm16` at `24000 Hz` or Deepgram `linear16` at `16000 Hz`) stream raw little-endian `int16` bytes without WAV headers:
+
+```python title="realtime_voice_ws.py"
+import asyncio
+import base64
+import capture_system_or_process_audio as cspa
+
+
+async def build_realtime_payloads() -> list[str]:
+    pcm24k = cspa.OutputConverter(rate=24000, channels=1, sample_format="i16")
+    payloads: list[str] = []
+
+    async with cspa.capture(
+        [cspa.microphone(), cspa.default_output()],
+        output_converter=pcm24k,
+        silence_on_idle=True,
+    ) as stream:
+        outcome = await stream.read_async(1200, timeout_ms=200)  # 50 ms @ 24 kHz
+        for block in outcome.blocks:
+            payloads.append(base64.b64encode(memoryview(block)).decode("ascii"))
+    return payloads
+
+
+if __name__ == "__main__":
+    _ = asyncio.run(build_realtime_payloads())
+```
+
+---
+
+## Part 2 — Zero-Rewrite Drop-In `Adapters` & `Node.js` SDK :badge[Planned]{variant=caution}
+
+<Aside type="caution" title="Roadmap Notice — Not in Shipped v1.3.1">
+The Drop-In Python `Adapters` and `Node.js / TypeScript` (`napi-rs`) package described below are **planned for the next release** (post-`1.3.1`). They are not present in `capture-system-or-process-audio` `1.3.1`; use the Part 1 direct recipes above today.
+</Aside>
+
+### Why Layer-4 Drop-In Adapters Matter
+
+Existing Python codebases built on `PyAudio` / `PyAudioWPatch`, `python-sounddevice`, `SoundCard`, or `SpeechRecognition` assume microphone-centric semantics that break or deadlock on native OS process/speaker loopback unless adapted carefully:
+
+1. **Preventing the Silent Loopback Deadlock (`silence_on_idle=True` by default):** Code written for `PyAudio.Stream.read(1024)` or `sd.InputStream.read(1024)` expects every read to return on wall-clock schedule. Because Windows WASAPI loopback emits `0` packets when speakers are idle, naive ports hang forever during silence. The planned adapters enable `silence_on_idle=True` by default (with opt-out).
+2. **Zero-Copy Exact-Frame Reblocking Across Continuity Boundaries:** `ManagedStream.read(N)` intentionally stops at device/format boundaries (`PartialReason.BOUNDARY`), returning `0..N` frames. A shared `ExactFrameReader` ring over `ManagedStream.read_into` delivers exact `num_frames` chunks expected by `PyAudio`, `sounddevice`, and `SoundCard` without extra intermediate copies.
+3. **Target Upgrade Without Silent Fallback:** Every adapter preserves legacy `device=` / `input_device_index=` kwargs while adding `target: CaptureTarget | Sequence[CaptureTarget]` — so any existing `sounddevice`, `PyAudioWPatch`, or `SpeechRecognition` pipeline can switch to `target=cspa.find_app("Teams")` or `target=[cspa.microphone(), cspa.find_app("Zoom")]` while preserving strict `CapabilityError` honesty.
+4. **Cross-Library Shape & Scaling Fidelity:**
+   - **Mono Shape Rule:** `sounddevice.InputStream` and `SoundCard._Recorder` always emit **2D `(frames, 1)`** for mono, whereas `soundfile.read(..., always_2d=False)` and `faster-whisper` expect **1D `(frames,)`**, and `PyAV` expects `(1, frames * channels)` packed or `(channels, frames)` planar.
+   - **Safe Callback Lifetimes:** Unlike `sounddevice`'s borrowed PortAudio CFFI buffer (which dangles immediately when `callback` returns), `PcmBlock`-backed views stay memory-safe via `Arc` pool ownership.
+   - **`paInt24` vs `get_format_from_width(4)`:** Explicit mapping avoids `PyAudio.get_format_from_width(4)`'s `paFloat32` vs `32-bit int` trap and documents `unpack_i24=True`'s `[-2^23, 2^23 - 1]` vs `soundfile` `PCM_24` left-shifted `[-2^31, 2^31 - 256]` (`256x`) convention.
+
+### Planned Python Drop-In Adapter Matrix
+
+| Adapter Surface | Target Ecosystem | Delivery Contract | Status |
+| --- | --- | --- | --- |
+| **`PyAudioAdapter` / `PyAudioStreamAdapter`** | `pyaudio` & `PyAudioWPatch` | Exact-frame `stream.read(num_frames, exception_on_overflow=True) -> bytes` + `(in_data, frames, time_info, status)` push callbacks (`paInt16`, `paFloat32`, `paInt24`, `paInt32`). | <CapabilityBadge status="planned" /> |
+| **`SoundDeviceInputStreamAdapter` / `RawInputStream` / `rec()`** | `python-sounddevice` | Pull `(np.ndarray, overflowed)` & push `cb(indata, frames, time, CallbackFlags)` (`CallbackStop` / `CallbackAbort`) in 2D `(frames, channels)`. | <CapabilityBadge status="planned" /> |
+| **`SoundCardRecorderAdapter`** | `SoundCard` (`include_loopback=True` migrators) | `rec.record(numframes=None \| int) -> np.ndarray` (`float32` 2D) + `rec.flush()`. | <CapabilityBadge status="planned" /> |
+| **`SpeechRecognitionAudioSource`** | `speech_recognition` (`Recognizer.listen` / `listen_in_background`) | Drop-in `sr.AudioSource` yielding `16 kHz` mono `int16` chunks with zero `PyAudio` install required. | <CapabilityBadge status="planned" /> |
+| **Sliding-Window Whisper / VAD Helpers** | `faster-whisper`, Silero VAD | 1D `16 kHz` `float32` frame windowing & overlap-stride iterator. | <CapabilityBadge status="planned" /> |
+
+---
+
+### Planned `Node.js / TypeScript / Electron` SDK (`napi-rs`) :badge[Planned]{variant=caution}
+
+Desktop AI meeting copilots, voice agents (`@livekit/rtc-node`, OpenAI Realtime, Deepgram, `@huggingface/transformers`), and `@discordjs/voice` relays in Electron and Node.js face acute gaps today: Electron's `desktopCapturer` cannot isolate external apps (`Zoom`, `Spotify`) and silently returns dead `'ended'` tracks on macOS TCC failure, while popular npm mic packages spawn external `sox`/`arecord` CLIs.
+
+The planned `napi-rs` (`Node-API`) binding wraps the exact same `#![forbid(unsafe_code)]` `crates/capture` Rust facade with four Electron/V8 safety guarantees:
+
+| Design Pillar | Planned Node.js / Electron Contract | Status |
+| --- | --- | --- |
+| **Electron 21+ V8 Memory Cage Safety** | Allocates `Float32Array` / `Int16Array` / `Uint8Array` inside V8's heap (`byteOffset === 0`, avoiding both external-`ArrayBuffer` sandbox crashes and Node `8 KiB` `Buffer` slab `.buffer` corruption in `@livekit/rtc-node`) + `stream.readInto(typedArray)` for **0-GC** steady-state loops. | <CapabilityBadge status="planned" /> |
+| **Idiomatic JS Delivery Surfaces** | `for await (const chunk of stream)` (`AsyncIterable` + `AbortSignal`), `stream.toNodeReadable()` (`node:stream.Readable` with backpressure for `@discordjs/voice` & `ffmpeg`), `onChunk` push callbacks, and `await using` (`Symbol.asyncDispose`). | <CapabilityBadge status="planned" /> |
+| **Built-In Consumer Format Presets** | One-option Rust `OutputConverter` + `silenceOnIdle: true` presets for `whisper-16k-mono-f32`, `stt-16k-mono-s16`, `openai-realtime-24k-mono-s16`, and `discord-48k-stereo-s16`. | <CapabilityBadge status="planned" /> |
+| **Zero `node-gyp` / Zero Linux `NEEDED` Links** | Prebuilt platform `optionalDependencies` (`win32-x64/arm64`, `darwin-arm64`, `linux-x64/arm64-gnu`) ABI-stable across Node `20+`, Electron `28–45+` (no `electron-rebuild`), Bun, and Deno. | <CapabilityBadge status="planned" /> |

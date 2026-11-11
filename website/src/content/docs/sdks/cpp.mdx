@@ -1,0 +1,335 @@
+---
+title: C++17 Header-Only RAII Handbook (cspa.hpp & CMake)
+description: Complete C++17 developer handbook for cspa.hpp and Cspa::cspa_ffi CMake integration, with 5 verified examples across deterministic discovery, -fno-exceptions, and *_or_throw().
+---
+
+import { Aside, FileTree, Steps } from '@astrojs/starlight/components';
+
+`include/cspa.hpp` is a **zero-`#ifdef`-per-OS header-only C++17 RAII wrapper** layered over the version-checked C11 ABI (`cspa_ffi`). It delivers move-only RAII handles (`cspa::ManagedStream`, `cspa::AudioStream`, `cspa::Discovery`, `cspa::DiscoverySubscription`, `cspa::PcmBlock`, `cspa::CancelToken`) across **Windows (`x64`, `ARM64`)**, **Linux (`x86_64`, `aarch64`)**, and **Apple Silicon macOS (`arm64`)**.
+
+---
+
+## 1. Prebuilt SDK Layout & CMake Setup
+
+Download `cspa-ffi-<version>-<target>.zip` (Windows) or `.tar.gz` (Linux / macOS) from [GitHub Releases](https://github.com/s0d3s/capture-system-or-process-audio/releases/latest):
+
+<FileTree>
+- cspa-ffi-&lt;version&gt;-&lt;target&gt;/
+  - include/
+    - **cspa.hpp** Header-only C++17 RAII wrapper (`namespace cspa`)
+    - **cspa_experimental.h** Underlying C11 size & schema-revision-checked ABI
+  - lib/
+    - cspa_ffi.dll.lib *(or `libcspa_ffi.so` / `libcspa_ffi.dylib`)*
+    - cmake/Cspa/
+      - **CspaConfig.cmake** Imported target `Cspa::cspa_ffi`
+      - **CspaConfigVersion.cmake** Same-major/minor numeric version check
+  - bin/
+    - cspa_ffi.dll *(Windows runtime DLL)*
+  - LICENSE-MIT
+  - LICENSE-APACHE
+  - THIRD_PARTY_NOTICES.md
+</FileTree>
+
+### Step-by-Step CMake Integration (`Cspa::cspa_ffi`)
+
+<Steps>
+1. **Add `find_package(Cspa REQUIRED CONFIG)` to your `CMakeLists.txt`:**
+
+   ```cmake title="CMakeLists.txt"
+   cmake_minimum_required(VERSION 3.20)
+   project(cspa_cpp_consumer LANGUAGES C CXX)
+
+   find_package(Cspa REQUIRED CONFIG)
+
+   add_executable(capture_app main.cpp)
+   target_compile_features(capture_app PRIVATE cxx_std_17)
+   target_link_libraries(capture_app PRIVATE Cspa::cspa_ffi)
+
+   # On Windows, copy cspa_ffi.dll next to capture_app.exe automatically:
+   if(WIN32)
+       add_custom_command(TARGET capture_app POST_BUILD
+           COMMAND ${CMAKE_COMMAND} -E copy_if_different
+               $<TARGET_FILE:Cspa::cspa_ffi>
+               $<TARGET_FILE_DIR:capture_app>
+       )
+   endif()
+   ```
+
+2. **Configure and build pointing `-DCspa_DIR` to `lib/cmake/Cspa`:**
+
+   ```bash
+   # Windows (MSVC x64 or ARM64):
+   cmake -S . -B build -A x64 -DCspa_DIR="C:/sdk/cspa-ffi/lib/cmake/Cspa"
+   cmake --build build --config Release
+
+   # Linux & Apple Silicon macOS:
+   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCspa_DIR="/opt/cspa-ffi/lib/cmake/Cspa"
+   cmake --build build
+   ```
+</Steps>
+
+<Aside type="note" title="CMake Version Matching & macOS Info.plist Notes">
+- **CMake `find_package` versioning:** Numeric version requests (`find_package(Cspa 1.3 REQUIRED CONFIG)`) accept an exact match or an older requested version with the same `MAJOR.MINOR`; version ranges are rejected, and prerelease/build-metadata builds use unversioned `find_package(Cspa REQUIRED CONFIG)`.
+- **macOS `.app` bundles:** `libcspa_ffi.dylib` carries `@rpath/libcspa_ffi.dylib`. If your C++ binary ships inside a `.app` bundle, include `NSMicrophoneUsageDescription` (for mic input) and `NSAudioCaptureUsageDescription` (for `macOS 14.2+` Core Audio process taps) in `Info.plist`.
+</Aside>
+
+---
+
+## 2. Dual Error-Handling Idioms (`-fno-exceptions` vs `/EHsc`)
+
+`cspa.hpp` automatically detects whether C++ exceptions are enabled (`CSPA_HAS_EXCEPTIONS`):
+- **Exception-Free (`cspa::Result<T>`):** Works identically under `-fno-exceptions` / `/EHs-c- /D_HAS_EXCEPTIONS=0` (game engines, audio plugins, embedded daemons) and standard `/EHsc` builds. Every method is `noexcept` where possible and never throws across the FFI boundary.
+- **Exception-Throwing (`*_or_throw()` & `cspa::unwrap_or_throw`):** Available whenever `CSPA_HAS_EXCEPTIONS == 1`, throwing `cspa::Error` (`std::runtime_error` subclass carrying `.status()`).
+
+---
+
+## 3. Five Compile-Verified C++17 Examples
+
+### Example 1 — Exception-Free `[Speaker + Mic]` Mix & Zero-Alloc `read_into` :badge[-fno-exceptions]{variant=success}
+
+```cpp title="mix_no_exceptions.cpp"
+#include <cspa.hpp>
+#include <cstdint>
+#include <cstdio>
+#include <vector>
+
+int main() {
+    auto spk_res = cspa::Target::default_output(cspa::DefaultDeviceMode::Follow);
+    auto mic_res = cspa::Target::microphone(cspa::DefaultDeviceMode::Follow);
+    if (!spk_res.is_ok() || !mic_res.is_ok()) {
+        return 1;
+    }
+
+    cspa::MixerConfig mixer;
+    mixer.set_silence_on_idle(true).set_clamp_f32(true);
+
+    cspa::CaptureRequest req({spk_res.take_value(), mic_res.take_value()});
+    req.set_combine_mode(cspa::CombineMode::Auto)
+       .set_mixer_config(mixer)
+       .set_output_converter(cspa::OutputConverter(16000, 1, cspa::SampleFormat::I16));
+
+    auto stream_res = cspa::ManagedStream::open(req);
+    if (!stream_res.is_ok()) {
+        std::fprintf(stderr, "Open failed with status %u\n",
+                     static_cast<unsigned>(stream_res.status()));
+        return 1;
+    }
+    cspa::ManagedStream stream = stream_res.take_value();
+
+    // Preallocate 100 ms buffer (1600 frames @ 16 kHz mono int16 = 3200 bytes):
+    std::vector<uint8_t> pcm(1600 * sizeof(int16_t));
+    for (int i = 0; i < 10; ++i) {
+        auto rd = stream.read_into(pcm.data(), pcm.size(), 1600, 250);
+        if (rd.is_ok() && rd.value().copy_bytes > 0) {
+            std::printf("Chunk #%d: %llu frames (%llu B)\n",
+                        i,
+                        static_cast<unsigned long long>(rd.value().frames),
+                        static_cast<unsigned long long>(rd.value().copy_bytes));
+        }
+    }
+
+    // Inspect per-input normalizer (BYPASS vs SYNC) status:
+    auto count_res = stream.input_count();
+    if (count_res.is_ok()) {
+        for (size_t idx = 0; idx < count_res.value(); ++idx) {
+            auto st = stream.input_status(idx);
+            if (st.is_ok()) {
+                std::printf("Input #%zu: bypass=%u, slips=%llu\n",
+                            idx,
+                            st.value().is_identity_bypass,
+                            static_cast<unsigned long long>(st.value().drift_slips));
+            }
+        }
+    }
+
+    stream.stop(false); // false = Drain, true = Abort
+    stream.wait_cleanup(2000);
+    return 0;
+}
+```
+
+### Example 2 — List, Filter & Capture Available `cspa::Target`s Deterministically :badge[Discovery]{variant=success}
+
+Enumerating `cspa::Discovery::query` lets you inspect every available application, process, speaker endpoint, and microphone, filter deterministically on `kind()`, `raw().active_audio == CSPA_ACTIVE_AUDIO_ACTIVE`, `pid()`, `app_id()`, or `raw().executable_path`, refine with `.with_gain(...)` / `.with_backend(...)`, and pass the exact targets into `cspa::CaptureRequest`:
+
+```cpp title="list_and_filter_targets.cpp"
+#include <cspa.hpp>
+#include <cstdint>
+#include <cstdio>
+#include <vector>
+
+int main() {
+    auto disc_res = cspa::Discovery::create();
+    if (!disc_res.is_ok()) return 1;
+    cspa::Discovery disc = disc_res.take_value();
+
+    cspa::DiscoveryQuery query;
+    auto catalog_res = disc.query(query);
+    if (!catalog_res.is_ok()) return 1;
+
+    std::vector<cspa::Target> selected;
+    for (const cspa::Target &t : catalog_res.value()) {
+        std::printf("kind=%u name='%s' pid=%u active=%u\n",
+                    static_cast<unsigned>(t.kind()),
+                    t.name(),
+                    t.pid(),
+                    t.raw().active_audio);
+        if (t.kind() == cspa::TargetKind::Application &&
+            t.raw().active_audio == CSPA_ACTIVE_AUDIO_ACTIVE &&
+            selected.size() < 2) {
+            auto scaled = t.with_gain(0.85f);
+            if (scaled.is_ok()) selected.push_back(scaled.take_value());
+        }
+    }
+    if (selected.empty()) {
+        selected.push_back(cspa::Target::default_output(cspa::DefaultDeviceMode::Follow).take_value());
+    }
+
+    cspa::MixerConfig mixer;
+    mixer.set_silence_on_idle(true);
+    cspa::CaptureRequest req(std::move(selected));
+    req.set_mixer_config(mixer);
+
+    auto stream_res = cspa::ManagedStream::open(req);
+    if (!stream_res.is_ok()) return 1;
+    cspa::ManagedStream stream = stream_res.take_value();
+
+    std::vector<uint8_t> pcm(480 * 8);
+    (void)stream.read_into(pcm.data(), pcm.size(), 480, 200);
+    stream.stop(false);
+    stream.wait_cleanup(2000);
+    return 0;
+}
+```
+
+### Example 3 — Exception-Enabled `*_or_throw()` Process Capture & Zero-Copy `PcmBlock`
+
+```cpp title="process_capture_exceptions.cpp"
+#include <cspa.hpp>
+#include <cstdio>
+
+int main() {
+#if CSPA_HAS_EXCEPTIONS
+    try {
+        cspa::Target proc = cspa::Target::process_or_throw(
+            4242,
+            0,
+            cspa::ProcessScope::Tree,
+            cspa::OnRootExitMode::Wait,
+            5000000000ULL // 5 s relaunch grace window in nanoseconds
+        );
+
+        cspa::CaptureRequest req({proc});
+        cspa::PlanReport plan = req.inspect_or_throw();
+        std::printf("Planned active streams: %llu (PCM budget: %llu B)\n",
+                    static_cast<unsigned long long>(plan.estimated_active_streams),
+                    static_cast<unsigned long long>(plan.estimated_pcm_bytes));
+
+        cspa::ManagedStream stream = cspa::ManagedStream::open_or_throw(req);
+        cspa::ReadOutcome out = cspa::unwrap_or_throw(stream.read(480, 200));
+
+        // Zero-copy RAII PcmBlock view remains valid even after stream.stop():
+        stream.stop(false);
+        if (out.block.valid()) {
+            std::printf("Retained %llu frames (%llu B) at %p\n",
+                        static_cast<unsigned long long>(out.block.frames()),
+                        static_cast<unsigned long long>(out.block.byte_len()),
+                        static_cast<const void *>(out.block.data()));
+        }
+        stream.wait_cleanup(2000);
+    } catch (const cspa::Error &err) {
+        std::fprintf(stderr, "cspa::Error (status=%u): %s\n",
+                     static_cast<unsigned>(err.status()), err.what());
+        return 1;
+    }
+#endif
+    return 0;
+}
+```
+
+### Example 4 — Live `cspa::DiscoverySubscription` & `update_targets` Hot-Swap
+
+```cpp title="discovery_and_hotswap.cpp"
+#include <cspa.hpp>
+#include <cstdio>
+
+int main() {
+    auto disc_res = cspa::Discovery::create();
+    if (!disc_res.is_ok()) return 1;
+    cspa::Discovery disc = disc_res.take_value();
+
+    cspa::DiscoveryQuery query;
+    query.set_dedupe(cspa::DiscoveryDedupe::ByLogicalTarget)
+         .set_order(cspa::DiscoveryOrder::KindThenBackend)
+         .set_active_only(true);
+
+    auto targets_res = disc.query(query);
+    if (targets_res.is_ok()) {
+        for (const auto &t : targets_res.value()) {
+            std::printf("Active target: %s (pid=%u)\n", t.name(), t.pid());
+        }
+    }
+
+    auto sub_res = disc.subscribe_query(query, 256);
+    if (sub_res.is_ok()) {
+        cspa::DiscoverySubscription sub = sub_res.take_value();
+        cspa::DiscoveryEvent ev;
+        while (true) {
+            auto polled = sub.poll(ev);
+            if (!polled.is_ok() || !polled.value()) break;
+            if (ev.kind == cspa::DiscoveryEventKind::ResnapshotRequired) {
+                uint64_t rev = 0;
+                (void)sub.resnapshot(&rev);
+            }
+        }
+    }
+
+    auto spk = cspa::Target::default_output();
+    auto mic = cspa::Target::microphone();
+    if (!spk.is_ok() || !mic.is_ok()) return 1;
+
+    cspa::CaptureRequest req({spk.value()});
+    auto stream_res = cspa::ManagedStream::open(req);
+    if (stream_res.is_ok()) {
+        cspa::ManagedStream stream = stream_res.take_value();
+        auto ver = stream.update_targets({spk.take_value(), mic.take_value()});
+        if (ver.is_ok()) {
+            std::printf("Hot-swapped membership version: %llu\n",
+                        static_cast<unsigned long long>(ver.value()));
+        }
+        stream.stop(true);
+        stream.wait_cleanup(2000);
+    }
+    return 0;
+}
+```
+
+### Example 5 — Non-Prompting OS Permissions Preflight (`cspa::PermissionReport`)
+
+```cpp title="permissions_preflight.cpp"
+#include <cspa.hpp>
+#include <cstdio>
+
+int main() {
+    auto mic = cspa::Target::microphone();
+    auto spk = cspa::Target::default_output();
+    if (!mic.is_ok() || !spk.is_ok()) return 1;
+
+    std::vector<cspa::Target> targets = {mic.take_value(), spk.take_value()};
+
+    auto check_res = cspa::check_permissions(targets);
+    if (!check_res.is_ok()) return 1;
+    const cspa::PermissionReport &rep = check_res.value();
+
+    std::printf("Granted=%d | Mic=%u | SysAudio=%u | Relaunch=%d\n",
+                rep.is_granted ? 1 : 0,
+                static_cast<unsigned>(rep.microphone().state),
+                static_cast<unsigned>(rep.system_audio().state),
+                rep.requires_relaunch ? 1 : 0);
+
+    if (!rep.is_granted && !rep.has_denial) {
+        (void)cspa::request_permissions(targets, 30000, false);
+    }
+    return 0;
+}
+```

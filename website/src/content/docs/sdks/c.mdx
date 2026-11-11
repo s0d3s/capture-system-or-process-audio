@@ -1,0 +1,301 @@
+---
+title: C11 Wire ABI Handbook (cspa_experimental.h)
+description: C11 FFI handbook for cspa_experimental.h — ABI handshake, struct_size & schema_revision safety, panic containment, and 5 verified C11 examples.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+`include/cspa_experimental.h` defines the self-contained C11 wire ABI (`CSPA_EXPERIMENTAL_ABI_MAJOR = 0`, `CSPA_EXPERIMENTAL_SCHEMA_REVISION = 1`) exported by `cspa_ffi` (`cspa_ffi.dll`, `libcspa_ffi.so`, `libcspa_ffi.dylib`). It is ideal for pure C11 applications as well as foreign-function bindings in Go (`cgo`), Zig (`@cImport`), C# (`LibraryImport`), Swift, or Java Panama.
+
+---
+
+## 1. Wire ABI Safety & Ownership Invariants
+
+1. **Startup Handshake (`cspa_abi_check`):** Call `cspa_abi_check(CSPA_EXPERIMENTAL_ABI_MAJOR, CSPA_EXPERIMENTAL_SCHEMA_REVISION)` once at initialization to verify header-to-library compatibility before passing structs.
+2. **Explicit `struct_size` + `schema_revision` Validation:** Every versioned record (`cspa_capture_target_record`, `cspa_capture_request_record`, `cspa_managed_read_outcome_record`, `cspa_plan_report_record`, `cspa_permission_report_record`, etc.) validates `struct_size == sizeof(record)` and `schema_revision == CSPA_EXPERIMENTAL_SCHEMA_REVISION`, returning `CSPA_STATUS_ABI_MISMATCH` (`2`) on mismatch instead of corrupting stack memory.
+3. **`catch_unwind` FFI Boundary:** Every `extern "C"` entrypoint wraps Rust execution in `std::panic::catch_unwind`, converting any unexpected panic into `CSPA_STATUS_INTERNAL_ERROR` (`9`) rather than unwinding across C frames.
+4. **Explicit Handle & Block Release:**
+
+| Handle / Record | Acquire Function | Release Function |
+| --- | --- | --- |
+| `cspa_stream *` | `cspa_stream_open` / `cspa_stream_open_with_policy` | `cspa_stream_release(stream)` |
+| `cspa_manager *` | `cspa_manager_open` | `cspa_manager_release(manager)` |
+| `cspa_discovery *` | `cspa_discovery_create` / `_with_backends` | `cspa_discovery_release(discovery)` |
+| `cspa_discovery_subscription *` | `cspa_discovery_subscribe_query` | `cspa_discovery_subscription_release(sub)` |
+| `cspa_cancel *` | `cspa_cancel_create` | `cspa_cancel_release(cancel)` |
+| `cspa_block_record` *(from `cspa_manager_read`)* | `cspa_manager_read` (`retained_owner != NULL`) | `cspa_block_release(&outcome.block)` |
+
+<Aside type="caution" title="Always release cspa_block_record on zero-copy reads">
+When calling `cspa_manager_read(...)`, `outcome.block.retained_owner` holds a reference-counted lease on an SPSC pool slot so `outcome.block.bytes` stays valid even after `cspa_manager_stop`. Call `cspa_block_release(&outcome.block)` as soon as you finish inspecting `bytes` so the slot returns to the bounded pool (`cspa_manager_read_into` copies directly into your buffer and leaves `retained_owner == NULL`).
+</Aside>
+
+---
+
+## 2. Five Compile-Verified C11 Examples (`/std:c11 /we4013`)
+
+### Example 1 — ABI Handshake & Single-Session `cspa_stream_open_with_policy`
+
+```c title="single_stream.c"
+#include <cspa_experimental.h>
+#include <stdint.h>
+#include <stdio.h>
+
+int main(void) {
+    if (cspa_abi_check(CSPA_EXPERIMENTAL_ABI_MAJOR, CSPA_EXPERIMENTAL_SCHEMA_REVISION) != CSPA_STATUS_OK) {
+        fprintf(stderr, "ABI mismatch between header and shared library\n");
+        return 1;
+    }
+
+    cspa_capture_target_record target = {0};
+    target.struct_size = (uint32_t)sizeof(target);
+    target.schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+    if (cspa_target_default_output(CSPA_DEFAULT_DEVICE_PIN, 1.0f, &target) != CSPA_STATUS_OK) {
+        return 1;
+    }
+
+    cspa_stream *stream = NULL;
+    uint32_t st = cspa_stream_open_with_policy(
+        &target,
+        CSPA_OVERFLOW_DROP_OLDEST,
+        CSPA_PERMISSION_POLICY_CHECK_ONLY,
+        &stream
+    );
+    if (st != CSPA_STATUS_OK) {
+        fprintf(stderr, "cspa_stream_open_with_policy failed: %u\n", st);
+        return 1;
+    }
+
+    cspa_pcm_format_record fmt = {0};
+    fmt.struct_size = (uint32_t)sizeof(fmt);
+    fmt.schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+    if (cspa_stream_format(stream, &fmt) == CSPA_STATUS_OK) {
+        printf("Stream format: %u Hz, %u ch\n", fmt.rate_hz, fmt.channels);
+    }
+
+    uint8_t pcm[480 * 8];
+    cspa_managed_read_outcome_record out = {0};
+    out.struct_size = (uint32_t)sizeof(out);
+    out.schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+
+    if (cspa_stream_read_into(stream, pcm, sizeof(pcm), 480u, 150u, NULL, &out) == CSPA_STATUS_OK) {
+        printf("Read %llu frames (%llu bytes)\n",
+               (unsigned long long)out.actual_frames,
+               (unsigned long long)out.copy_bytes);
+    }
+
+    cspa_stream_stop(stream, 0u);
+    uint32_t cleaned = 0u;
+    cspa_stream_wait_cleanup(stream, 2000u, &cleaned);
+    cspa_stream_release(stream);
+    return 0;
+}
+```
+
+### Example 2 — Multi-Target `cspa_manager_open`, `OutputConverter`, `read_into` & `cspa_block_release` :badge[0 Alloc]{variant=success}
+
+```c title="manager_mix.c"
+#include <cspa_experimental.h>
+#include <stdint.h>
+#include <stdio.h>
+
+int main(void) {
+    if (cspa_abi_check(CSPA_EXPERIMENTAL_ABI_MAJOR, CSPA_EXPERIMENTAL_SCHEMA_REVISION) != CSPA_STATUS_OK) {
+        return 1;
+    }
+
+    cspa_capture_target_record targets[2] = {{0}, {0}};
+    for (size_t i = 0; i < 2u; ++i) {
+        targets[i].struct_size = (uint32_t)sizeof(targets[i]);
+        targets[i].schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+    }
+    if (cspa_target_default_output(CSPA_DEFAULT_DEVICE_FOLLOW, 1.0f, &targets[0]) != CSPA_STATUS_OK ||
+        cspa_target_microphone(CSPA_DEFAULT_DEVICE_FOLLOW, 1.0f, &targets[1]) != CSPA_STATUS_OK) {
+        return 1;
+    }
+
+    cspa_mixer_config_record mixer = {0};
+    if (cspa_mixer_config_init(&mixer) != CSPA_STATUS_OK) return 1;
+    mixer.silence_on_idle = 1u;
+    mixer.clamp_f32 = 1u;
+
+    cspa_output_converter_record conv = {0};
+    conv.struct_size = (uint32_t)sizeof(conv);
+    conv.schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+    conv.rate_hz = 16000u;
+    conv.channels = 1u;
+    conv.sample_format = CSPA_SAMPLE_FORMAT_I16;
+    conv.byte_order = CSPA_BYTE_ORDER_LITTLE;
+    conv.dither = CSPA_DITHER_TPDF;
+
+    cspa_capture_request_record req = {0};
+    if (cspa_capture_request_init(&req, targets, 2u) != CSPA_STATUS_OK) return 1;
+    req.mixer_config = &mixer;
+    req.converter = &conv;
+
+    cspa_manager *mgr = NULL;
+    if (cspa_manager_open(&req, &mgr) != CSPA_STATUS_OK) return 1;
+
+    /* Path A: 0-steady-state-allocation read_into */
+    uint8_t scratch[1600 * 2];
+    cspa_managed_read_outcome_record out = {0};
+    out.struct_size = (uint32_t)sizeof(out);
+    out.schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+    if (cspa_manager_read_into(mgr, scratch, sizeof(scratch), 1600u, 250u, NULL, &out) == CSPA_STATUS_OK) {
+        printf("read_into: %llu frames (%llu B)\n",
+               (unsigned long long)out.actual_frames,
+               (unsigned long long)out.copy_bytes);
+    }
+
+    /* Path B: Zero-copy block read + explicit cspa_block_release */
+    cspa_managed_read_outcome_record zc = {0};
+    zc.struct_size = (uint32_t)sizeof(zc);
+    zc.schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+    if (cspa_manager_read(mgr, 1600u, 250u, NULL, &zc) == CSPA_STATUS_OK) {
+        if (zc.block.bytes != NULL) {
+            printf("Zero-copy block: %llu B\n", (unsigned long long)zc.block.byte_length);
+        }
+        cspa_block_release(&zc.block);
+    }
+
+    cspa_manager_stop(mgr, 0u);
+    uint32_t cleaned = 0u;
+    cspa_manager_wait_cleanup(mgr, 2000u, &cleaned);
+    cspa_manager_release(mgr);
+    return 0;
+}
+```
+
+### Example 3 — Deterministic Target Listing, Filtering & Capture (`cspa_discover_query`) :badge[Discovery]{variant=success}
+
+`cspa_discovery_find_app` is a single-match helper that rejects ambiguous multi-instance names. For deterministic selection, call `cspa_discover_query(&query, NULL, 0, &count)` to size your buffer, inspect `kind`, `active_audio == CSPA_ACTIVE_AUDIO_ACTIVE`, `pid`, `app_id`, `executable_path`, or `device_id`, optionally adjust gain via `cspa_target_with_gain`, and pass the selected record(s) directly to `cspa_manager_open`:
+
+```c title="list_and_filter_targets.c"
+#include <cspa_experimental.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void) {
+    if (cspa_abi_check(CSPA_EXPERIMENTAL_ABI_MAJOR, CSPA_EXPERIMENTAL_SCHEMA_REVISION) != CSPA_STATUS_OK) {
+        return 1;
+    }
+
+    cspa_discovery_query_record query = {0};
+    if (cspa_discovery_query_init(&query) != CSPA_STATUS_OK) return 1;
+
+    size_t count = 0;
+    if (cspa_discover_query(&query, NULL, 0u, &count) != CSPA_STATUS_OK) return 1;
+
+    size_t cap = count + 8u;
+    cspa_capture_target_record *items = (cspa_capture_target_record *)calloc(cap, sizeof(*items));
+    if (items == NULL) return 1;
+
+    size_t filled = 0;
+    if (cspa_discover_query(&query, items, cap, &filled) == CSPA_STATUS_OK) {
+        size_t n = filled < cap ? filled : cap;
+        for (size_t i = 0; i < n; ++i) {
+            printf("kind=%u name='%s' pid=%u active=%u\n",
+                   items[i].kind, items[i].name, items[i].pid, items[i].active_audio);
+            if (items[i].kind == CSPA_TARGET_KIND_APPLICATION &&
+                items[i].active_audio == CSPA_ACTIVE_AUDIO_ACTIVE) {
+                cspa_capture_target_record scaled = {0};
+                if (cspa_target_with_gain(&items[i], 0.85f, &scaled) == CSPA_STATUS_OK) {
+                    cspa_capture_request_record req = {0};
+                    cspa_capture_request_init(&req, &scaled, 1u);
+                    cspa_manager *mgr = NULL;
+                    if (cspa_manager_open(&req, &mgr) == CSPA_STATUS_OK) {
+                        cspa_manager_stop(mgr, 1u);
+                        cspa_manager_release(mgr);
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    free(items);
+    return 0;
+}
+```
+
+### Example 4 — Single-Match `cspa_discovery_find_app` Shortcut & `cspa_request_inspect`
+
+```c title="discover_and_inspect.c"
+#include <cspa_experimental.h>
+#include <stdint.h>
+#include <stdio.h>
+
+int main(void) {
+    cspa_discovery *disc = NULL;
+    if (cspa_discovery_create(&disc) != CSPA_STATUS_OK) {
+        return 1;
+    }
+
+    cspa_capture_target_record app = {0};
+    app.struct_size = (uint32_t)sizeof(app);
+    app.schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+
+    uint32_t st = cspa_discovery_find_app(
+        disc,
+        "Spotify",
+        CSPA_SCOPE_TREE,
+        CSPA_ON_ROOT_EXIT_WAIT,
+        5000000000ULL,
+        &app
+    );
+    if (st == CSPA_STATUS_OK) {
+        cspa_capture_request_record req = {0};
+        cspa_capture_request_init(&req, &app, 1u);
+
+        cspa_target_plan_record target_plans[1] = {{0}};
+        cspa_plan_report_record report = {0};
+        report.struct_size = (uint32_t)sizeof(report);
+        report.schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+        report.target_plans = target_plans;
+        report.target_plans_capacity = 1u;
+
+        if (cspa_request_inspect(&req, &report) == CSPA_STATUS_OK) {
+            printf("Found '%s' (pid=%u) -> backend=%u, pcm_bytes=%llu\n",
+                   app.name,
+                   app.pid,
+                   target_plans[0].resolved_backend,
+                   (unsigned long long)report.estimated_pcm_bytes);
+        }
+    }
+
+    cspa_discovery_release(disc);
+    return 0;
+}
+```
+
+### Example 5 — Non-Prompting `cspa_permissions_check` & Consent Inspection
+
+```c title="permissions_check.c"
+#include <cspa_experimental.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+
+int main(void) {
+    cspa_permission_report_record rep = {0};
+    if (cspa_permission_report_init(&rep) != CSPA_STATUS_OK) {
+        return 1;
+    }
+
+    /* NULL targets + 0 count inspects all 3 OS recording domains without prompting: */
+    if (cspa_permissions_check(NULL, 0u, NULL, &rep) != CSPA_STATUS_OK) {
+        return 1;
+    }
+
+    printf("All granted=%u | has_denial=%u | requires_relaunch=%u\n",
+           rep.is_granted, rep.has_denial, rep.requires_relaunch);
+
+    for (size_t i = 0; i < CSPA_PERMISSION_KIND_COUNT; ++i) {
+        const cspa_permission_entry_record *e = &rep.entries[i];
+        printf("  domain=%u state=%u can_prompt=%u\n",
+               e->kind, e->state, e->can_prompt);
+    }
+    return 0;
+}
+```
+
+For CMake linkage instructions (`Cspa::cspa_ffi` works identically for `LANGUAGES C` targets), see [C++17 Header-Only RAII Handbook & CMake](/capture-system-or-process-audio/sdks/cpp/).

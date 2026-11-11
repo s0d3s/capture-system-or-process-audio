@@ -1,0 +1,319 @@
+---
+title: Python SDK Handbook (3.11–3.15t)
+description: Python 3.11–3.15 and free-threaded 3.14t/3.15t (-Xgil=0) handbook with 9 runnable audio capture recipes, python -m diagnostics, and a PyAudioWPatch migration guide.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+`capture_system_or_process_audio` is a zero-dependency native PyO3 (`0.30.1`) package binding the unified `#![forbid(unsafe_code)]` Rust capture facade across **Windows 10/11 (`WASAPI`)**, **Linux (`PipeWire` & `PulseAudio` `manylinux_2_28`, `0` `NEEDED` links)**, and **Apple Silicon macOS (`Core Audio` & `ScreenCaptureKit`)**.
+
+---
+
+## 1. Installation, CLI Diagnostics & Wheel ABI Architecture
+
+```bash
+pip install capture-system-or-process-audio
+
+# Optional zero-copy NumPy 2D (frames, channels) views:
+pip install "capture-system-or-process-audio[numpy]"
+
+# Render current platform, OS backends, permissions, and per-backend CaptureTarget tables:
+python -m capture_system_or_process_audio
+```
+
+Pass `--active-only`, `--include-non-audio`, or `--no-color` to `python -m capture_system_or_process_audio` when inspecting targets in scripts or CI logs.
+
+### 3-Wheel Stable ABI Hybrid & Free-Threading (`-Xgil=0`)
+Every PyPI release ships prebuilt binary wheels across three ABI tiers plus `sdist`:
+- **`cp311-abi3`:** Single Stable ABI binary covering GIL-enabled CPython `3.11`, `3.12`, `3.13`, `3.14`, and `3.15`.
+- **`cp314-cp314t`:** Dedicated free-threaded CPython `3.14t` wheel.
+- **`cp315-abi3.abi3t` (PEP 803):** Forward-compatible Stable ABI wheel for both GIL and free-threaded CPython `3.15+`.
+
+<Aside type="tip" title="True Free-Threading (Py_MOD_GIL_NOT_USED)">
+Importing `capture_system_or_process_audio` on `python3.14t` or `python3.15t` (`-Xgil=0`) **never re-enables the GIL** (`sys._is_gil_enabled() is False`). All `26` native classes are `@final` frozen `#[pyclass(frozen)]` types, all `33` enums are plain `enum.Enum` classes accepting either typed `Enum` members or lowercase `str` aliases (`Enum | str`), and `__init__.pyi` + `py.typed` ship inside the wheel for `pyright` / Pylance / `mypy`.
+</Aside>
+
+---
+
+## 2. Nine Compile-Verified Python Recipes
+
+### Recipe 1 — Default Speaker Loopback + Zero-Copy `memoryview` :badge[Zero-Copy]{variant=success}
+
+```python title="speaker_loopback.py"
+import capture_system_or_process_audio as cspa
+
+# default_device_mode="follow" automatically switches when headphones plug/unplug:
+target = cspa.default_output(default_device_mode=cspa.DefaultDeviceMode.FOLLOW)
+
+with cspa.capture(target) as stream:
+    fmt = stream.output_format
+    outcome = stream.read(480, timeout_ms=200)
+    for block in outcome.blocks:
+        # PEP 3118 zero-copy view directly into the ref-counted Rust pool slot:
+        pcm_view = memoryview(block)
+        print(
+            f"Captured {block.frames} frames ({len(pcm_view)} B) "
+            f"@ {fmt.rate} Hz, {fmt.channels} ch, {fmt.sample_format.value}"
+        )
+    # Preserve accepted queued tail cleanly before exiting context:
+    stream.stop(cspa.StopMode.DRAIN)
+    stream.wait_cleanup()
+```
+
+### Recipe 2 — List, Filter & Capture Available `CaptureTarget`s Deterministically :badge[Discovery]{variant=success}
+
+`cspa.find_app("Name")` is a quick single-match shortcut, but it raises an error if multiple instances share the same name (such as two browser profiles or Python workers) or if the OS display name differs across locales. Enumerate `cspa.discover()` to inspect all available `CaptureTarget`s (`applications`, `processes`, `output_devices`, `input_devices`), filter deterministically on `active_audio`, `pid`, `executable_path`, `app_id`, or `device_id`, refine with `.with_gain(...)` / `.with_backend(...)`, and pass them directly to `cspa.capture(...)`:
+
+```python title="list_and_filter_targets.py"
+import os
+import capture_system_or_process_audio as cspa
+
+catalog = cspa.discover(active_only=False)
+for t in catalog.targets:
+    print(f"{t.kind.value:12} name={t.name!r} pid={t.pid} active={t.active_audio} id={t.logical_id}")
+
+# Select up to 2 actively playing apps (excluding our own PID), or fall back to default speakers:
+my_pid = os.getpid()
+selected = [
+    app.with_gain(0.9)
+    for app in catalog.applications
+    if app.active_audio is True and app.pid != my_pid
+][:2] or [cspa.default_output()]
+
+with cspa.capture(selected, silence_on_idle=True) as stream:
+    outcome = stream.read(480, timeout_ms=200)
+    print(f"Captured {outcome.frames} frames across {len(stream.targets)} target(s)")
+    stream.stop(cspa.StopMode.DRAIN)
+    stream.wait_cleanup()
+```
+
+### Recipe 3 — Single-Match App Shortcut (`find_app`) & Relaunch Tracking :badge[Per-App]{variant=tip}
+
+```python title="isolate_application.py"
+import capture_system_or_process_audio as cspa
+
+# Rolls up child audio helpers (e.g. Chromium/Electron audio utility processes)
+# and waits up to 5 seconds if the user restarts the app mid-session:
+app = cspa.find_app(
+    "Spotify",
+    scope=cspa.ProcessScope.TREE,
+    on_root_exit=cspa.RootExitPolicy.WAIT,
+    wait_timeout_ms=5000,
+)
+
+with cspa.capture(app, silence_on_idle=True) as stream:
+    outcome = stream.read(960, timeout_ms=250)
+    print(f"Read {outcome.frames} isolated app frames (reason={outcome.reason.value})")
+    stream.stop("drain")
+    stream.wait_cleanup()
+```
+
+### Recipe 4 — Live `[Microphone + Meeting App]` Mix for Whisper / STT (`16 kHz` Mono `F32`) :badge[AI / STT]{variant=note}
+
+```python title="whisper_meeting_mix.py"
+import capture_system_or_process_audio as cspa
+
+# Built-in CspaMixer aligns mic + app clocks (64-frame crossfade drift sync),
+# and OutputConverter downmixes + resamples to 16 kHz mono float32 in Rust:
+converter = cspa.OutputConverter(
+    rate=16000,
+    channels=1,
+    sample_format=cspa.SampleType.F32,
+)
+
+targets = [
+    cspa.microphone(gain=1.0),
+    cspa.find_app("Zoom", scope="tree", gain=0.85),
+]
+
+with cspa.capture(targets, output_converter=converter, silence_on_idle=True) as stream:
+    outcome = stream.read(1600, timeout_ms=250)  # 100 ms @ 16 kHz
+    for block in outcome.blocks:
+        # 2D (frames, 1) zero-copy float32 ndarray -> reshape(-1) for 1D Whisper input:
+        pcm_2d = block.to_numpy(copy=False)
+        whisper_1d = pcm_2d.reshape(-1)
+        print("1D float32 chunk ready for STT:", whisper_1d.shape)
+```
+
+### Recipe 5 — Zero-Allocation Steady-State `read_into` Loop (`-Xgil=0` Safe) :badge[0 Alloc]{variant=success}
+
+```python title="zero_alloc_read_into.py"
+import capture_system_or_process_audio as cspa
+
+with cspa.capture(cspa.default_output(), silence_on_idle=True) as stream:
+    fmt = stream.output_format
+    chunk_frames = 480  # 10 ms @ 48 kHz
+    scratch = bytearray(chunk_frames * fmt.bytes_per_frame)
+
+    for _ in range(50):
+        # 0 steady-state heap allocations; guarded via critical section on Python 3.14t/3.15t:
+        outcome = stream.read_into(scratch, chunk_frames, timeout_ms=200)
+        if outcome.copy_bytes > 0:
+            valid_slice = memoryview(scratch)[: outcome.copy_bytes]
+            _ = len(valid_slice)
+```
+
+### Recipe 6 — Native `asyncio` Streaming & Cooperative `Cancellation`
+
+```python title="asyncio_capture.py"
+import asyncio
+import capture_system_or_process_audio as cspa
+
+
+async def stream_audio() -> None:
+    cancel = cspa.Cancellation()
+    conv = cspa.OutputConverter(rate=24000, channels=1, sample_format="i16")
+
+    async with cspa.capture(
+        cspa.default_output(),
+        output_converter=conv,
+        silence_on_idle=True,
+    ) as stream:
+        # Single non-blocking coroutine read:
+        first = await stream.read_async(480, timeout_ms=200, cancel=cancel)
+        print("First async chunk frames:", first.frames)
+
+        # Or iterate directly with `async for`:
+        chunks_seen = 0
+        async for outcome in stream:
+            chunks_seen += 1
+            if chunks_seen >= 5:
+                cancel.cancel()
+                stream.stop("drain")
+                break
+
+
+if __name__ == "__main__":
+    asyncio.run(stream_audio())
+```
+
+### Recipe 7 — Off-Acquisition Worker Push Callbacks (`start_callback`)
+
+```python title="push_callback.py"
+import time
+import capture_system_or_process_audio as cspa
+
+received_frames = 0
+
+
+def on_chunk(outcome: cspa.ReadOutcome) -> bool:
+    global received_frames
+    received_frames += outcome.frames
+    # Return True to continue, or False to stop the callback worker cleanly:
+    return received_frames < 4800
+
+
+with cspa.capture(cspa.default_output(), silence_on_idle=True) as stream:
+    # Runs on a dedicated off-acquisition worker thread (never blocks OS RT audio):
+    stream.start_callback(on_chunk, frames=480, timeout_ms=50)
+    time.sleep(0.15)
+    stream.stop_callback()
+    if stream.last_callback_error is not None:
+        raise RuntimeError(stream.last_callback_error)
+```
+
+### Recipe 8 — Live `DiscoveryQuery`, `256`-Event Subscriptions & Mid-Stream Hot-Swap
+
+```python title="discovery_and_hotswap.py"
+import capture_system_or_process_audio as cspa
+
+# 1. Structured snapshot query (only apps/processes actively playing audio):
+query = cspa.DiscoveryQuery(
+    dedupe=cspa.DiscoveryDedupe.BY_LOGICAL_TARGET,
+    order=cspa.DiscoveryOrder.KIND_THEN_BACKEND,
+    active_only=True,
+)
+catalog = cspa.discover_query(query)
+for app in catalog.applications:
+    print(f"Playing now: {app.name} (pid={app.pid}, backends={[b.value for b in app.available_backends]})")
+
+# 2. Bounded 256-event cursor subscription + live hot-swap without dropping the stream:
+with cspa.subscribe_discovery(max_discovery_queue=256) as sub:
+    with cspa.capture([cspa.default_output()], silence_on_idle=True) as stream:
+        if sub.is_overflowed:
+            _fresh = sub.resnapshot()
+        for event in sub.poll_events():
+            print("Event:", event.kind.value, event.target_id)
+
+        # Dynamically add the default microphone into the active session:
+        version = stream.update_targets([cspa.default_output(), cspa.microphone()])
+        print("Updated membership version:", version)
+```
+
+### Recipe 9 — OS Recording Permissions Preflight & Headless Opt-Out
+
+```python title="permissions_preflight.py"
+import capture_system_or_process_audio as cspa
+
+targets = [cspa.microphone(), cspa.default_output()]
+
+# 1. Non-prompting preflight (safe in background workers, CLI diagnostics, and UI startup):
+report = cspa.check_permissions(targets)
+print(
+    f"Granted={report.is_granted} | "
+    f"Mic={report.microphone.state.value} | "
+    f"SysAudio={report.system_audio.state.value}"
+)
+
+# 2. Interactive OS consent request when needed:
+if not report.is_granted and not report.has_denial:
+    report = cspa.request_permissions(targets, timeout_ms=30000, open_settings_if_denied=False)
+    if report.requires_relaunch:
+        print("Consent granted — relaunch the app to activate ScreenCaptureKit capture.")
+
+# 3. Headless / CI opt-out: never show an OS modal; raise PermissionError immediately if ungranted:
+with cspa.capture(targets, request_permissions=False) as stream:
+    _ = stream.output_format
+```
+
+---
+
+## 3. Migrating from `PyAudioWPatch`
+
+Created by the same author (`@s0d3s`), [`PyAudioWPatch`](https://github.com/s0d3s/PyAudioWPatch) serves **140,000+ monthly PyPI downloads** across **340+ open-source repositories** — yet PortAudio's legacy C architecture made the community's top feature requests (per-app isolation, macOS/Linux loopback, `[Mic + Speaker]` drift sync, silent-speaker stall protection, and `-Xgil=0` free-threading) impossible to add inside `PyAudioWPatch`. **`capture_system_or_process_audio` is the result of nearly a year of dedicated ground-up Rust engineering and polish** built to replace those limitations permanently:
+
+| `PyAudioWPatch` Pattern | `capture_system_or_process_audio` Equivalent | What Improves |
+| --- | --- | --- |
+| `p.get_default_wasapi_loopback()` device lookup | `cspa.default_output()` | Cross-platform (`WASAPI`, `PipeWire`/`PulseAudio`, `Core Audio`) + auto-follows headphone switches! |
+| *Impossible* (captures all system audio) | `cspa.find_app("Firefox")` or `cspa.process(pid)` | Isolates a single app/process tree without leaking notification or call audio. |
+| `stream.read(1024)` hangs forever when speakers are silent | `cspa.capture(..., silence_on_idle=True)` | Synthesizes wall-clock silent frames marked `synthesized_silence=True` so loops never stall. |
+| Manual `scipy.signal.resample` + `pyaudio` mic drift | `cspa.capture([cspa.microphone(), ...], output_converter=...)` | Drift-compensated `CspaMixer` + `16 kHz` / `24 kHz` `OutputConverter` in safe Rust. |
+
+### Side-by-Side Code Comparison
+
+**Before (`PyAudioWPatch` — Windows-only, stalls on silent speakers, manual device index hunting):**
+
+{/* cspa-snippet: ignore */}
+```python title="legacy_pyaudiowpatch.py"
+import pyaudiowpatch as pyaudio
+
+with pyaudio.PyAudio() as p:
+    wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
+    default_speakers = p.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
+    loopback = next(g for g in p.get_loopback_device_info_generator() if default_speakers["name"] in g["name"])
+
+    stream = p.open(
+        format=pyaudio.paInt16,
+        channels=loopback["maxInputChannels"],
+        rate=int(loopback["defaultSampleRate"]),
+        frames_per_buffer=1024,
+        input=True,
+        input_device_index=loopback["index"],
+    )
+    raw_bytes = stream.read(1024)  # Blocks indefinitely if no app is playing audio!
+```
+
+**After (`capture_system_or_process_audio` — Windows, Linux & macOS, headphone-follow, `16 kHz` ready):**
+
+```python title="modern_cspa.py"
+import capture_system_or_process_audio as cspa
+
+conv = cspa.OutputConverter(rate=16000, channels=1, sample_format="i16")
+
+with cspa.capture(cspa.default_output(), output_converter=conv, silence_on_idle=True) as stream:
+    outcome = stream.read(1024, timeout_ms=200)
+    raw_bytes = b"".join(bytes(memoryview(b)) for b in outcome.blocks)
+    print(f"Captured {outcome.frames} frames ({len(raw_bytes)} B) without silent stalls")
+```
+
+See [Ecosystem Integration & Drop-In Adapters](/capture-system-or-process-audio/adapters/overview/) for direct `NumPy` / `faster-whisper` / `wave` recipes and the upcoming zero-rewrite `PyAudioWPatch` adapter preview.

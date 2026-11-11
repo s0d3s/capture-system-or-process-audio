@@ -1,0 +1,166 @@
+---
+title: SDK Overview & Quick Starts
+description: Compare first-class Python, Rust, C++17, and C11 SDKs for capture-system-or-process-audio with side-by-side target discovery and live-mixing examples.
+---
+
+import { CardGrid, LinkCard, TabItem } from '@astrojs/starlight/components';
+import SdkTabs from '../../../components/SdkTabs.astro';
+import CapabilityBadge from '../../../components/CapabilityBadge.astro';
+
+`capture-system-or-process-audio` provides four first-class native bindings built directly on the unified `#![forbid(unsafe_code)]` Rust facade — with zero OS-specific `#ifdef` / `#[cfg]` leaks in any binding layer.
+
+| SDK | Distribution | Key Ergonomics & Runtime Guarantees | Status |
+| --- | --- | --- | --- |
+| **Python (`3.11`–`3.15t`)** | PyPI (`cp311-abi3`, `cp314t`, `cp315-abi3.abi3t`, `sdist`) | `with` / `async with`, PEP 3118 `memoryview`, `to_numpy(copy=False)`, `33` `enum.Enum`s (`Enum \| str`), `Py_MOD_GIL_NOT_USED` `-Xgil=0` safe | <CapabilityBadge status="supported" /> |
+| **Rust (`1.88+`)** | `crates.io` (`capture-system-or-process-audio`) | `#![forbid(unsafe_code)]` facade, zero-cost static dispatch, `0`-alloc `read_into` | <CapabilityBadge status="supported" /> |
+| **C++17 RAII** | GitHub Releases (`cspa-ffi` + `Cspa::cspa_ffi` CMake) | Header-only `cspa.hpp`, supports both `cspa::Result<T>` (`-fno-exceptions`) and `*_or_throw()` (`/EHsc`) | <CapabilityBadge status="supported" /> |
+| **C11 Wire ABI** | GitHub Releases (`cspa_experimental.h` + shared lib) | `struct_size` + `schema_revision` checked records, `catch_unwind` FFI boundary, `0` Linux `NEEDED` links | <CapabilityBadge status="supported" /> |
+| **Node.js / TypeScript** | `npm` (`napi-rs` Node-API) | Electron V8 Memory Cage safe `TypedArray`s, `AsyncIterable`, `.toNodeReadable()` | <CapabilityBadge status="planned" /> |
+
+---
+
+## Side-by-Side: List, Filter & Inspect Available `CaptureTarget`s
+
+Rather than relying on `find_app("Name")` when multiple app instances or localized names exist, every SDK lets you enumerate `CaptureTarget`s, filter deterministically, and preview or open the exact plan:
+
+<SdkTabs>
+  <TabItem label="Python">
+    ```python
+    import capture_system_or_process_audio as cspa
+
+    catalog = cspa.discover(active_only=False)
+    for app in catalog.applications:
+        print(f"{app.name} (pid={app.pid}, active={app.active_audio}, id={app.logical_id})")
+
+    selected = [app.with_gain(0.9) for app in catalog.applications if app.active_audio is True][:2]
+    targets = selected + [cspa.microphone()] if selected else [cspa.microphone(), cspa.default_output()]
+
+    plan = cspa.request(targets).inspect()
+    print("Resolution:", plan.combine_resolution.value, "Streams:", plan.estimated_active_streams)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use capture_system_or_process_audio::{
+        CapabilityError, CaptureTarget, DefaultDeviceMode, DiscoveryQuery, discover_query, request,
+    };
+
+    fn main() -> Result<(), CapabilityError> {
+        let catalog = discover_query(&DiscoveryQuery::default())?;
+        for app in &catalog.applications {
+            let name = app.name().map(|s| s.as_ref()).unwrap_or("<unnamed>");
+            println!("{name} (pid={:?}, active={:?})", app.pid(), app.active_audio());
+        }
+
+        let mut targets: Vec<CaptureTarget> = catalog
+            .applications
+            .iter()
+            .filter(|app| app.active_audio() == Some(true))
+            .take(2)
+            .filter_map(|app| app.clone().with_gain(0.9).ok())
+            .collect();
+        if targets.is_empty() {
+            targets.push(CaptureTarget::default_output(DefaultDeviceMode::Follow));
+        }
+        targets.push(CaptureTarget::microphone(DefaultDeviceMode::Follow));
+
+        let plan = request(targets).inspect()?;
+        println!("Resolution: {:?}, Streams: {}", plan.combine_resolution, plan.estimated_active_streams);
+        Ok(())
+    }
+    ```
+  </TabItem>
+  <TabItem label="C++17">
+    ```cpp
+    #include <cspa.hpp>
+    #include <cstdio>
+    #include <vector>
+
+    int main() {
+        auto disc_res = cspa::Discovery::create();
+        if (!disc_res.is_ok()) return 1;
+        auto disc = disc_res.take_value();
+
+        cspa::DiscoveryQuery q;
+        auto catalog = disc.query(q);
+        if (!catalog.is_ok()) return 1;
+
+        std::vector<cspa::Target> targets;
+        for (const cspa::Target &t : catalog.value()) {
+            if (t.kind() == cspa::TargetKind::Application &&
+                t.raw().active_audio == CSPA_ACTIVE_AUDIO_ACTIVE &&
+                targets.size() < 2) {
+                auto scaled = t.with_gain(0.9f);
+                if (scaled.is_ok()) targets.push_back(scaled.take_value());
+            }
+        }
+        if (targets.empty()) {
+            targets.push_back(cspa::Target::default_output().take_value());
+        }
+        targets.push_back(cspa::Target::microphone().take_value());
+
+        cspa::CaptureRequest req(std::move(targets));
+        auto plan = req.inspect();
+        if (plan.is_ok()) {
+            std::printf("Estimated streams: %llu\n",
+                        static_cast<unsigned long long>(plan.value().estimated_active_streams));
+        }
+        return 0;
+    }
+    ```
+  </TabItem>
+  <TabItem label="C11">
+    ```c
+    #include <cspa_experimental.h>
+    #include <stdio.h>
+
+    int main(void) {
+        cspa_discovery_query_record query = {0};
+        cspa_discovery_query_init(&query);
+
+        cspa_capture_target_record items[32];
+        size_t total = 0;
+        if (cspa_discover_query(&query, items, 32u, &total) == CSPA_STATUS_OK) {
+            size_t n = total < 32u ? total : 32u;
+            for (size_t i = 0; i < n; ++i) {
+                printf("kind=%u name='%s' pid=%u active=%u\n",
+                       items[i].kind, items[i].name, items[i].pid, items[i].active_audio);
+            }
+        }
+        return 0;
+    }
+    ```
+  </TabItem>
+</SdkTabs>
+
+---
+
+## Per-SDK Developer Handbooks & Ecosystem Guides
+
+<CardGrid>
+  <LinkCard
+    title="Python SDK Handbook (3.11–3.15t)"
+    description="9 runnable recipes + python -m diagnostic CLI: deterministic target filtering, zero-copy memoryview, 16 kHz Whisper mix, 0-alloc read_into, asyncio, callbacks, and PyAudioWPatch migration."
+    href="/capture-system-or-process-audio/sdks/python/"
+  />
+  <LinkCard
+    title="Safe-Rust SDK Handbook (crates/capture)"
+    description="7 runnable recipes on the #![forbid(unsafe_code)] unified facade: deterministic target filtering, CaptureManager, 0-alloc read_into, CspaMixer telemetry, and AudioStream."
+    href="/capture-system-or-process-audio/sdks/rust/"
+  />
+  <LinkCard
+    title="C++17 RAII & CMake Handbook (cspa.hpp)"
+    description="Cspa::cspa_ffi CMake setup plus 5 verified examples covering deterministic target filtering, -fno-exceptions cspa::Result<T>, and *_or_throw() styles."
+    href="/capture-system-or-process-audio/sdks/cpp/"
+  />
+  <LinkCard
+    title="C11 Wire ABI Handbook (cspa_experimental.h)"
+    description="ABI handshake, struct_size & schema_revision safety, panic containment, handle ownership, and 5 /std:c11 examples."
+    href="/capture-system-or-process-audio/sdks/c/"
+  />
+  <LinkCard
+    title="Ecosystem Integrations & Drop-In Adapters"
+    description="Verified NumPy, faster-whisper, wave, and asyncio recipes working today, plus the Planned zero-rewrite PyAudioWPatch, sounddevice, SoundCard, and Node.js roadmap."
+    href="/capture-system-or-process-audio/adapters/overview/"
+  />
+</CardGrid>
