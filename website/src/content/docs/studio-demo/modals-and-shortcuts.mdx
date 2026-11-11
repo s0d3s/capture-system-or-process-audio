@@ -1,0 +1,115 @@
+---
+title: Modals & Complete Shortcut Reference
+description: Complete guide to cspa-tui-demo's Add Capture Sources modal (A), Mouse Hover Inspector, OS Recording Permissions modal (K), and all keyboard & mouse actions.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import { Kbd } from 'starlight-kbd/components';
+
+`cspa-tui-demo` includes two full-featured interactive overlay modals (`Add Capture Sources` and `OS Recording Permissions & Consent`), mutually exclusive so keyboard navigation stays unambiguous.
+
+---
+
+## 1. Modal A — `Add Capture Sources` (<Kbd windows="A" />)
+
+Opening `Add Capture Sources` starts a bounded `256`-event `DiscoverySubscription` matching the active modal filters so newly launched apps, plugged-in USB headsets, and `PLAYING` $\leftrightarrow$ `IDLE` state transitions update live without manual refreshes.
+
+### Top Tabs & Search / Filter Row
+- **4 Live Category Tabs** (click tab or cycle with <Kbd windows="Tab" /> — `SwitchModalTab`):
+  1. **`Apps (Tree)` (`ModalTab::Applications`):** Top-level desktop applications with child audio helpers rolled up automatically.
+  2. **`Processes` (`ModalTab::Processes`):** Individual OS processes (`PID` + executable path).
+  3. **`Output Devs` (`ModalTab::OutputDevices`):** `🔊 DEFAULT` (`Default System Output`) + named `🔈 ENDPOINT` render devices.
+  4. **`Microphones` (`ModalTab::Microphones`):** `🎤 DEFAULT` (`Default Microphone`) + physical/virtual `🎙 MIC IN` endpoints (`.monitor` loopback sinks excluded).
+- **Search & Quick Filters:**
+  - `Search (/): [ ..._ ]` (<Kbd windows="/" /> or click to focus `FocusModalSearch`; type to filter by name, PID, app ID, or path; <Kbd windows="Enter" /> or <Kbd windows="Escape" /> unfocuses search; `[Clear]` resets via `ClearModalSearch`).
+  - `[x] AudioOnly(F)` (<Kbd windows="F" /> or click, `ToggleModalAudioOnly`) — hides non-audio background processes.
+  - `[x] PlayingOnly(P)` (<Kbd windows="P" /> or click, `ToggleModalPlayingOnly`) — filters to applications/processes actively outputting audio right now (`🔊 PLAYING`).
+  - `[Refresh]` (click, `RefreshModalDiscovery`) — forces an immediate OS inventory rescan.
+
+### `DiscoveryQuery` Bar
+- **`[Backend: All (B)]`** (<Kbd windows="B" /> or click, `CycleModalBackendFilter`) — cycles `All` $\rightarrow$ individual OS backends (`WASAPI`, `PW`, `PA`, `CA`, `SCK`).
+- **`[Dedupe: Logical / PerBackend (U)]`** (<Kbd windows="U" /> or click, `ToggleModalDedupe`) — switches between `ByLogicalTarget` deduplication and raw `<backend>:<kind>:...` `PerBackend` rows.
+- **`[Order: Kind->Bk / Bk->Kind (O)]`** (<Kbd windows="O" /> or click, `ToggleModalOrder`) — toggles `KindThenBackend` vs `BackendThenKind` sorting.
+
+### Candidate List, Contextual Consent Pill & Mouse Hover Inspector
+- **Multi-Select:** Move cursor with <Kbd windows="ArrowUp" /> / <Kbd windows="ArrowDown" />, toggle `[x]` with <Kbd windows="Space" /> or mouse click (`ToggleModalCandidate`), and press <Kbd windows="Enter" /> or click `[ + Add N Selected (Enter) ]` (`ConfirmAddModalCandidates`). Pressing <Kbd windows="Enter" /> with `0` boxes checked automatically adds the highlighted cursor row!
+- **Mouse Hover Metadata Popup:** Hovering the mouse cursor over any candidate row opens a floating rounded inspector card showing untruncated `Name`, canonical `Target ID`, `Pinned` & `Available` backends, `App ID` / `Device ID`, `PID` + `start_time` generation, wrapped `Path`, default policy, and live OS `Permission` status!
+- **Active-Tab Consent Pill (<Kbd windows="G" />):** Displays `[Perm Mic/SysAudio/ScreenRec: OK (K)]`, `[Grant ... (G)]` (requests consent for that tab's permission domain in the background!), or `[...:Settings (G)]` (opens OS Privacy Settings when denied).
+
+---
+
+## 2. Modal B — `OS Recording Permissions & Consent` (<Kbd windows="K" />)
+
+Backed by a non-blocking single-flight `PermissionRunner` so the `30 FPS` UI never freezes while macOS TCC or OS Settings dialogs are open:
+
+- **Header Controls:**
+  - `[Policy: AutoRequest / CheckOnly (P)]` (<Kbd windows="P" /> or click, `TogglePermissionPolicy`) — sets `CaptureRequest::with_permission_policy(...)`.
+  - `[x] Open OS Settings on Denial (O)` (<Kbd windows="O" /> or click, `ToggleOpenSettingsFallback`) — controls `open_settings_if_denied` when requesting permissions.
+  - `[Close (Esc)]` (<Kbd windows="Escape" /> or <Kbd windows="K" />, `ClosePermissionsModal`).
+- **Global Actions:**
+  - `[Re-Check States (C)]` (<Kbd windows="C" /> or click, `RefreshPermissions`) — runs non-prompting `check_permissions`.
+  - `[ Request Required for Staged (R / Enter) ]` (<Kbd windows="R" />, <Kbd windows="Enter" />, or click, `RequestRequiredPermissions`) — prompts for all consent domains required by currently checked staged sources.
+- **Per-Domain Consent Table (<Kbd windows="1" />, <Kbd windows="2" />, <Kbd windows="3" />):**
+  - Row `1` (`Microphone`), Row `2` (`SystemAudio`), Row `3` (`ScreenRecording`): shows `* REQUIRED` vs `optional`, 5-state `State` (`GRANTED`, `NOT DETERMINED`, `DENIED`, `RESTRICTED`, `UNKNOWN (Unprobed)`), `Prompt`, `Relaunch`, and context-sensitive action button (`[Ask OS (1..3)]`, `[Probe (2)]` for unprobed macOS `14.2+` Core Audio taps, or `[Settgs (1..3)]` via `RequestDomainPermission` / `OpenDomainSettings`), followed by platform-specific diagnostic guidance for Windows (`ConsentStore` / GPO), macOS (`Info.plist`, SSH console, TCC relaunch), and Linux (`PipeWire`/`PulseAudio` sockets & Flatpak).
+
+---
+
+## 3. Complete Keyboard Shortcut Matrix
+
+### Main Studio View
+
+| Shortcut | Action |
+| :---: | --- |
+| <Kbd windows="A" /> | Open **Add Capture Sources** modal (`OpenAddSourceModal`) |
+| <Kbd windows="K" /> | Open **OS Recording Permissions & Consent** modal (`OpenPermissionsModal`) |
+| <Kbd windows="R" /> | Start or stop recording into a RAM `MemoryTake` (`ToggleRecordStop`) |
+| <Kbd windows="S" /> | Stop active recording, or stop active take playback (`StopPlayback`) |
+| <Kbd windows="P" /> | Play or pause the selected RAM `MemoryTake` (`PlayPauseSelectedTake`) |
+| <Kbd windows="W" /> | Export the selected `MemoryTake` to `./recordings/*.wav` (`SaveSelectedTakeWav`) |
+| <Kbd windows="V" /> | Cycle `[3] Live Spectroscope` mode (`FFT Spectrum` $\rightarrow$ `Waterfall Map` $\rightarrow$ `Oscilloscope`) |
+| <Kbd windows="M" /> | Toggle visual live monitoring `ON` / `OFF` (`ToggleLiveMonitor`) |
+| <Kbd windows="T" /> | Toggle synthetic multi-tone signal generator `ON` / `OFF` (`ToggleSyntheticSignal`) |
+| <Kbd windows="C" /> | Cycle session `CombineMode` (`Auto` $\rightarrow$ `NativeOnly` $\rightarrow$ `CspaMixer`) |
+| <Kbd windows="ArrowUp" /> / <Kbd windows="ArrowDown" /> | Move selection cursor `>` in `[1] Staged Audio Sources` |
+| <Kbd windows="Space" /> | Enable / disable the selected staged source row (live hot-swap!) |
+| <Kbd windows="B" /> | Cycle pinned backend on the selected staged source (`CycleStagedBackend`) |
+| <Kbd windows="G" /> | Cycle static gain (`1.0x`, `0.5x`, `1.5x`, `0.25x`) on the selected staged source (`CycleStagedGain`) |
+| <Kbd windows="D" /> | Duplicate (`+2x`) the selected staged source (`DuplicateStagedSource`) |
+| <Kbd windows="Delete" /> / <Kbd windows="Backspace" /> | Remove the selected staged source row (`RemoveStagedSource`) |
+| <Kbd windows="[" /> / <Kbd windows="]" /> | Select previous / next recorded `MemoryTake` in Panel `[5]` |
+| <Kbd windows="ArrowLeft" /> / <Kbd windows="ArrowRight" /> | Seek playback `-5%` / `+5%` in the selected `MemoryTake` |
+| <Kbd windows="Q" /> / <Kbd windows="Ctrl+C" mac="Control+C" linux="Ctrl+C" /> | Exit `cspa-tui-demo` cleanly |
+
+### `Add Capture Sources` Modal (<Kbd windows="A" />)
+
+| Shortcut | Action |
+| :---: | --- |
+| <Kbd windows="Tab" /> | Cycle modal tabs (`Apps (Tree)` $\rightarrow$ `Processes` $\rightarrow$ `Output Devs` $\rightarrow$ `Microphones`) |
+| <Kbd windows="/" /> | Focus live search box (`Enter` or `Esc` exits search input) |
+| <Kbd windows="F" /> | Toggle `[x] AudioOnly(F)` filter |
+| <Kbd windows="P" /> | Toggle `[x] PlayingOnly(P)` filter |
+| <Kbd windows="B" /> | Cycle `[Backend: ... (B)]` filter |
+| <Kbd windows="U" /> | Toggle `[Dedupe: Logical / PerBackend (U)]` |
+| <Kbd windows="O" /> | Toggle `[Order: Kind->Bk / Bk->Kind (O)]` |
+| <Kbd windows="G" /> | Request consent (or open OS Settings) for the active tab's permission domain |
+| <Kbd windows="K" /> | Switch directly to the **OS Recording Permissions & Consent** modal |
+| <Kbd windows="ArrowUp" /> / <Kbd windows="ArrowDown" /> | Navigate candidate rows |
+| <Kbd windows="Space" /> | Toggle candidate `[x]` selection |
+| <Kbd windows="Enter" /> | Stage all checked candidates (or cursor row if none checked) and close modal |
+| <Kbd windows="Escape" /> | Cancel and close modal (`CloseModal`) |
+
+### `OS Recording Permissions & Consent` Modal (<Kbd windows="K" />)
+
+| Shortcut | Action |
+| :---: | --- |
+| <Kbd windows="P" /> | Toggle `PermissionPolicy` (`AutoRequest` $\leftrightarrow$ `CheckOnly`) |
+| <Kbd windows="O" /> | Toggle `[x] Open OS Settings on Denial (O)` |
+| <Kbd windows="C" /> | Re-check all OS permission states (`RefreshPermissions`) |
+| <Kbd windows="R" /> / <Kbd windows="Enter" /> | Request all permissions required by staged sources (`RequestRequiredPermissions`) |
+| <Kbd windows="1" /> / <Kbd windows="2" /> / <Kbd windows="3" /> | Trigger per-domain Ask / Probe / Open Settings for `Microphone` (`1`), `SystemAudio` (`2`), or `ScreenRecording` (`3`) |
+| <Kbd windows="Escape" /> / <Kbd windows="K" /> | Close permissions modal (`ClosePermissionsModal`) |
+| <Kbd windows="Q" /> | Quit `cspa-tui-demo` |
+
+<Aside type="note" title="100% Mouse Parity">
+Every single `ClickAction` variant in `cspa-tui-demo` (`52` interactive hit regions across Header, Panels `[1]`–`[5]`, Voice Strip, and both Modals) is clickable with the left mouse button in addition to the keyboard shortcuts above.
+</Aside>

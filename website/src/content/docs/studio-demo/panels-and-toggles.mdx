@@ -1,0 +1,107 @@
+---
+title: Panels & Toggles Reference ([1]–[5])
+description: Complete control-by-control guide to cspa-tui-demo's Top Header Bar, Panels [1] through [5], per-source chips, OutputConverter settings, spectroscope views, and Voice Strip.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import { Kbd } from 'starlight-kbd/components';
+
+Every button, badge, and configuration chip on the `cspa-tui-demo` main screen responds to direct mouse clicks (`HitMap` hit-testing) as well as single-key hotkeys.
+
+---
+
+## Top Header Bar
+
+| Control / Pill | States & Visual Meaning | Click / Key Action |
+| --- | --- | --- |
+| **Session State Pill** | `● REC Take #N (Xs \| seg #M)` (red) · `▶ PLAY Take #N` (green) · `◉ LIVE MONITOR (No Rec)` (cyan) · `■ IDLE (Monitor Off)` (gray) | Live session indicator |
+| **`[+ Add Source (A)]`** | Opens the 4-tab live discovery picker modal. | Click or <Kbd windows="A" /> (`OpenAddSourceModal`) |
+| **`[● Record (R)]` / `[■ Stop Rec (R)]`** | Starts or stops recording into a new RAM `MemoryTake` (zero disk I/O until `[Save WAV]`). | Click or <Kbd windows="R" /> (`ToggleRecordStop`) |
+| **`[Perms: ... (K)]`** | Aggregate consent pill: `OK`, `ASK?` (`NotDetermined`), `UNPRB` (`Unknown` macOS tap), `DENY!` (`Denied`/`Restricted`), `RLNCH` (`requires_relaunch`), or `ASK..` (prompt in flight). | Click or <Kbd windows="K" /> (`OpenPermissionsModal`) |
+| **`[Mon: ON (M)]` / `[Mon: OFF (M)]`** | Enables or pauses background visual monitoring when not recording. | Click or <Kbd windows="M" /> (`ToggleLiveMonitor`) |
+| **`[Synth:OFF (T)]` / `[Synth: ON (T)]`** | Switches between real OS hardware capture (`OFF`) and deterministic synthetic multi-tone test signals (`ON`) for headless/offline testing. | Click or <Kbd windows="T" /> (`ToggleSyntheticSignal`) |
+
+---
+
+## Panel `[1]` — Staged Audio Sources *(Live Hot-Swap Mixing Board)*
+
+Panel `[1]` holds your staged `CaptureTarget` rows. Toggling checkboxes or editing per-source chips **while recording is active** triggers live `CaptureManager::update_targets(...)` hot-swap (or seamless session transition if working format promotes), appending a new segment (`seg #N`) into the active `MemoryTake` without dropping recorded audio!
+
+### Row Kind & Consent Alert Badges
+- **Target Kind Badges:** `[SYS]` (`DefaultOutput`), `[DEV]` (`Device`), `[APP]` (`Application`), `[PID]` (`Process`), `[MIC]` (`DefaultInput`), `[IN]` (`InputDevice`).
+- **Inline Permission Warnings:**
+  - `[MIC!]` / `[APP!]` *(Red)* — Enabled source requires an OS permission currently `Denied` or `Restricted`.
+  - `[APP~]` *(Magenta)* — Consent is `Granted`, but macOS `ScreenCaptureKit` requires an app relaunch (`requires_relaunch == true`).
+
+### Per-Source Clickable Chips & Footer Controls
+
+| Control | Values Cycled | Click / Key Action |
+| --- | --- | --- |
+| **Row Checkbox `[x]` / `[ ]`** | Enables or mutes/removes the source from the active capture request. | Click row or select with <Kbd windows="ArrowUp" />/<Kbd windows="ArrowDown" /> + <Kbd windows="Space" /> (`ToggleStagedSource` / `SelectStagedSource`) |
+| **Backend Chip** | `[AUTO]` $\rightarrow$ `[WASAPI]` (Win) · `[PW]` / `[PA]` (Linux) · `[CA]` / `[SCK]` (macOS) | Click chip or press <Kbd windows="B" /> on selected row (`CycleStagedBackend`) |
+| **Gain Chip** | `[1.0x]` $\rightarrow$ `[0.5x]` $\rightarrow$ `[1.5x]` $\rightarrow$ `[0.25x]` | Click chip or press <Kbd windows="G" /> on selected row (`CycleStagedGain`) |
+| **Scope Chip** *(App & PID only)* | `[tree]` (`ProcessScope::Tree`) $\leftrightarrow$ `[exact]` (`ProcessScope::Exact`) | Click chip (`CycleStagedScope`) |
+| **Exit Chip** *(App & PID only)* | `[stop]` (`OnRootExit::Stop`) $\leftrightarrow$ `[wait5s]` (`OnRootExit::Wait` `5 s`) | Click chip (`CycleStagedExitPolicy`) |
+| **Device Mode Chip** *(`SYS` & `MIC` only)* | `[follow]` (`DefaultDeviceMode::Follow`) $\leftrightarrow$ `[pin]` (`DefaultDeviceMode::Pin`) | Click chip (`CycleStagedDeviceMode`) |
+| **`[+2x]` Duplicate** | Clones the row into the staged list to test caller-owned overlap (`SoftwareSummation` vs `NativeSetUnion`). | Click `[+2x]` or press <Kbd windows="D" /> (`DuplicateStagedSource`) |
+| **`[x]` Remove** | Deletes the staged row from the mixing board. | Click `[x]` or press <Kbd windows="Delete" /> / <Kbd windows="Backspace" /> (`RemoveStagedSource`) |
+| **Footer Buttons** | `[+ Add Source]`, `[All On]`, `[All Off]` | Click (`OpenAddSourceModal`, `EnableAllStaged`, `DisableAllStaged`) |
+
+---
+
+## Panel `[2]` — Capture Plan & Config + Inline Permissions Strip
+
+Every change in Panel `[1]` or Panel `[2]` immediately runs side-effect-free `CaptureRequest::inspect()` and displays the resulting execution plan:
+
+### Strategy, Converter & Buffer Chips
+
+| Chip | Options Cycled | Underlying API Contract |
+| --- | --- | --- |
+| **`[Comb:...]`** (<Kbd windows="C" />) | `[Comb:Auto]` $\rightarrow$ `[Comb:Native]` $\rightarrow$ `[Comb:Mixer]` | `CombineMode::{Auto, NativeOnly, CspaMixer}` (`CycleCombineMode`) |
+| **`[Tree:...]`** | `[Tree:Krn..Sw]` $\rightarrow$ `[Tree:Krn..Gr]` $\rightarrow$ `[Tree:KrnOnly]` $\rightarrow$ `[Tree:SwOnly]` | `ProcessTreeRange` start & fallback bounds (`CycleTreeStrategy`) |
+| **`[In:...]`** | `[In:AutoResmp]` $\leftrightarrow$ `[In:NoResampl]` | `InputConversionPolicy::{AutoWhenMixing, StrictNoResample}` (`ToggleInputConversion`) |
+| **`Converter:[OFF/ON ]`** | Enables or bypasses post-mix `OutputConverter`. | `ToggleFormatConverter` |
+| **`[48000 Hz]`** | `48000 Hz` $\rightarrow$ `44100 Hz` $\rightarrow$ `16000 Hz` | Target output sample rate (`CycleSampleRate`) |
+| **`[Stereo]` / `[Mono]`** | `2` channels (`FrontLeft, FrontRight`) $\leftrightarrow$ `1` channel (`Mono`) | Target channel count & `Layout::Known` (`CycleChannels`) |
+| **`[F32]`** | `[F32]` $\rightarrow$ `[I16]` $\rightarrow$ `[I24]` $\rightarrow$ `[I32]` | Target PCM `SampleType` (`CycleSampleFormat`) |
+| **`[Dither:...]`** | `[Dither:TPDF]` $\leftrightarrow$ `[Dither:None]` | SplitMix64 `DitherMode` (`CycleDither`) |
+| **`[Idle:...]`** | `[Idle:Park]` $\leftrightarrow$ `[Idle:Silence]` | `silence_on_idle` continuous silent-frame synthesis (`ToggleSilenceOnIdle`) |
+| **`[DropOldest]`** | `[DropOldest]` $\rightarrow$ `[DropNewest]` $\rightarrow$ `[Ovf:Fail]` | Real-time SPSC `Overflow` policy (`CycleOverflowPolicy`) |
+
+### Live Plan Readout & Inline Permissions Strip
+- **Plan Readout Rows:** Displays `Combine :` (`PassThrough(...)`, `NativeGraphMix(...)`, or `CspaMixer (48kHz Stereo F32)`), `Targets :` (`#idx:BACKEND:Endpt|Kernel|Graph|SwMix`), and `Budgets :` (`N str, X KiB | SingleTarget / SoftwareSummation / NativeSetUnion`), or a red **`Plan Reject : <PlanError>`** banner when you test an unsupported combination (such as `[exact]` on Windows WASAPI or `[Comb:Native]` across two incompatible devices).
+- **Inline Permissions Strip:** Shows compact per-domain chips (`Mic:OK*`, `Sys:UNK*`, `Scr:--` where `*` marks domains required by currently staged sources), `[Pol:AutoRq]` $\leftrightarrow$ `[Pol:ChkOnl]` (`TogglePermissionPolicy`), `[Re-Check]` (`RefreshPermissions`), `[Ask Needed]` / `[Asking OS..]` (`RequestRequiredPermissions`), and `[Perms UI (K)]` (`OpenPermissionsModal`).
+
+---
+
+## Panel `[3]` — Live Spectroscope *(3 Views + Meters)*
+
+Press <Kbd windows="V" /> or click any tab (`SelectVisMode`) to switch real-time visualizations:
+1. **`[1] FFT Spectrum`:** `2048`-point Hann-windowed FFT mapped across logarithmic frequency bands (`20Hz`–`20kHz`) using `1/8`-block vertical resolution (`▁`..`█`) plus decaying white peak-hold markers (`▔`).
+2. **`[2] Waterfall Map`:** Rolling half-block (`▀`) truecolor spectrogram rendering $2\times$ vertical time slices per terminal row.
+3. **`[3] Oscilloscope`:** Zero-crossing-triggered high-density Unicode Braille (`Marker::Braille`) stereo waveform (`Cyan` = Left, `LightMagenta` = Right).
+- **Right Tab Toggle:** `[◉ Idle Monitor: ON (M)]` / `[○ Idle Monitor: OFF (M)]` (`ToggleLiveMonitor`).
+- **Bottom Rows:** Collision-free logarithmic frequency ruler (`20Hz` to `20kHz`) and Stereo `L` / `R` Peak + RMS dBFS bar meters.
+
+---
+
+## Panel `[4]` — Active Stream & Mixer Telemetry
+
+- **`Session :`** Live total frames, KiB captured, hot-swap segment count (`Segs`), and active `contributing_mask` bitmask.
+- **`CspaMixer:`** Clock-domain-gated relative skew (`Skew X.XXms (±Y.YYms)` when inputs share a calibrated clock domain, or `Skew cross-clock` across independent hardware oscillators), `Clips`, `Slips` (`64`-frame crossfade drift corrections), and `Late` input counts.
+- **Per-Input `InputStatusHandle` Rows:** Displays `#idx`, `ParticipationState` (`[ACTIVE]`, `[IDLE]`, `[WAIT]`, `[LATE]`, `[EXITED]`, `[FAIL]`), normalizer mode badge (**`[48k->48k BYPASS]`** vs **`[16k 1ch->48k 2ch SYNC]`**), target ID, queued packet count (`q:`), and per-input drift slips (`slp:`).
+
+---
+
+## Panel `[5]` — In-Memory Takes & Playback + Bottom `💬 Voice Strip`
+
+Recordings live purely in RAM (`MemoryTake`, marked `[RAM ONLY ]`) until you explicitly export them:
+- **Selecting Takes:** Click any take row (`SelectTake`) or press <Kbd windows="[" /> / <Kbd windows="]" />. Notice `segs:N` tracks how many hot-swap segments were recorded into that take!
+- **Seeking:** Click anywhere along the `Seek: [━━●──]` bar (`SeekPlaybackBar`), click anywhere inside the bottom **`💬 Voice Strip` capsule waveform**, or press <Kbd windows="ArrowLeft" /> / <Kbd windows="ArrowRight" /> (`±5%`).
+- **Transport & Export Buttons:**
+  - `[▶ Play RAM (P)]` / `[■ Pause (P)]` (<Kbd windows="P" />, `PlayPauseSelectedTake`) — plays the RAM take via `cpal` while muting the live monitor.
+  - `[■ Stop (S)]` (<Kbd windows="S" />, `StopPlayback` — or stops recording if currently recording).
+  - `[💾 Save WAV (W)]` (<Kbd windows="W" />, `SaveSelectedTakeWav` — also clickable on the right side of the `💬 Voice Strip`) — writes `./recordings/take_<id>_<rate>Hz_<ch>ch_<fmt>.wav` in the exact captured sample format (`F32`, `I16`, `I24`, `I32`) and updates the badge to `[SAVED WAV]`.
+  - `[Delete]` (`DeleteSelectedTake`) — frees the selected `MemoryTake` from RAM.
+
+Continue to [Modals & Complete Shortcut Reference](/capture-system-or-process-audio/studio-demo/modals-and-shortcuts/).

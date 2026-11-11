@@ -1,0 +1,167 @@
+---
+title: OS Recording Permissions & Privacy Consent
+description: Preflight and request macOS TCC (Microphone, SystemAudio, ScreenRecording), Windows ConsentStore/GPO, and Linux audio socket permissions with crash-safe 5-state reports.
+---
+
+import { Aside, TabItem } from '@astrojs/starlight/components';
+import SdkTabs from '../../../components/SdkTabs.astro';
+
+Modern desktop operating systems gate microphone and desktop/application audio capture behind user privacy consent. `capture-system-or-process-audio` provides an honest, unified permissions API across all four SDKs — keeping 1-line scripts effortless while giving desktop apps and background daemons full control.
+
+---
+
+## 1. Three Permission Domains & Five Honest States
+
+Every `PermissionReport` contains three fixed `PermissionEntry` records:
+1. **`PermissionKind::Microphone`** — OS microphone / audio-input access.
+2. **`PermissionKind::SystemAudio`** — System/process output tap consent (e.g., macOS `14.2+` Core Audio `NSAudioCaptureUsageDescription` / `SystemAudio` TCC).
+3. **`PermissionKind::ScreenRecording`** — Screen & application audio consent when using macOS `ScreenCaptureKit`.
+
+Each `PermissionEntry` reports one of **five distinct `PermissionState`s** (never conflating an unprobed state with `Granted`):
+
+| `PermissionState` | Meaning | `can_prompt` |
+| --- | --- | :---: |
+| **`Granted`** | OS consent is verified and active (check `entry.requires_relaunch` after newly granting `ScreenCaptureKit` on macOS). | `false` |
+| **`NotDetermined`** | User has not yet been prompted; calling `request_permissions` (or opening with `AutoRequest`) will show the OS consent dialog. | `true` |
+| **`Denied`** | User previously declined consent in OS System Settings (`open_settings_if_denied=True` can deep-link to the exact OS privacy pane). | `false` |
+| **`Restricted`** | Blocked by enterprise Group Policy, MDM profile, headless SSH session without GUI console, Flatpak socket restriction, or missing `.app` `Info.plist` usage description. | `false` |
+| **`Unknown`** | Cannot be passively read without creating a temporary probe tap (such as unprobed macOS `14.2+` Core Audio `CATapDescription` prior to first probe/open) or audio server not running. | OS-dependent |
+
+---
+
+## 2. `AutoRequest` Default vs `CheckOnly` Preflight
+
+- **`PermissionPolicy::AutoRequest` *(Default)*:** Opening `capture(...)` or `AudioStream::open(...)` automatically triggers required OS permission prompts on interactive GUI sessions. Zero permission boilerplate is needed for standard CLI/GUI apps!
+- **`PermissionPolicy::CheckOnly` (`request_permissions=False` in Python):** Fails immediately with `CapabilityError::PermissionDenied` (`PermissionError` in Python, `CSPA_STATUS_PERMISSION_DENIED` in C/C++) if consent is not already granted — guaranteeing background services, tests, and CI jobs **never hang waiting on modal OS dialogs**.
+
+---
+
+## 3. Platform-Specific Protections & Deep-Dives
+
+### macOS `.app` Bundle `SIGABRT` Crash Guard :badge[Crash Safe]{variant=success}
+On macOS, calling Apple's `AVCaptureDevice` or `AudioHardwareCreateProcessTap` inside a bundled `.app` whose `Info.plist` omits `NSMicrophoneUsageDescription` or `NSAudioCaptureUsageDescription` normally **terminates the entire process with an uncatchable TCC `SIGABRT`**.
+
+`crates/capture-macos` inspects the active bundle's `Info.plist` *before* invoking Apple frameworks:
+- Missing required usage keys report `PermissionState::Restricted` and return a clean `PermissionDenied` error (`PermissionError` in Python) instead of crashing your app!
+- Add both keys to your macOS `.app`'s `Info.plist`:
+  ```xml
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Record microphone input for live audio mixing.</string>
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>Capture system or application audio streams.</string>
+  ```
+- Non-bundled CLI binaries (`python`, `cargo run`, `cspa-tui-demo`) inherit TCC consent from the parent terminal app (`Terminal.app`, `iTerm2`, `VS Code`), while SSH sessions without an active Aqua GUI console (`CGSessionCopyCurrentDictionary`) report `Restricted` cleanly.
+
+### Windows `ConsentStore` & Group Policy Inspection
+On Windows 10/11, `check_permissions` inspects both enterprise Group Policy (`HKLM\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy\LetAppsAccessMicrophone`) and per-machine / per-user `CapabilityAccessManager\ConsentStore\microphone\NonPackaged` registry settings via `advapi32.dll`, distinguishing user-toggleable `Denied` (`ms-settings:privacy-microphone`) from administrator-locked `Restricted`.
+
+### Linux Socket & Flatpak Sandbox Checks
+On Linux, `check_permissions` verifies `PipeWire` and `PulseAudio` runtime socket reachability, `EACCES` permission denials, and `/.flatpak-info` sandbox boundaries.
+
+---
+
+## 4. Preflight & Prompt Examples Across All 4 SDKs
+
+<SdkTabs>
+  <TabItem label="Python">
+    ```python
+    import capture_system_or_process_audio as cspa
+
+    targets = [cspa.microphone(), cspa.default_output()]
+
+    # 1. Non-prompting preflight for specific targets:
+    report = cspa.check_permissions(targets)
+    for entry in report.entries:
+        if entry.required:
+            print(entry.kind.value, "->", entry.state.value, "can_prompt=", entry.can_prompt)
+
+    # 2. Interactive prompt (with optional OS Privacy Settings fallback if previously denied):
+    if False:
+        updated = cspa.request_permissions(targets, timeout_ms=30000, open_settings_if_denied=True)
+        if updated.requires_relaunch:
+            print("Consent granted — please relaunch the app to activate ScreenCaptureKit.")
+
+    # 3. Headless / non-prompting stream open (raises PermissionError if ungranted):
+    req = cspa.request(targets, request_permissions=False)
+    assert req.permission_policy == cspa.PermissionPolicy.CHECK_ONLY
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use capture_system_or_process_audio::{
+        CapabilityError, CaptureTarget, DefaultDeviceMode, PermissionPolicy, Permissions,
+        check_permissions, request,
+    };
+    use std::time::Duration;
+
+    fn preflight_and_configure() -> Result<(), CapabilityError> {
+        let targets = vec![
+            CaptureTarget::microphone(DefaultDeviceMode::Follow),
+            CaptureTarget::default_output(DefaultDeviceMode::Follow),
+        ];
+
+        let report = check_permissions(&targets)?;
+        println!(
+            "Mic: {:?}, SysAudio: {:?}, Relaunch needed: {}",
+            report.microphone().state,
+            report.system_audio().state,
+            report.requires_relaunch()
+        );
+
+        if false {
+            let _ = Permissions::request(&targets, &Default::default(), Duration::from_secs(30), true)?;
+        }
+
+        let headless_req = request(targets).with_permission_policy(PermissionPolicy::CheckOnly);
+        assert_eq!(headless_req.permission_policy(), PermissionPolicy::CheckOnly);
+        Ok(())
+    }
+    let _ = preflight_and_configure();
+    ```
+  </TabItem>
+  <TabItem label="C++17">
+    ```cpp
+    #include <cspa.hpp>
+    #include <cstdio>
+
+    int main() {
+        auto mic = cspa::Target::microphone().take_value();
+        auto spk = cspa::Target::default_output().take_value();
+
+        auto rep_res = cspa::check_permissions({mic, spk});
+        if (rep_res.is_ok()) {
+            const auto &rep = rep_res.value();
+            std::printf("Mic granted: %d, SysAudio required: %d\n",
+                        rep.microphone().is_granted() ? 1 : 0,
+                        rep.system_audio().required ? 1 : 0);
+        }
+
+        cspa::CaptureRequest req({mic, spk});
+        req.set_permission_policy(cspa::PermissionPolicy::CheckOnly);
+        return 0;
+    }
+    ```
+  </TabItem>
+  <TabItem label="C11">
+    ```c
+    #include <cspa_experimental.h>
+    #include <stdio.h>
+
+    int main(void) {
+        cspa_capture_target_record mic = {0};
+        mic.struct_size = (uint32_t)sizeof(mic);
+        mic.schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+        if (cspa_target_microphone(CSPA_DEFAULT_DEVICE_FOLLOW, 1.0f, &mic) != CSPA_STATUS_OK) return 1;
+
+        cspa_permission_report_record report = {0};
+        cspa_permission_report_init(&report);
+        if (cspa_permissions_check(&mic, 1u, NULL, &report) == CSPA_STATUS_OK) {
+            printf("All required granted: %u\n", report.is_granted);
+        }
+        return 0;
+    }
+    ```
+  </TabItem>
+</SdkTabs>
+
+Continue to [Troubleshooting, Loopback Traps & Architecture FAQ](/capture-system-or-process-audio/concepts/troubleshooting-faq/).

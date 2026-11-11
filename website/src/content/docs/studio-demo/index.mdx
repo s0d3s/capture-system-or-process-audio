@@ -1,0 +1,78 @@
+---
+title: Studio Demo Overview & Screen Map
+description: Install and launch cspa-tui-demo, explore its annotated 7-zone terminal studio layout, and understand visual-only acoustic feedback loop protection.
+---
+
+import { Aside, CardGrid, LinkCard } from '@astrojs/starlight/components';
+import { Kbd } from 'starlight-kbd/components';
+
+`cspa-tui-demo` is a standalone `#![forbid(unsafe_code)]` interactive terminal studio built with `ratatui`, `crossterm`, `rustfft`, and `cpal` directly on top of the unified `capture-system-or-process-audio` Rust facade (`0` OS-specific `#[cfg]` branches in `backend.rs`).
+
+It lets you browse live applications, processes, output endpoints, and microphones, preview side-effect-free `CaptureRequest::inspect()` execution plans, inspect or request OS privacy permissions, hot-swap mixes **while recording**, play back zero-disk RAM takes, and export WAV files — without writing a line of code.
+
+---
+
+## 1. Quick Launch & CLI Modes
+
+### Prebuilt Binary *(Zero Rust Toolchain Needed)*
+Download `cspa-tui-demo-<version>-<target>.zip` (Windows `x64`/`ARM64`) or `.tar.gz` (Linux `x86_64`/`aarch64`, macOS `arm64`) from [GitHub Releases](https://github.com/s0d3s/capture-system-or-process-audio/releases/latest) and run it in any truecolor terminal (**`100x36` or larger** recommended):
+
+```bash
+# Linux & macOS:
+./cspa-tui-demo
+
+# Windows Terminal / PowerShell:
+.\cspa-tui-demo.exe
+```
+
+### Build & Smoke-Test From Source
+
+```bash
+cargo run --release --manifest-path tools/cspa-tui-demo/Cargo.toml
+
+# Non-interactive headless self-test (used in CI release smoke checks):
+cargo run --release --manifest-path tools/cspa-tui-demo/Cargo.toml -- --smoke-test
+```
+
+---
+
+## 2. Annotated 7-Zone Studio Screen Map
+
+Click the diagram below to zoom in:
+
+![cspa-tui-demo Annotated 7-Zone Terminal Studio Layout](/capture-system-or-process-audio/diagrams/tui-studio-layout.svg)
+
+| Screen Zone | Primary Role | Key Hotkeys |
+| --- | --- | --- |
+| **Top Header Bar** | Session state pill (`LIVE MONITOR`, `● REC`, `▶ PLAY`, `■ IDLE`), `[+ Add Source]`, `[● Record]`, aggregate `[Perms]` pill, `[Mon]`, and `[Synth]` test-tone generator. | <Kbd windows="A" />, <Kbd windows="R" />, <Kbd windows="K" />, <Kbd windows="M" />, <Kbd windows="T" /> |
+| **Panel `[1]` Staged Audio Sources** | Live mixing board with hot-swap checkboxes, `[SYS]`/`[DEV]`/`[APP]`/`[PID]`/`[MIC]`/`[IN]` badges, and per-target Backend, Gain, Scope, Exit, Device Mode, & `+2x` Duplicate chips. | <Kbd windows="ArrowUp" /> / <Kbd windows="ArrowDown" />, <Kbd windows="Space" />, <Kbd windows="B" />, <Kbd windows="G" />, <Kbd windows="D" />, <Kbd windows="Delete" /> |
+| **Panel `[2]` Capture Plan & Config** | Clickable session strategy & `OutputConverter` chips, live `CaptureRequest::inspect()` readout, and inline `Mic`/`Sys`/`Scr` Permissions Strip. | <Kbd windows="C" />, <Kbd windows="K" /> |
+| **Panel `[3]` Live Spectroscope** | Real-time **FFT Spectrum** (`2048`-pt Hann + peak hold), **Waterfall Map**, and **Braille Oscilloscope** + `20Hz–20kHz` log ruler & stereo Peak/RMS dBFS meters. | <Kbd windows="V" />, <Kbd windows="M" /> |
+| **Panel `[4]` Stream & Mixer Telemetry** | Frame/byte/segment counters, `CspaMixer` clock-domain skew & drift-slip counters, and per-input `BYPASS` / `SYNC` normalizer & participation badges. | Live Readout |
+| **Panel `[5]` In-Memory Takes & Playback** | Zero-disk `MemoryTake` list (`segs:N`), clickable `Seek:` progress bar, `cpal` playback, and on-demand `./recordings/` WAV export. | <Kbd windows="[" /> / <Kbd windows="]" />, <Kbd windows="P" />, <Kbd windows="S" />, <Kbd windows="ArrowLeft" /> / <Kbd windows="ArrowRight" />, <Kbd windows="W" /> |
+| **Bottom `💬 Voice Strip` & Status Bar** | Interactive capsule waveform (click anywhere on the waveform to seek playback!), quick Record/Play & WAV save buttons, and live status/error banner. | Mouse Click |
+
+---
+
+## 3. Acoustic Feedback Loop Guard
+
+<Aside type="tip" title="Why live monitoring never howls through your speakers">
+When you stage a `[MIC]` source alongside `[SYS]` speakers, routing live captured audio back to speakers would immediately trigger an acoustic feedback loop. `cspa-tui-demo`'s live monitor (`[Mon: ON (M)]`) is **100% visual** (driving the FFT, Waterfall, Oscilloscope, dBFS meters, and Voice Strip without speaker output) and automatically pauses live monitoring whenever `cpal` plays back a recorded `MemoryTake` (`P`).
+</Aside>
+
+---
+
+## Deep-Dive Studio Demo Guides
+
+<CardGrid>
+  <LinkCard
+    title="Panels & Toggles Reference ([1]–[5])"
+    description="Every header button, per-source chip, Capture Plan & OutputConverter toggle, spectroscope view, telemetry badge, and RAM take control."
+    href="/capture-system-or-process-audio/studio-demo/panels-and-toggles/"
+  />
+  <LinkCard
+    title="Modals & Complete Shortcut Reference"
+    description="Add Capture Sources modal (A) + hover inspector, OS Recording Permissions modal (K), and the complete keyboard & mouse action matrix."
+    href="/capture-system-or-process-audio/studio-demo/modals-and-shortcuts/"
+  />
+</CardGrid>

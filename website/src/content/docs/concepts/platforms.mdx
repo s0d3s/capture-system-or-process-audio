@@ -1,0 +1,148 @@
+---
+title: Platform Backends & Capability Matrix
+description: Authoritative capability matrix for Windows WASAPI, Linux PipeWire/PulseAudio (dlopen), and Apple Silicon macOS Core Audio & ScreenCaptureKit.
+---
+
+import { Aside, TabItem } from '@astrojs/starlight/components';
+import SdkTabs from '../../../components/SdkTabs.astro';
+
+`capture-system-or-process-audio` exposes a portable cross-platform API without pretending every operating system has identical kernel audio internals. Unsupported scopes or OS versions **always fail explicitly** with a typed `CapabilityError` / `PlanError` rather than silently falling back to full-system capture.
+
+---
+
+## 1. Cross-Platform Capability Summary
+
+| Platform & Architecture | Native `Backends` (Default Priority) | System & Output Endpoints | Application & Process Capture | Microphones & Input Endpoints |
+| --- | --- | --- | --- | --- |
+| **Windows 10 / 11** (`x86_64`, `ARM64`) | `["wasapi"]` | ✅ Build `19041+` (`default_output` `Follow`/`Pin`, `device(id)`) | ✅ Build `20348+` (`ProcessScope::Tree`; `Exact` rejected) | ✅ Build `19041+` (`microphone` `Follow`/`Pin`, `input_device(id)`) |
+| **Linux** (`x86_64`, `aarch64`) | `["pipewire", "pulseaudio"]` | ✅ Sink monitor & live default-sink tracking | ✅ PipeWire virtual-sink fan-in (`Tree` & `Exact`) + PulseAudio per-stream `CspaMixer` | ✅ Physical/virtual sources (`.monitor` sinks excluded) |
+| **macOS** (`Apple Silicon arm64`) | `["coreaudio", "screencapturekit"]` *(SCK-first for `Exact` `Application`)* | ✅ `macOS 14.2+` Core Audio Process Taps | ✅ `macOS 14.2+` Core Audio Taps (`Tree` & `Exact`) + `macOS 13.0+` `ScreenCaptureKit` (`Application` `Exact`) | ✅ `macOS 13.0+` Core Audio HAL input (`AVMediaTypeAudio` TCC) |
+
+---
+
+## 2. Windows 10 / 11 (`WASAPI`) :badge[Build 19041+ / 20348+]{variant=note}
+
+- **Speaker & Device Loopback (`Build 19041+`):** Captures `eRender` endpoints via event-driven `AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK` on a dedicated MMCSS `Capture` COM thread (STA/MTA safe).
+- **Per-Process / Application Loopback (`Build 20348+` — Windows 10 21H2 / Server 2022 / Windows 11):**
+  - Uses `ActivateAudioInterfaceAsync` with `PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE`.
+  - **Scope Boundary:** Because the Windows kernel only exposes tree-scoped process activation (not exact-PID-only isolation), requesting `ProcessScope::Exact` on Windows deterministically returns `CapabilityError::UnsupportedScope`.
+  - **Best-Effort Child-Join Transient Note:** When a target process dynamically spawns or closes an audio-rendering child process mid-stream, Windows WASAPI's internal process loopback mixer exhibits a brief ~`31 ms` (`1504`-frame at `48 kHz`) kernel transition before settling cleanly into the updated process-tree mix. (Automatic stream reopening is intentionally avoided because reopening introduces an extra gap without repairing prior samples.)
+- **Microphones & Inputs (`Build 19041+`):** Opens `eCapture` endpoints without `LOOPBACK`, verifies `IMMEndpoint::GetDataFlow()` direction isolation, and stamps an independent `clock_domain` so `[microphone(), default_output()]` mixes apply active clock-drift compensation.
+
+---
+
+## 3. Linux (`PipeWire 0.3.65+` & `PulseAudio 15.0+`) :badge[0 NEEDED Links]{variant=success}
+
+- **Zero Compile-Time `NEEDED` Dependencies:** Both `libpipewire-0.3.so.0` (`>= 0.3.65`) and `libpulse.so.0` (`>= 15.0`) are loaded dynamically at runtime via `dlopen`. Prebuilt wheels, Rust binaries, and `libcspa_ffi.so` run cleanly on minimal servers without audio packages installed and never statically bundle LGPL libraries.
+- **PipeWire Backend (`pipewire`):**
+  - Resolves bridged PulseAudio/ALSA clients accurately via `Client` `application.process.id` (never misidentifying the `pipewire-pulse` daemon PID via `pipewire.sec.pid`) plus `/proc/<pid>/cmdline` and Flatpak/D-Bus `cgroup` metadata.
+  - Orchestrates `SharedNativeGraphMix` using a transient `support.null-audio-sink` node with passive, non-lingering FL/FR port links (`PW_STREAM_FLAG_RT_PROCESS`), preserving normal speaker/headphone playback and automatically rolling back links via `RouteRollbackGuard` on drop.
+- **PulseAudio Backend (`pulseaudio`):**
+  - Captures per-application/process audio by attaching `pa_stream_set_monitor_stream` streams to each matching sink-input and aligning them in `CspaMixer` (`SoftwareStreamMix`).
+- **Cross-Backend Mixing:** Supports pinning one target to `pipewire` and another to `pulseaudio` in the same `CspaMixer` session.
+
+---
+
+## 4. macOS (`Apple Silicon arm64`) :badge[macOS 13.0+ / 14.2+]{variant=tip}
+
+- **Architecture Requirement:** Targets Apple Silicon (`aarch64-apple-darwin`) exclusively; Intel `x86_64` macOS is explicitly unsupported.
+- **Core Audio Process Taps (`coreaudio`, `macOS 14.2+`):**
+  - Uses `CATapDescription` (`AudioHardwareCreateProcessTap`) for both system-output loopback and `Tree`/`Exact` process & application capture (`SharedNativeGraphMix` over `[parent_obj, child_obj]` `AudioObjectID` sets).
+  - Validates `(pid, pbi_start_tvsec)` via `proc_pidinfo(PROC_PIDTBSDINFO)` to filter stale post-exit `AudioObjectID`s immediately after process termination.
+- **ScreenCaptureKit Audio (`screencapturekit`, `macOS 13.0+`):**
+  - Captures discovered `Application` targets (`ProcessScope::Exact`) across visible, minimized, hidden (`orderOut:`), and closed windows with single-write planar-to-interleaved `AudioBufferList` packing.
+  - Automatically preferred first for `Exact` `Application` requests (so `macOS 13.x` hosts work out of the box when `ScreenRecording` consent is granted!).
+- **Core Audio HAL Input (`coreaudio`, `macOS 13.0+`):**
+  - Captures `1ch`/`2ch` HAL input endpoints via `AudioDeviceCreateIOProcID` on `kAudioObjectPropertyScopeInput` (excluding private/tap aggregates) and mixes seamlessly with `ScreenCaptureKit` or `CoreAudio` output taps in `CspaMixer`.
+
+---
+
+## 5. Customizing `Backends` Priority & Disabling Cross-Backend Fallback
+
+Passing a single-element backend list for an OS disables cross-backend fallback on that platform:
+
+<SdkTabs>
+  <TabItem label="Python">
+    ```python
+    import capture_system_or_process_audio as cspa
+
+    # Require PipeWire only on Linux (no fallback to PulseAudio) and preview Linux plan from any OS:
+    strict_backends = cspa.Backends(
+        linux=[cspa.BackendId.PIPEWIRE],
+        macos=[cspa.BackendId.COREAUDIO, cspa.BackendId.SCREENCAPTUREKIT],
+    )
+    plan = cspa.request(cspa.default_output(), backends=strict_backends).inspect_for_os("linux")
+    print("Selected Linux backend:", plan.selected_backend)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use capture_system_or_process_audio::{
+        BackendId, Backends, CaptureTarget, DefaultDeviceMode, PlanError, PlatformOs, request,
+    };
+
+    fn preview_linux_pipewire_only() -> Result<(), PlanError> {
+        let backends = Backends::new(
+            None,
+            Some(vec![BackendId::PipeWire]),
+            Some(vec![BackendId::CoreAudio, BackendId::ScreenCaptureKit]),
+        )?;
+        let plan = request(vec![CaptureTarget::default_output(DefaultDeviceMode::Follow)])
+            .with_backends(backends)
+            .inspect_for_os(PlatformOs::Linux)?;
+        assert_eq!(plan.selected_backend, Some(BackendId::PipeWire));
+        Ok(())
+    }
+    preview_linux_pipewire_only().expect("valid Linux plan");
+    ```
+  </TabItem>
+  <TabItem label="C++17">
+    ```cpp
+    #include <cspa.hpp>
+
+    int main() {
+        cspa::Backends backends;
+        backends.set_linux({cspa::BackendId::PipeWire})
+                .set_macos({cspa::BackendId::CoreAudio, cspa::BackendId::ScreenCaptureKit});
+
+        auto spk = cspa::Target::default_output().take_value();
+        cspa::CaptureRequest req({spk});
+        req.set_backends(backends);
+
+        auto linux_plan = req.inspect_for_os(cspa::PlatformOs::Linux);
+        return (linux_plan.is_ok() && linux_plan.value().selected_backend == cspa::BackendId::PipeWire) ? 0 : 1;
+    }
+    ```
+  </TabItem>
+  <TabItem label="C11">
+    ```c
+    #include <cspa_experimental.h>
+
+    int main(void) {
+        cspa_backends_record backends = {0};
+        cspa_backends_init(&backends);
+        backends.linux_mask = CSPA_BACKEND_PIPEWIRE;
+
+        cspa_capture_target_record spk = {0};
+        spk.struct_size = (uint32_t)sizeof(spk);
+        spk.schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+        if (cspa_target_default_output(CSPA_DEFAULT_DEVICE_FOLLOW, 1.0f, &spk) != CSPA_STATUS_OK) return 1;
+
+        cspa_capture_request_record req = {0};
+        cspa_capture_request_init(&req, &spk, 1u);
+        req.backends = &backends;
+
+        cspa_plan_report_record rep = {0};
+        rep.struct_size = (uint32_t)sizeof(rep);
+        rep.schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+        return cspa_request_inspect_for_os(CSPA_PLATFORM_OS_LINUX, &req, &rep) == CSPA_STATUS_OK ? 0 : 1;
+    }
+    ```
+  </TabItem>
+</SdkTabs>
+
+<Aside type="note" title="TimingRequirement::Raw vs Precise">
+All backends support `TimingRequirement::Raw` (monotonic packet sequence + hardware/QPC tick headers + clock-domain tags). Because OS process-loopback APIs do not yet expose independently calibrated `<= 1 ms` absolute hardware-render sample timestamps across all platforms, requesting `TimingRequirement::Precise` fails explicitly (`CapabilityError::PreciseTimingUnqualified`) rather than inventing unverified timestamps.
+</Aside>
+
+Continue to [OS Recording Permissions & Privacy Consent](/capture-system-or-process-audio/concepts/permissions/).

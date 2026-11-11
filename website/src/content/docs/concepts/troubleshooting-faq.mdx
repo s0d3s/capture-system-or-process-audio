@@ -1,0 +1,139 @@
+---
+title: Troubleshooting, Loopback Traps & FAQ
+description: Solutions for silent WASAPI loopback hangs, headphone switching, mic+speaker clock drift, macOS TCC relaunch, Linux dlopen, and free-threaded Python 3.14t/3.15t.
+faq:
+  - question: "Do end users need to install VB-Cable, BlackHole, or Soundflower?"
+    answer: "No. Every platform uses built-in native OS audio APIs (WASAPI on Windows, PipeWire and PulseAudio on Linux, Core Audio Process Taps and ScreenCaptureKit on macOS) without altering normal speaker or headphone playback."
+  - question: "Why do blocking loopback reads pause when no audio is playing, and how do I get continuous silent frames?"
+    answer: "On Windows WASAPI loopback and per-process taps, the OS emits zero packets while audio playback is idle. Pass silence_on_idle=True (Python) or set silence_on_idle on MixerConfig (Rust/C++) to receive continuous wall-clock silent frames marked synthesized_silence=true."
+  - question: "What happens when a user unplugs headphones or switches their default speaker or microphone?"
+    answer: "Default targets (default_output and microphone) use DefaultDeviceMode::Follow by default. CaptureManager listens for native OS endpoint-change events, closes the old stream, opens the new default endpoint, and emits BoundaryKind::DeviceChanged."
+  - question: "Why does ProcessScope::Exact fail on Windows?"
+    answer: "Windows ActivateAudioInterfaceAsync process loopback only exposes kernel process-tree inclusion or exclusion, not single-PID non-tree isolation. Rather than silently capturing child processes or system audio, Windows rejects Exact with CapabilityError::UnsupportedScope."
+  - question: "Does capture-system-or-process-audio work on free-threaded Python 3.14t and 3.15t (-Xgil=0)?"
+    answer: "Yes. The PyO3 extension declares Py_MOD_GIL_NOT_USED (keeping sys._is_gil_enabled() False), marks all 26 pyclasses frozen, and uses critical-section-guarded scratch copy-out on read_into with zero steady-state allocations."
+  - question: "Why do Linux wheels and binaries have zero libpipewire or libpulse NEEDED links?"
+    answer: "crates/capture-linux loads libpipewire-0.3.so.0 and libpulse.so.0 dynamically at runtime via dlopen so binaries start cleanly in minimal containers and never statically link or bundle LGPL client libraries."
+---
+
+import { Aside, TabItem } from '@astrojs/starlight/components';
+import SdkTabs from '../../../components/SdkTabs.astro';
+
+Real-world desktop audio capture is full of subtle OS traps that break naive recording scripts in production. Below are the most common symptoms, why they happen at the OS level, and how `capture-system-or-process-audio` solves them cleanly.
+
+---
+
+## 1. Blocking `read()` Waits or Times Out When Speakers Are Silent
+
+**Cause:** Unlike physical microphones (which continuously emit ADC thermal noise), Windows `WASAPI` loopback and per-process taps emit **zero packets** while no application is actively rendering audio. In legacy `PyAudioWPatch` / PortAudio wrappers, blocking `stream.read(N)` hangs indefinitely until a sound plays.
+
+**Solution:**
+- If you only want active audio bursts, read with `timeout_ms` and check `outcome.reason == PartialReason.TIMEOUT`.
+- If you are feeding a continuous wall-clock pipeline (VAD, `faster-whisper` live window, WebRTC/Discord bot, or recording a timeline where silence must advance time), enable **`silence_on_idle=True`**:
+
+<SdkTabs>
+  <TabItem label="Python">
+    ```python
+    import capture_system_or_process_audio as cspa
+
+    with cspa.capture(cspa.default_output(), silence_on_idle=True) as stream:
+        outcome = stream.read(frames=960, timeout_ms=200)
+        if outcome.mixed_metadata and outcome.mixed_metadata.synthesized_silence:
+            print("Speaker is idle — received continuous synthesized silence")
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use capture_system_or_process_audio::{
+        CapabilityError, CaptureManager, CaptureTarget, DefaultDeviceMode, MixerConfig, Stop,
+        request,
+    };
+    use std::time::Duration;
+
+    fn continuous_loopback() -> Result<(), CapabilityError> {
+        let req = request(vec![CaptureTarget::default_output(DefaultDeviceMode::Follow)])
+            .with_mixer_config(MixerConfig {
+                silence_on_idle: true,
+                ..MixerConfig::default()
+            });
+        if false {
+            let mut mgr = CaptureManager::open(req)?;
+            let _ = mgr.read(960, Duration::from_millis(200));
+            if let Some(meta) = mgr.last_block_metadata() {
+                println!("Synthesized silence: {}", meta.synthesized_silence);
+            }
+            mgr.stop(Stop::Drain);
+            mgr.wait_cleanup(Duration::from_secs(2));
+        }
+        Ok(())
+    }
+    let _ = continuous_loopback();
+    ```
+  </TabItem>
+  <TabItem label="C++17">
+    ```cpp
+    #include <cspa.hpp>
+
+    int main() {
+        auto spk = cspa::Target::default_output().take_value();
+        cspa::MixerConfig mixer;
+        mixer.set_silence_on_idle(true);
+
+        cspa::CaptureRequest req({spk});
+        req.set_mixer_config(mixer);
+        return req.inspect().is_ok() ? 0 : 1;
+    }
+    ```
+  </TabItem>
+  <TabItem label="C11">
+    ```c
+    #include <cspa_experimental.h>
+
+    int main(void) {
+        cspa_mixer_config_record mixer = {0};
+        cspa_mixer_config_init(&mixer);
+        mixer.silence_on_idle = 1u;
+        return mixer.silence_on_idle == 1u ? 0 : 1;
+    }
+    ```
+  </TabItem>
+</SdkTabs>
+
+---
+
+## 2. Microphone + System Audio Slowly Drift Out of Sync
+
+**Cause:** A USB microphone and onboard speakers run on two physically independent hardware crystal oscillators (`48000.4 Hz` vs `47999.7 Hz`), accumulating tens of milliseconds of skew over long meetings if naively zipped together.
+
+**Solution:** Pass both targets into a single `capture([microphone(), find_app("Zoom")])` session rather than opening two separate streams! `CspaMixer` inspects per-packet `Stamp.clock_domain` tags and applies **`64`-frame crossfade slip/repeat drift compensation** whenever cross-clock drift exceeds `drift_threshold_ms` (`5 ms` default).
+
+---
+
+## 3. macOS `PermissionError` or `requires_relaunch`
+
+- **Running inside a packaged `.app` bundle:** Verify your `Info.plist` includes `NSMicrophoneUsageDescription` (for `microphone` / `input_device`) and `NSAudioCaptureUsageDescription` (for `CoreAudio` system/process taps). Missing keys return `PermissionState::Restricted` (`PermissionError`) to protect your process from macOS TCC `SIGABRT`.
+- **Newly granted `ScreenCaptureKit` consent (`requires_relaunch == true`):** macOS `ScreenRecording` TCC grants require restarting the host process before `SCShareableContent` delivers live app audio buffers. Check `report.requires_relaunch` after `request_permissions(...)` and prompt the user to restart your app once.
+- **Running over SSH on macOS:** macOS TCC requires an active GUI login console (`CGSessionCopyCurrentDictionary`). Headless SSH sessions without a logged-in desktop session report `Restricted`.
+
+---
+
+## 4. Linux `ClientLibraryUnavailable` in Minimal Containers
+
+**Cause:** Neither `libpipewire-0.3.so.0` (`>= 0.3.65`) nor `libpulse.so.0` (`>= 15.0`) is installed or running in the container.
+
+**Solution:** Install `pipewire-libs` / `libpipewire-0.3-0` or `pulseaudio-libs` / `libpulse0` on the target Linux host and ensure `XDG_RUNTIME_DIR` points to the active user audio session (`/run/user/<uid>`).
+
+---
+
+## 5. Frequently Asked Questions
+
+### Do end users need to install `VB-Cable`, `BlackHole`, or `Soundflower`?
+**No.** Every backend uses built-in native OS audio APIs without mutating system default playback devices, so hardware volume keys and headphone auto-pause continue working normally.
+
+### Why does `scope="exact"` fail on Windows?
+Windows `WASAPI` process loopback (`ActivateAudioInterfaceAsync`) only supports kernel tree inclusion/exclusion. Rather than silently capturing child processes or broadening to full speaker loopback, Windows rejects `Exact` with `CapabilityError::UnsupportedScope`. Use `scope="tree"` (the default) on Windows.
+
+### Does this library work on Free-Threaded Python `3.14t` and `3.15t` (`-Xgil=0`)?
+**Yes.** Prebuilt `cp314-cp314t` and PEP 803 `cp315-abi3.abi3t` wheels declare `Py_MOD_GIL_NOT_USED` (`sys._is_gil_enabled() == False`), freeze `100%` of exported `#[pyclass]` types, and guard `read_into` buffer writes with `pyo3::sync::critical_section::with_critical_section`.
+
+Next, explore the [Interactive Studio Demo (`cspa-tui-demo`) Manual](/capture-system-or-process-audio/studio-demo/).
