@@ -1,0 +1,71 @@
+---
+title: Multi-SDK API Reference Hub
+description: Cross-SDK symbol concordance and complete API reference portals for Python (.pyi), Safe-Rust (plus self-hosted /api/rust/ rustdoc), C++17 RAII, and C11 FFI.
+---
+
+import { CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+Every binding exposes the exact same core concepts so teams working across **Python**, **Rust**, **C++17**, and **C11** share one mental model. Every reference page below is deterministically generated from workspace headers, `.pyi` stubs, and Rust crate definitions (`0` manual signature drift) and indexed for symbol-exact search (<kbd>Ctrl</kbd>+<kbd>K</kbd>).
+
+---
+
+## SDK Reference Portals
+
+<CardGrid>
+  <LinkCard
+    title="Python API Reference (79 Symbols)"
+    description="All 20 module functions, 26 frozen @final classes, and 33 stdlib enum.Enum classes from __init__.pyi."
+    href="/capture-system-or-process-audio/reference/python/functions/"
+  />
+  <LinkCard
+    title="Rust Facade Reference (109+ Symbols)"
+    description="Unified #![forbid(unsafe_code)] facade functions, static-dispatch aliases, 7 backend traits, structs, and enums."
+    href="/capture-system-or-process-audio/reference/rust/overview/"
+  />
+  <LinkCard
+    title="Hosted Rust cargo doc (/api/rust/)"
+    description="Full interactive DOCS_RS=1 rustdoc HTML across all 5 crates (capture, core, windows, linux, macos)."
+    href="/capture-system-or-process-audio/api/rust/capture_system_or_process_audio/index.html"
+  />
+  <LinkCard
+    title="C++17 RAII Reference (48 Symbols)"
+    description="Header-only cspa.hpp classes, -fno-exceptions Result<T> & *_or_throw() helpers, and 25 enum class types."
+    href="/capture-system-or-process-audio/reference/cpp/classes-and-streams/"
+  />
+  <LinkCard
+    title="C11 Wire ABI Reference (113+ Symbols)"
+    description="cspa_experimental.h functions, opaque handles, 64-bit sizeof/offsetof wire records, and CSPA_STATUS_* codes."
+    href="/capture-system-or-process-audio/reference/c/abi-and-functions/"
+  />
+</CardGrid>
+
+---
+
+## Cross-SDK Concept & Symbol Concordance
+
+The Python examples use `import capture_system_or_process_audio as cspa`.
+
+| Concept | Python (`capture_system_or_process_audio`) | Rust (`capture_system_or_process_audio`) | C++17 (`cspa::*`) | C11 (`cspa_experimental.h`) |
+| --- | --- | --- | --- | --- |
+| **Default Speakers** | `cspa.default_output(default_device_mode="follow")` | `CaptureTarget::default_output(DefaultDeviceMode::Follow)` | `cspa::Target::default_output(...)` | `cspa_target_default_output(...)` |
+| **Default Microphone** | `cspa.microphone(default_device_mode="follow")` | `CaptureTarget::microphone(DefaultDeviceMode::Follow)` | `cspa::Target::microphone(...)` | `cspa_target_microphone(...)` |
+| **List & Filter Targets** | `cspa.discover()` / `cspa.discover_query(query)` | `discover_query(&query)` $\rightarrow$ `TargetCatalog` | `cspa::Discovery::query(query)` | `cspa_discover_query(&q, buf, cap, &n)` |
+| **Find Single App** | `cspa.find_app("Zoom", scope="tree")` | `Discovery::new().find_app("Zoom", ...)` | `cspa::Discovery::query(...)` | `cspa_discovery_find_app(...)` |
+| **Process by PID** | `cspa.process(pid, scope="tree")` | `CaptureTarget::process(pid, ...)` | `cspa::Target::process(pid, ...)` | `cspa_target_process(...)` |
+| **Plan Inspection** | `cspa.request(targets).inspect()` | `request(targets).inspect()` | `req.inspect()` / `inspect_or_throw()` | `cspa_request_inspect(&req, &rep)` |
+| **Managed Capture** | `cspa.capture(targets, ...)` $\rightarrow$ `ManagedStream` | `CaptureManager::open(req)` | `cspa::ManagedStream::open(req)` | `cspa_manager_open(&req, &mgr)` |
+| **Zero-Alloc Pull** | `stream.read_into(buf, frames)` | `manager.read_into(&mut buf, frames, timeout)` | `stream.read_into(ptr, len, frames, ms)` | `cspa_manager_read_into(...)` |
+| **Live Hot-Swap** | `stream.update_targets(new_targets)` | `manager.update_targets(new_targets)` | `stream.update_targets(new_targets)` | `cspa_manager_update_targets(...)` |
+| **Format Converter** | `cspa.OutputConverter(rate, channels, ...)` | `OutputConverterConfig` | `cspa::OutputConverter` | `cspa_output_converter_record` |
+| **Mixer Config** | `cspa.MixerConfig(...)` / `silence_on_idle=True` | `MixerConfig` | `cspa::MixerConfig` | `cspa_mixer_config_record` |
+| **Permissions Check** | `cspa.check_permissions(targets)` | `check_permissions(targets)` | `cspa::check_permissions(targets)` | `cspa_permissions_check(...)` |
+| **Single-Session Stream** | `cspa.AudioStream.open(target)` | `open_stream(&target, overflow)` | `cspa::AudioStream::open(target)` | `cspa_stream_open(&target, ...)` |
+
+---
+
+## Upstream Registry & Header Sources
+
+- **Self-Hosted Rust `cargo doc`:** [`/capture-system-or-process-audio/api/rust/`](/capture-system-or-process-audio/api/rust/capture_system_or_process_audio/index.html) · [`docs.rs/capture-system-or-process-audio`](https://docs.rs/capture-system-or-process-audio)
+- **Python `.pyi` Type Stubs:** [`__init__.pyi`](https://github.com/s0d3s/capture-system-or-process-audio/blob/main/crates/capture-python/python/capture_system_or_process_audio/__init__.pyi)
+- **C++17 RAII Header:** [`crates/capture-ffi/include/cspa.hpp`](https://github.com/s0d3s/capture-system-or-process-audio/blob/main/crates/capture-ffi/include/cspa.hpp)
+- **C11 Wire ABI Header:** [`crates/capture-ffi/include/cspa_experimental.h`](https://github.com/s0d3s/capture-system-or-process-audio/blob/main/crates/capture-ffi/include/cspa_experimental.h)
