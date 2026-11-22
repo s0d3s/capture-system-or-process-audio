@@ -1,7 +1,8 @@
 import os, pathlib, shutil, subprocess, tarfile, tempfile, textwrap, zipfile
 
 from cmake_version import generate_cmake_version
-from config import PYTHON_SPECS, ROOT_LICENSE_FILES, WHEEL_TAGS
+from config import PYTHON_SPECS, ROOT_LICENSE_FILES
+from python_wheels import build_wheels, smoke_cases
 
 root = pathlib.Path(".").resolve()
 ver = os.environ["PACKAGE_VERSION"]
@@ -23,12 +24,8 @@ def find_py(spec: str) -> str:
     assert out, f"Could not find managed Python {spec}"
     return out
 
-py311, py314, py314t, py315, py315t = [find_py(spec) for spec in PYTHON_SPECS]
+python_executables = {spec: find_py(spec) for spec in PYTHON_SPECS}
 
-# 1. Build 3-wheel Stable ABI + Free-Threaded hybrid:
-#    - cp311-abi3 (GIL CPython 3.11+)
-#    - cp314-cp314t (Free-threaded CPython 3.14t)
-#    - PEP 803 cp315-abi3.abi3t (GIL & Free-threaded CPython 3.15+)
 maturin_exe = shutil.which("maturin")
 if not maturin_exe:
     bin_dir = pathlib.Path(
@@ -52,16 +49,9 @@ maturin_common = [
 if platform == "linux":
     maturin_common.extend(["--zig", "--compatibility", "manylinux_2_28"])
 
-subprocess.run([*maturin_common, "-i", py311, "--features", "abi3-py311"], check=True)
-subprocess.run([*maturin_common, "-i", py314t], check=True)
-subprocess.run([*maturin_common, "-i", py315t, "--features", "abi3t-py315"], check=True)
+wheels = build_wheels(maturin_common, wheels_dir, python_executables)
 
-whl_abi3, whl_314t, whl_abi3t = [list(wheels_dir.glob(f"*-{tag}-*.whl")) for tag in WHEEL_TAGS]
-assert (
-    len(whl_abi3) == 1 and len(whl_314t) == 1 and len(whl_abi3t) == 1
-), f"Expected exact 3 wheels, got {[p.name for p in wheels_dir.iterdir()]}"
-
-for whl in (whl_abi3[0], whl_314t[0], whl_abi3t[0]):
+for whl in wheels.values():
     with zipfile.ZipFile(whl, "r") as zf:
         names = zf.namelist()
         assert any(n.endswith("README.md") for n in names), f"Missing README.md in {whl.name}"
@@ -116,15 +106,8 @@ with tempfile.TemporaryDirectory(prefix="cspa-wheel-smoke-") as tmp_str:
     tmp = pathlib.Path(tmp_str)
     smoke_py = tmp / "smoke.py"
     smoke_py.write_text(textwrap.dedent(smoke_code).strip() + "\n", encoding="utf-8")
-    checks = [
-        ("cp311", py311, whl_abi3[0], False),
-        ("cp314", py314, whl_abi3[0], False),
-        ("cp314t", py314t, whl_314t[0], True),
-        ("cp315", py315, whl_abi3t[0], False),
-        ("cp315t", py315t, whl_abi3t[0], True),
-    ]
-    for label, py_exe, whl_path, free_threaded in checks:
-        venv_dir = tmp / f"venv-{label}"
+    for index, (_, py_exe, whl_path, free_threaded) in enumerate(smoke_cases(wheels, python_executables)):
+        venv_dir = tmp / f"venv-{index}"
         subprocess.run(["uv", "venv", "--python", py_exe, str(venv_dir)], check=True)
         vpy = (
             venv_dir / "Scripts" / "python.exe"

@@ -1,17 +1,13 @@
 import os, pathlib, subprocess, tomllib
 
-from config import DEFAULT_RETENTION_DAYS, HOST_PYTHON, MATURIN_VERSION, PUBLISHED_CRATES, PYTHON_SPECS, ROOT_LICENSE_FILES, matrix_json
+from config import DEFAULT_RETENTION_DAYS, HOST_PYTHON, MATURIN_VERSION, PUBLISHED_CRATES, PYTHON_SPECS, RELEASE_CARGO_MANIFESTS, ROOT_LICENSE_FILES, matrix_json
 
 root = pathlib.Path(".").resolve()
 for lic_name in ROOT_LICENSE_FILES:
     if not (root / lic_name).is_file():
         raise SystemExit(f"Missing required root license file: {lic_name}")
 
-cargo_manifests = [f"crates/{folder}/Cargo.toml" for folder, _ in PUBLISHED_CRATES] + [
-    "crates/capture-ffi/Cargo.toml",
-    "crates/capture-python/Cargo.toml",
-    "tools/cspa-tui-demo/Cargo.toml",
-]
+cargo_manifests = RELEASE_CARGO_MANIFESTS
 
 versions = {}
 for rel in cargo_manifests:
@@ -29,12 +25,8 @@ if len(unique_versions) != 1:
 version = unique_versions[0]
 
 # Verify internal crate dependency version pins match package version.
-for rel in [
-    "crates/capture-windows/Cargo.toml",
-    "crates/capture-linux/Cargo.toml",
-    "crates/capture-macos/Cargo.toml",
-    "crates/capture/Cargo.toml",
-]:
+for folder, _ in PUBLISHED_CRATES:
+    rel = f"crates/{folder}/Cargo.toml"
     data = tomllib.loads((root / rel).read_text(encoding="utf-8"))
     tables = [data.get("dependencies", {})]
     for tgt in data.get("target", {}).values():

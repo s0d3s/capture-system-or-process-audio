@@ -82,7 +82,7 @@ jobs:
             crates/capture-core
             crates/capture
 
-      - name: Package 5 publishable crates and verify out-of-tree extracted .crate archives
+      - name: Package crates and verify out-of-tree extracted .crate archives
         env:
           EXPECTED_VERSION: ${{ needs.preflight.outputs.version }}
         shell: bash
@@ -215,7 +215,7 @@ jobs:
           cargo clippy --locked --manifest-path crates/capture-ffi/Cargo.toml --target "$RUST_TARGET" --all-targets -- -D warnings
           cargo test --locked --manifest-path crates/capture-ffi/Cargo.toml --target "$RUST_TARGET" --lib -- --test-threads=1
 
-      - name: Build & verify 3-wheel Python hybrid, C/C++ FFI SDK, and TUI studio demo
+      - name: Build & verify Python wheels, C/C++ FFI SDK, and TUI studio demo
         shell: bash
         env:
           PACKAGE_VERSION: ${{ needs.preflight.outputs.version }}

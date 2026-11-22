@@ -15,7 +15,7 @@ for folder, pkg_name, full_verify in crates:
     cmd = ["cargo", "package", "--locked", "--manifest-path", str(manifest)]
     if not full_verify:
         # Dependent crates reference sibling crates before registry upload;
-        # we verify all 5 extracted .crate archives together below.
+        # we verify the extracted .crate archives together below.
         cmd.extend(["--no-verify", "--exclude-lockfile"])
     subprocess.run(cmd, check=True)
     crate_file = (
@@ -33,7 +33,7 @@ subprocess.run(
     check=True,
 )
 
-# Extract all 5 .crate tarballs outside the repository and compile a clean
+# Extract the .crate tarballs outside the repository and compile a clean
 # consumer solely against the extracted .crate contents.
 with tempfile.TemporaryDirectory(prefix="cspa-crate-verify-") as tmp:
     tmp_path = pathlib.Path(tmp)
@@ -59,7 +59,7 @@ with tempfile.TemporaryDirectory(prefix="cspa-crate-verify-") as tmp:
     (consumer / "Cargo.toml").write_text(
         "[package]\n"
         'name = "crate-archive-smoke"\n'
-        'version = "0.1.0"\n'
+        f'version = "{ver}"\n'
         'edition = "2024"\n'
         "publish = false\n\n"
         "[dependencies]\n"
@@ -86,4 +86,4 @@ with tempfile.TemporaryDirectory(prefix="cspa-crate-verify-") as tmp:
         ["cargo", "run", "--manifest-path", str(consumer / "Cargo.toml")],
         check=True,
     )
-print("Verified all 5 packaged .crate archives out-of-tree.")
+print(f"Verified all {len(crates)} packaged .crate archives out-of-tree.")
