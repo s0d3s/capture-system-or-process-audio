@@ -188,3 +188,87 @@ Pick your language — your selection stays synced across every guide on this si
 
 Four years ago, [`@s0d3s`](https://github.com/s0d3s) created **[`PyAudioWPatch`](https://github.com/s0d3s/PyAudioWPatch)** to bring Windows WASAPI speaker loopback to Python's `PyAudio`. Today it is the standard Windows loopback package in the Python ecosystem — serving **140,000+ monthly PyPI downloads** (`~1.6M+` annually) and powering **340+ open-source repositories** across AI meeting copilots, live Whisper/STT transcription bots, voice agents, and desktop recorders.
 
+<div class="cspa-stat-grid not-content">
+  <div class="cspa-stat-card">
+    <p class="cspa-stat-value">140,000+ / mo</p>
+    <p class="cspa-stat-label"><strong>PyAudioWPatch</strong> PyPI downloads (~1.6M+ / yr) proven in production</p>
+  </div>
+  <div class="cspa-stat-card">
+    <p class="cspa-stat-value">340+ Repos</p>
+    <p class="cspa-stat-label">Open-source meeting copilots, STT pipelines &amp; recorders built on it</p>
+  </div>
+  <div class="cspa-stat-card">
+    <p class="cspa-stat-value">4+ Years</p>
+    <p class="cspa-stat-label">Real-world WASAPI loopback bug reports &amp; edge-case lessons</p>
+  </div>
+  <div class="cspa-stat-card">
+    <p class="cspa-stat-value">~1 Year R&amp;D</p>
+    <p class="cspa-stat-label">Dedicated ground-up engineering &amp; polish in safe Rust for this library</p>
+  </div>
+</div>
+
+### Why `PyAudioWPatch` Hit an Architectural Wall — and Why This Took Nearly a Year to Build
+
+As `PyAudioWPatch` grew, users repeatedly requested capabilities that were **architecturally impossible to implement** inside a legacy PortAudio C wrapper:
+
+- **Per-application isolation & macOS / Linux support:** PortAudio models hardware endpoints only — it cannot attach to Windows per-process loopback trees, Linux PipeWire/PulseAudio application graphs, or macOS Core Audio Process Taps / ScreenCaptureKit without throwing away the underlying C engine (leaving macOS and Linux users stuck installing `BlackHole` or `VB-Cable`).
+- **Real-world loopback traps that break naive recorders:** Silent WASAPI speakers emit zero packets (causing blocking `stream.read()` loops in `PyAudioWPatch` to hang forever); unplugging headphones breaks pinned streams; combining `[Microphone + App/System Audio]` drifts out of sync across independent hardware clocks; and Free-Threaded Python `3.14t`/`3.15t` (`-Xgil=0`) collides with PortAudio's global C state.
+
+Rather than bolting fragile workarounds onto a 20-year-old C wrapper, **`capture-system-or-process-audio` is the result of nearly a year of dedicated ground-up development and polish in safe Rust** — turning years of `PyAudioWPatch` production feedback into one zero-steady-state-allocation engine across **Python, Rust, C++17, and C11**:
+
+| Capability | `capture-system-or-process-audio` | `PyAudioWPatch` | `sounddevice` / `PyAudio` | `cpal` (Rust) | Virtual Cables (`VB-Cable` / `BlackHole`) |
+| --- | :---: | :---: | :---: | :---: | :---: |
+| **System Speaker Loopback** | ✅ Win · Linux · macOS | ✅ Windows only | ❌ | ⚠️ Partial | ⚠️ Manual driver install |
+| **Single App / Process Tree Isolation** | ✅ Win · Linux · macOS | ❌ | ❌ | ❌ | ❌ |
+| **Microphone + App/System Live Mix** | ✅ Built-in (`CspaMixer` + drift sync) | ❌ Manual | ❌ Manual | ❌ Manual | ⚠️ Manual multi-output |
+| **Silent-Speaker Hang Protection** | ✅ (`silence_on_idle` + timeouts) | ❌ Hangs `read()` | ❌ | ❌ | N/A |
+| **Auto-Follow Default Device Switches** | ✅ (`Follow` mode) | ❌ | ❌ | ❌ | ❌ Breaks volume keys |
+| **Built-In Resampler & Format Converter** | ✅ (`16k`/`44.1k`/`48k`, `f32`/`i16`/`i24`/`i32`) | ❌ | ❌ | ❌ | ❌ |
+| **OS Permission Preflight & Prompt API** | ✅ Honest 5-state report | ❌ | ❌ | ❌ | N/A |
+| **Free-Threaded Python (`3.14t`/`3.15t`)** | ✅ Native (`Py_MOD_GIL_NOT_USED`) | ❌ | ❌ | N/A | N/A |
+| **First-Class SDKs** | **Python, Rust, C++17, C11** | Python (Win) | Python | Rust | OS Driver |
+
+Already using `PyAudioWPatch`? Jump straight to the [Side-by-Side `PyAudioWPatch` Migration Guide](/capture-system-or-process-audio/sdks/python/#3-migrating-from-pyaudiowpatch).
+
+---
+
+## Platform & Backend Matrix
+
+When a requested scope or capability is unsupported on the active OS or OS build, `capture-system-or-process-audio` **fails explicitly with a typed error (`CapabilityError` / `PlanError`)** — it **never** silently substitutes full-system audio for single-process capture.
+
+| Platform | Native Backends | System & Device Output | Application / Process Capture | Microphones & Inputs |
+| --- | --- | --- | --- | --- |
+| **Windows 10 / 11** (`x64`, `ARM64`) | `wasapi` | ✅ Build `19041+` (`Follow`/`Pin`, `device`) | ✅ Build `20348+` (`scope="tree"`; `exact` rejected explicitly) | ✅ Build `19041+` (`Follow`/`Pin`, `input_device`) |
+| **Linux** (`x86_64`, `aarch64`) | `pipewire` (`0.3.65+`), `pulseaudio` (`15.0+`) | ✅ Sink monitor & default sink tracking | ✅ PipeWire virtual-sink fan-in (`tree`/`exact`) & PulseAudio stream mix | ✅ Physical/virtual sources (`0` compile-time `NEEDED` links) |
+| **macOS** (`Apple Silicon arm64`) | `coreaudio`, `screencapturekit` | ✅ `macOS 14.2+` Core Audio Process Taps | ✅ `macOS 14.2+` Core Audio Taps (`tree`/`exact`) & `macOS 13.0+` SCK (`exact`) | ✅ `macOS 13.0+` Core Audio HAL input (`AVMediaTypeAudio`) |
+
+---
+
+## Next Release Preview: Drop-In Ecosystem `Adapters` & Node.js SDK :badge[Planned]{variant=caution}
+
+<p><CapabilityBadge status="planned" /></p>
+
+Today's release connects directly to `NumPy` (`block.to_numpy(copy=False)`), `faster-whisper` (`16 kHz` mono `f32`), `wave`, `asyncio`, Rust, and C/C++. Next release adds zero-rewrite drop-in compatibility `adapters` (`PyAudio`/`PyAudioWPatch`, `python-sounddevice`, `SoundCard`, `SpeechRecognition`, Whisper sliding-window streams) alongside first-class `napi-rs` **Node.js / TypeScript / Electron** bindings.
+
+<CardGrid>
+  <LinkCard
+    title="Overview & Architecture Manual"
+    description="Explore the four-layer real-time architecture and explicit capability guarantees."
+    href="/capture-system-or-process-audio/getting-started/overview/"
+  />
+  <LinkCard
+    title="Installation Across All 4 SDKs"
+    description="Set up Python 3.11-3.15t, Rust 1.88+, C++17 CMake, C11 FFI, or cspa-tui-demo."
+    href="/capture-system-or-process-audio/getting-started/installation/"
+  />
+  <LinkCard
+    title="Interactive Studio Demo (cspa-tui-demo)"
+    description="Test live discovery, permissions, mixing, and 3-mode spectroscopes in your terminal."
+    href="/capture-system-or-process-audio/studio-demo/"
+  />
+  <LinkCard
+    title="Multi-SDK API Reference Hub"
+    description="Cross-language concordance for Python, Rust, C++17, and C11."
+    href="/capture-system-or-process-audio/reference/"
+  />
+</CardGrid>

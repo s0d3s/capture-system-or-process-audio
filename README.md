@@ -384,3 +384,155 @@ int main(void) {
                (unsigned long long)out.copy_bytes);
     }
 
+    cspa_manager_stop(mgr, 0u);
+    uint32_t cleaned = 0;
+    cspa_manager_wait_cleanup(mgr, 2000u, &cleaned);
+    cspa_manager_release(mgr);
+    return 0;
+}
+```
+
+📖 **C11 Docs:** [C11 ABI Handbook](https://s0d3s.github.io/capture-system-or-process-audio/sdks/c/) • [C11 Functions & Structs Reference](https://s0d3s.github.io/capture-system-or-process-audio/reference/c/abi-and-functions/) • [FFI SDK README](crates/capture-ffi/README.md)
+
+<p align="right"><sub><a href="#readme">↑ Back to SDKs</a></sub></p>
+
+---
+
+<a id="adapters-and-nodejs-roadmap"></a>
+## Drop-In Ecosystem `Adapters` & Node.js SDK *(Planned — Next Release)*
+
+Today's initial release already connects cleanly to `NumPy` (`block.to_numpy(copy=False)`), `PyAudio` / `wave` (`memoryview(block)` + `OutputConverter`), `faster-whisper` (`16 kHz` mono `f32`), `asyncio`, Rust, and C/C++ pipelines.
+
+For the **next release**, we are shipping **zero-rewrite drop-in compatibility `adapters`** alongside first-class **Node.js / TypeScript / Electron** bindings so existing audio apps can swap in system, per-application, or mixed mic+app capture without rewriting their consumer loops:
+
+| Planned Feature (Next Release) | Target Ecosystem | What It Enables |
+| --- | --- | --- |
+| **`PyAudio` & `PyAudioWPatch` Drop-In Adapter** | `pyaudio`, `pyaudiowpatch` | Familiar `Stream.read(num_frames, exception_on_overflow=...)` & `stream_callback` (`paInt16`, `paFloat32`, `paInt24`, `paInt32`) backed by cross-platform system, app, or mixed capture with `silence_on_idle=True` deadlock protection. |
+| **`python-sounddevice` Drop-In Adapter** | `sounddevice` (`InputStream`, `RawInputStream`, `rec`) | Exact 2D `(frames, channels)` NumPy pull & `CallbackFlags` push streams over any application, speaker, or mic+app mix. |
+| **`SoundCard` & `SpeechRecognition` Adapters** | `soundcard` (`_Recorder`), `speech_recognition` (`AudioSource`) | Drop any running app (`Zoom`, `Teams`, browser) directly into `Recognizer.listen(...)` or `_Recorder.record(numframes=...)` without `PyAudio` C-extension build issues. |
+| **Whisper / Live STT Stream Helpers** | `faster-whisper`, `openai-whisper`, VADs | Ready-to-iterate 1D `(samples,)` `16 kHz` `float32` / `int16` sliding-window streams. |
+| **Node.js / TypeScript / Electron SDK (`napi-rs`)** | Electron `UtilityProcess`, Node `20+`, Bun, `@livekit/rtc-node`, `@discordjs/voice` | Prebuilt `Node-API` binaries (Electron V8 Memory Cage safe, zero `node-gyp`), `for await (const chunk of stream)`, `.toNodeReadable()`, zero-GC `readInto(TypedArray)`, and built-in `16k`/`24k`/`48k` presets. |
+
+👉 **Want early access to a specific adapter or the Node.js SDK?** Star / Watch this repository or open an issue with your target stack!
+
+---
+
+## Why This Exists — Beyond `PyAudioWPatch`
+
+Four years ago I created **[PyAudioWPatch](https://github.com/s0d3s/PyAudioWPatch)** to bring Windows WASAPI speaker loopback to Python's `PyAudio`. Today it is a staple of the Python audio ecosystem — serving **140,000+ monthly PyPI downloads** (`~1.6M+` / year) and powering **340+ open-source repositories** across AI meeting copilots, live Whisper/STT transcription bots, voice agents, and desktop recorders.
+
+As `PyAudioWPatch` grew over 4+ years in production, users repeatedly requested features that were **architecturally impossible to implement** inside a legacy PortAudio C wrapper:
+
+1. **Per-application isolation & native macOS / Linux capture:** PortAudio only models hardware endpoints — you could not isolate *just* `Zoom`, `Spotify`, or a game without recording Discord pings and desktop notifications too, while macOS and Linux users were still forced to manually install virtual audio drivers (`BlackHole`, `VB-Cable`).
+2. **Production loopback traps that break naive recorders:** Silent WASAPI endpoints emit zero packets (causing blocking `stream.read()` loops in `PyAudioWPatch` to hang forever); unplugging or switching headphones breaks pinned streams; mixing `[Microphone + System/App Output]` drifts apart across independent hardware clocks; and Free-Threaded Python `3.14t`/`3.15t` (`-Xgil=0`) collides with PortAudio's global C state.
+
+Rather than piling fragile workarounds onto `PyAudioWPatch`, I spent **nearly a year developing, testing, and polishing `capture-system-or-process-audio` from scratch in safe Rust** — turning years of `PyAudioWPatch` user requests and edge-case lessons into one unified, zero-steady-state-allocation engine across **Python, Rust, C++17, and C11**:
+
+| Capability | `capture-system-or-process-audio` | `PyAudioWPatch` | `PyAudio` / `sounddevice` / `SoundCard` | `cpal` (Rust) | `VB-Cable` / `BlackHole` |
+| --- | :---: | :---: | :---: | :---: | :---: |
+| **System Speaker Loopback** | ✅ Win · Linux · macOS | ✅ Windows only | ⚠️ Partial (`SoundCard`) | ⚠️ Partial | ⚠️ Manual driver install |
+| **Single App / Process Tree Isolation** | ✅ Win · Linux · macOS | ❌ | ❌ | ❌ | ❌ |
+| **Microphone + App/System Live Mix** | ✅ Built-in (`CspaMixer` + drift sync) | ❌ Manual | ❌ Manual | ❌ Manual | ⚠️ Manual multi-output setup |
+| **Silent-Speaker Hang Protection** | ✅ (`silence_on_idle` + timeouts) | ❌ Hangs `read()` | ❌ | ❌ | N/A |
+| **Auto-Follow Default Device Switches** | ✅ (`Follow` mode) | ❌ | ❌ | ❌ | ❌ Breaks hardware volume keys |
+| **Built-In Resampler & Format Converter** | ✅ (`16k`/`24k`/`44.1k`/`48k`, `f32`/`i16`/`i24`/`i32`) | ❌ | ❌ | ❌ | ❌ |
+| **OS Permission Preflight & Prompt API** | ✅ Honest 5-state report | ❌ | ❌ | ❌ | N/A |
+| **Free-Threaded Python (`3.14t`/`3.15t`)** | ✅ Native (`Py_MOD_GIL_NOT_USED`) | ❌ Disabled | ❌ | N/A | N/A |
+| **First-Class SDKs** | **Python, Rust, C++17, C11** *(+ Node.js next)* | Python (Win) | Python | Rust | OS Driver |
+
+- **What about single-OS process-tap wrappers (`proc-tap`, `catap`, `flexaudio`) or `Electron desktopCapturer`?** Single-platform and prototype wrappers lack unified Windows + PipeWire/PulseAudio + macOS Core Audio/ScreenCaptureKit coverage, cross-clock `[Microphone + App]` drift compensation, live target hot-swap, and free-threaded `3.14t`/`3.15t` zero-allocation `read_into` — while `Electron desktopCapturer` bundles heavyweight video capture pipelines without per-process isolation on Windows/Linux.
+- 📊 **Upcoming Cross-Platform Statistical Benchmarks:** A standalone, reproducible cross-platform latency, tail-jitter (`p50`/`p95`), and zero-allocation benchmark suite comparing `capture-system-or-process-audio` head-to-head against existing audio capture libraries across **Windows 11 (`WASAPI`)**, **Linux (`PipeWire` & standalone `PulseAudio`)**, and **Apple Silicon macOS (`Core Audio Taps` & `ScreenCaptureKit`)** will be published shortly.
+
+> 📖 **Migrating from `PyAudioWPatch`?** See the [Side-by-Side `PyAudioWPatch` Migration Guide](https://s0d3s.github.io/capture-system-or-process-audio/sdks/python/#3-migrating-from-pyaudiowpatch) in the Python SDK Handbook.
+
+---
+
+## Platform & Backend Matrix
+
+Capabilities differ across operating systems. **Core invariant:** When a requested scope or capability is unsupported on the current OS or OS version, `capture-system-or-process-audio` **fails explicitly with a typed error (`CapabilityError` / `PlanError`)** — it **never** silently falls back from single-process capture to full-system audio.
+
+| Platform | Native Backends (`Backends`) | System & Device Output | Application / Process Capture | Microphones & Inputs | Key Runtime Notes |
+| --- | --- | --- | --- | --- | --- |
+| **Windows 10 / 11** (`x86_64`, `ARM64`) | `wasapi` | ✅ Build `19041+` (`default_output` `Follow`/`Pin`, `device(id)`) | ✅ Build `20348+` (`process` & `application`, `scope="tree"`) | ✅ Build `19041+` (`microphone` `Follow`/`Pin`, `input_device(id)`) | `scope="exact"` rejects explicitly (WASAPI process loopback is kernel tree-scoped). |
+| **Linux** (`x86_64`, `aarch64`) | `pipewire` (`0.3.65+`), `pulseaudio` (`15.0+`) | ✅ Sink monitor & default sink tracking | ✅ PipeWire virtual-sink fan-in (`tree`/`exact`) & PulseAudio per-stream mix | ✅ Physical/virtual sources (`.monitor` sinks excluded) | `libpipewire-0.3.so.0` & `libpulse.so.0` load via runtime `dlopen` (**`0` compile-time `NEEDED` links**). |
+| **macOS** (`Apple Silicon arm64`) | `coreaudio`, `screencapturekit` | ✅ `macOS 14.2+` Core Audio Process Taps | ✅ `macOS 14.2+` Core Audio Taps (`tree`/`exact`) & `macOS 13.0+` ScreenCaptureKit (`application`, `scope="exact"`) | ✅ `macOS 13.0+` Core Audio HAL input (`AVMediaTypeAudio` TCC) | Supports cross-backend `[ScreenCaptureKit + CoreAudio]` mixing. Intel macOS (`x86_64`) is rejected explicitly. |
+
+---
+
+## Recording Permissions
+
+Modern desktop operating systems gate audio capture behind user privacy consent — including macOS TCC (`Microphone`, Core Audio `SystemAudio` taps, and `ScreenCaptureKit` `ScreenRecording`) and Windows Microphone `ConsentStore` / Group Policy.
+
+- **Interactive auto-request by default (`PermissionPolicy::AutoRequest`):** Opening a capture session automatically prompts for required OS permissions on interactive desktop sessions.
+- **Non-prompting preflight (`check_permissions` & `PermissionPolicy::CheckOnly` / `request_permissions=False`):** Query an honest 5-state `PermissionReport` (`Granted`, `NotDetermined`, `Denied`, `Restricted`, `Unknown`) before opening any stream, without triggering modal OS dialogs in background services or CI.
+- **macOS `.app` bundle `SIGABRT` protection:** Detects missing `NSMicrophoneUsageDescription` / `NSAudioCaptureUsageDescription` keys in bundled `Info.plist` files before calling Apple frameworks and returns a clean `PermissionDenied` (`PermissionError` in Python) instead of aborting the process.
+
+---
+
+## Interactive Studio Demo
+
+Explore live target discovery, per-source backend/gain controls, real-time `CaptureRequest::inspect()` execution plans, OS permission states, and live spectroscopes right in your terminal with **`cspa-tui-demo`** (prebuilt binaries in [GitHub Releases](https://github.com/s0d3s/capture-system-or-process-audio/releases/latest), or built from source):
+
+```bash
+cargo run --release --manifest-path tools/cspa-tui-demo/Cargo.toml
+```
+
+- **Live Picker (`A`):** Browse **Applications** (parent-tree roll-up), **Processes**, **Output Devices**, and **Microphones** with live `256`-event discovery updates.
+- **Record (`R`), Live Hot-Swap (`Space`) & Permissions (`K`):** Start/stop RAM takes (`R`), toggle staged sources or gain (`G`) **mid-recording** without losing your active take, and inspect/request OS privacy permissions interactively.
+- **3-Mode Spectroscope (`V`) & WAV Export (`W`):** Switch between **2048-pt Hann FFT**, **Truecolor Waterfall**, and **Zero-Crossing Braille Oscilloscope** (visual-only monitoring prevents microphone speaker feedback!), play back RAM takes (`P`), and export `[Save WAV]` on demand.
+
+See [tools/cspa-tui-demo/README.md](tools/cspa-tui-demo/README.md) and the [Interactive Studio Demo Manual](https://s0d3s.github.io/capture-system-or-process-audio/studio-demo/) for all panels, modals, and shortcuts.
+
+---
+
+## FAQ & Architecture Details
+
+<details>
+<summary><b>Do I or my end users need to install VB-Cable, BlackHole, or Soundflower?</b></summary>
+
+**No.** Every backend uses built-in OS audio APIs (`WASAPI` on Windows, `PipeWire`/`PulseAudio` on Linux, `Core Audio Process Taps` and `ScreenCaptureKit` on macOS). Normal speaker and headphone playback continues uninterrupted.
+</details>
+
+<details>
+<summary><b>Why do blocking loopback reads hang in other libraries when audio pauses — and how is that solved here?</b></summary>
+
+On Windows WASAPI loopback and per-process taps, the OS emits zero packets while no audio is playing. By default, single-stream reads wait cleanly until audio resumes (or until `timeout_ms` elapses). When feeding consumers that expect continuous wall-clock frames (such as VADs, `PyAudio`-style loops, or WebRTC/Discord streams), pass `silence_on_idle=True` (Python) or `MixerConfig { silence_on_idle: true, .. }` (Rust/C++) to synthesize metadata-flagged silent frames (`synthesized_silence = true`) while idle.
+</details>
+
+<details>
+<summary><b>Is the capture pipeline real-time safe and zero-allocation?</b></summary>
+
+Yes. Architecture follows a strict four-layer invariant: *Backends capture. Core orders and buffers. Manager plans, monitors, mixes, and reopens sessions. Adapters adapt.* Native acquisition callbacks write into preallocated bounded slot pools (`StorageBudget`) without unbounded allocation or locks, `CspaMixer` aligns independent hardware clocks within `< 10 ms` best-effort relative skew, and warmed `read_into` loops perform **0 heap allocations** in steady state across Rust, Python (including `-Xgil=0` free-threading), C++17, and C11.
+</details>
+
+<details>
+<summary><b>Can I preview which backend and mixing strategy will run before opening any OS audio stream?</b></summary>
+
+Yes. Call `cspa.request(targets).inspect()` (Python), `request(targets).inspect()` (Rust), or `req.inspect()` (C++) for a side-effect-free `CapturePlanReport` showing per-target backend resolution, session combine strategy (`PassThrough`, `SharedNativeGraphMix`, or `CspaMixer`), active stream count, and estimated PCM memory footprint.
+</details>
+
+---
+
+<a id="documentation--guides"></a>
+## Documentation & Guides
+
+Full user manuals, architecture deep-dives, and 100%-symbol API references are hosted at **[s0d3s.github.io/capture-system-or-process-audio](https://s0d3s.github.io/capture-system-or-process-audio/)**:
+
+| Section | Direct Links |
+| :--- | :--- |
+| **Getting Started** | [Overview](https://s0d3s.github.io/capture-system-or-process-audio/getting-started/overview/) • [Installation](https://s0d3s.github.io/capture-system-or-process-audio/getting-started/installation/) • [Choosing an API (`CaptureManager` vs `AudioStream`)](https://s0d3s.github.io/capture-system-or-process-audio/getting-started/choosing-an-api/) |
+| **SDK Handbooks** | [Python (`3.11`–`3.15t`)](https://s0d3s.github.io/capture-system-or-process-audio/sdks/python/) • [Rust (`#![forbid(unsafe_code)]`)](https://s0d3s.github.io/capture-system-or-process-audio/sdks/rust/) • [C++17 RAII (`cspa.hpp`)](https://s0d3s.github.io/capture-system-or-process-audio/sdks/cpp/) • [C11 ABI (`cspa_experimental.h`)](https://s0d3s.github.io/capture-system-or-process-audio/sdks/c/) • [Ecosystem & Planned Adapters](https://s0d3s.github.io/capture-system-or-process-audio/adapters/overview/) |
+| **Core Concepts** | [Targets & Scopes](https://s0d3s.github.io/capture-system-or-process-audio/concepts/targets-and-scopes/) • [Live Discovery](https://s0d3s.github.io/capture-system-or-process-audio/concepts/discovery/) • [Planning & Live Mixing (`CspaMixer`)](https://s0d3s.github.io/capture-system-or-process-audio/concepts/planning-and-mixing/) • [Format Conversion (`OutputConverter`)](https://s0d3s.github.io/capture-system-or-process-audio/concepts/format-conversion/) • [Real-Time & Lifecycle](https://s0d3s.github.io/capture-system-or-process-audio/concepts/realtime-and-lifecycle/) |
+| **Platforms & Privacy** | [Platform & Backend Matrix](https://s0d3s.github.io/capture-system-or-process-audio/concepts/platforms/) • [OS Recording Permissions (`TCC` / `ConsentStore`)](https://s0d3s.github.io/capture-system-or-process-audio/concepts/permissions/) • [Troubleshooting & FAQ](https://s0d3s.github.io/capture-system-or-process-audio/concepts/troubleshooting-faq/) |
+| **API References & Demo** | [Multi-SDK API Reference Hub](https://s0d3s.github.io/capture-system-or-process-audio/reference/) • [Hosted Rustdoc (`/api/rust/`)](https://s0d3s.github.io/capture-system-or-process-audio/api/rust/capture_system_or_process_audio/) • [Interactive `cspa-tui-demo` Manual](https://s0d3s.github.io/capture-system-or-process-audio/studio-demo/) |
+
+---
+
+## License
+
+Dual-licensed under either of:
+
+- **Apache License, Version 2.0** ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
+- **MIT License** ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option. Prebuilt Linux binaries dynamically load system `libpipewire-0.3.so.0` and `libpulse.so.0` at runtime without bundling or statically linking LGPL libraries; see each package's `THIRD_PARTY_NOTICES.md` for dependency attributions.

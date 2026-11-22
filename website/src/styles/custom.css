@@ -162,3 +162,49 @@ header.header {
   border: 1px solid rgba(56, 189, 248, 0.35);
 }
 
+.cspa-cap-planned {
+  background: rgba(192, 132, 252, 0.15);
+  color: #c084fc;
+  border: 1px solid rgba(192, 132, 252, 0.38);
+}
+
+/* Provenance & Statistical Highlight Strip */
+.cspa-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11.5rem, 1fr));
+  gap: 0.85rem;
+  margin: 1.25rem 0 1.5rem;
+}
+
+.cspa-stat-card {
+  background: var(--cspa-card-bg);
+  border: 1px solid var(--cspa-card-border);
+  border-radius: 0.85rem;
+  padding: 0.95rem 1.05rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.cspa-stat-value {
+  font-size: 1.35rem;
+  font-weight: 800;
+  line-height: 1.2;
+  letter-spacing: -0.02em;
+  color: var(--sl-color-accent);
+  margin: 0 !important;
+}
+
+.cspa-stat-label {
+  font-size: 0.83rem;
+  line-height: 1.4;
+  opacity: 0.88;
+  margin: 0 !important;
+}
+
+/* Responsive Markdown tables */
+.sl-markdown-content table {
+  display: block;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
