@@ -72,3 +72,7 @@ exclude = [
     { path = "**/__pycache__/**/*", format = ["sdist", "wheel"] },
     { path = "**/*.pyc", format = ["sdist", "wheel"] },
 ]
+
+[project.scripts]
+capture-system-or-process-audio = "capture_system_or_process_audio.__main__:main"
+cspa = "capture_system_or_process_audio.__main__:main"
