@@ -16,8 +16,11 @@
     "astro": "astro"
   },
   "dependencies": {
+    "@astrojs/markdown-satteri": "^0.4.10",
     "@astrojs/starlight": "^0.43.1",
     "astro": "^7.4.13",
+    "katex": "^0.19.1",
+    "satteri-katex": "^0.3.0",
     "sharp": "^0.35.5",
     "starlight-heading-badges": "^0.8.0",
     "starlight-image-zoom": "^0.16.3",

@@ -1,5 +1,7 @@
 import { defineConfig } from 'astro/config';
+import { satteri } from '@astrojs/markdown-satteri';
 import starlight from '@astrojs/starlight';
+import { mathProcessorOptions } from './scripts/math-processor.mjs';
 import starlightHeadingBadges from 'starlight-heading-badges';
 import starlightImageZoom from 'starlight-image-zoom';
 import starlightKbd from 'starlight-kbd';
@@ -15,6 +17,9 @@ export default defineConfig({
   prefetch: {
     prefetchAll: true,
     defaultStrategy: 'viewport',
+  },
+  markdown: {
+    processor: satteri(mathProcessorOptions),
   },
   integrations: [
     starlight({
@@ -36,7 +41,7 @@ export default defineConfig({
       editLink: {
         baseUrl: 'https://github.com/s0d3s/capture-system-or-process-audio/edit/main/website/',
       },
-      customCss: ['./src/styles/custom.css'],
+      customCss: ['katex/dist/katex.min.css', './src/styles/custom.css'],
       disable404Route: true,
       routeMiddleware: './src/routeData.ts',
       markdown: {
