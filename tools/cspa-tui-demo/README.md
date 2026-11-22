@@ -36,8 +36,7 @@ Every button, tab, and toggle is also clickable directly with the mouse!
 | Key / Click | Action |
 | :---: | --- |
 | `A` / `[+ Add Source]` | Open live **Add Capture Sources** modal (**Applications**, **Processes**, **Output Devices**, **Microphones**) |
-| `R` / `[Record]` · `[Stop]` | Start or stop recording into a RAM `MemoryTake` (`S` also stops recording or active playback) |
-| `Space` / `[x]` checkbox | Enable or disable the selected staged source row (live hot-swap!) or toggle picker selection |
+| `Space` / `[Record]` · `[Stop]` | Start or finish recording into a new RAM `MemoryTake` (zero disk writes until requested) |
 | `P` / `[Play]` | Play / pause the selected in-memory take via `cpal` (click progress bar to seek) |
 | `W` / `[Save WAV]` | Export the selected take in its exact captured format (`F32`, `I16`, `I24`, `I32`) to `./recordings/` |
 | `V` / Spectroscope Tabs | Cycle real-time **2048-pt FFT Spectrum**, **Truecolor Waterfall**, and **Braille Oscilloscope** |

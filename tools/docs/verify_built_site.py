@@ -302,7 +302,14 @@ def verify_dist(
 
     for rel_html, info in pages.items():
         is_rustdoc = rel_html.startswith("api/rust/")
-        is_aux = is_rustdoc or rel_html == "404.html" or rel_html.endswith("/404.html") or info.has_meta_refresh
+        is_google_verification = (
+            "/" not in rel_html
+            and rel_html.startswith("google")
+            and rel_html.endswith(".html")
+            and (dist_dir / rel_html).read_text(encoding="utf-8", errors="replace").strip()
+            == f"google-site-verification: {rel_html}"
+        )
+        is_aux = is_rustdoc or is_google_verification or rel_html == "404.html" or rel_html.endswith("/404.html") or info.has_meta_refresh
 
         if not is_aux:
             doc_pages += 1
