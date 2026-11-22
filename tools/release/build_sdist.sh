@@ -1,9 +1,11 @@
 set -euo pipefail
 uv python install "$HOST_PYTHON"
 HOST_PY="$(uv python find --no-project --managed-python "$HOST_PYTHON")"
+PYTHON_LIBDIR="$("$HOST_PY" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR") or "")')"
+test -n "$PYTHON_LIBDIR"
 
 PYO3_PYTHON="$HOST_PY" cargo build --locked --manifest-path crates/capture-python/Cargo.toml
-PYO3_PYTHON="$HOST_PY" cargo test --locked --manifest-path crates/capture-python/Cargo.toml --lib
+LD_LIBRARY_PATH="$PYTHON_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" PYO3_PYTHON="$HOST_PY" cargo test --locked --manifest-path crates/capture-python/Cargo.toml --lib
 
 mkdir -p dist/sdist
 uv tool run --from "maturin==$MATURIN_VERSION" maturin sdist -m crates/capture-python/Cargo.toml -o dist/sdist

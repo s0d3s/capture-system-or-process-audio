@@ -1444,7 +1444,7 @@ mod tests {
                 1024,
             )?;
             let mut feed_pkt = [0u8; 64 * 8];
-            for chunk in feed_pkt.chunks_exact_mut(4) {
+            for chunk in feed_pkt.as_chunks_mut::<4>().0 {
                 chunk.copy_from_slice(&0.25_f32.to_le_bytes());
             }
             Ok(Self {

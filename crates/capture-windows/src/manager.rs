@@ -2264,7 +2264,7 @@ mod tests {
             let res =
                 read_into_via_generic_manager(&mut mgr, &mut dst, 256, Duration::from_millis(40))
                     .unwrap();
-            for b in dst[..res.frames * 8].chunks_exact(4) {
+            for b in dst[..res.frames * 8].as_chunks::<4>().0 {
                 mixed_samples.push(f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
             }
         }
@@ -2348,7 +2348,7 @@ mod tests {
             let res = mgr2
                 .read_into(&mut dst, 256, Duration::from_millis(40))
                 .unwrap();
-            for b in dst[..res.frames * 8].chunks_exact(4) {
+            for b in dst[..res.frames * 8].as_chunks::<4>().0 {
                 mixed_samples.push(f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
             }
             if mixed_samples.len() >= 14_400 * 2 {

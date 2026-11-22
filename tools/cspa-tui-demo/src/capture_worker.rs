@@ -204,7 +204,7 @@ impl ActiveTakeBuffer {
         let prev_len = self.preview_stereo_f32.len();
         decode_pcm_to_stereo_f32(pcm_bytes, &self.format, &mut self.preview_stereo_f32);
         let new_stereo = self.preview_stereo_f32[prev_len..].to_vec();
-        for pair in new_stereo.chunks_exact(2) {
+        for pair in new_stereo.as_chunks::<2>().0 {
             self.peak_abs[0] = self.peak_abs[0].max(pair[0].abs());
             self.peak_abs[1] = self.peak_abs[1].max(pair[1].abs());
         }

@@ -51,6 +51,7 @@ impl StorageBudget {
         })))
     }
 
+    #[allow(deprecated, reason = "fetch_update supports the minimum Rust version")]
     pub fn reserve(
         &self,
         limits: StorageLimits,
@@ -93,6 +94,7 @@ impl StorageBudget {
     /// Charge auxiliary stage PCM + metadata bytes (such as `MultiInputManager`'s mixed `out_pool`)
     /// against `byte_ceiling` (`max_total_pcm_memory`) without consuming one of the input-stream
     /// `sessions` (`max_active_streams`) slots.
+    #[allow(deprecated, reason = "fetch_update supports the minimum Rust version")]
     pub fn reserve_auxiliary_bytes(
         &self,
         limits: StorageLimits,
@@ -900,6 +902,7 @@ impl MultiInputManager {
         Ok(mapping)
     }
 
+    #[allow(deprecated, reason = "fetch_update supports the minimum Rust version")]
     pub fn acquire_pending_open(&self) -> Result<PendingOpenTicket, ManagerError> {
         let max_pending = self.request.budgets.max_pending_opens;
         self.pending_opens

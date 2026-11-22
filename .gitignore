@@ -26,6 +26,7 @@ temp_python
 /*.ps1
 !/README.md
 /.github/*
+!/.github/FUNDING.yml
 !/.github/workflows/
 !/.github/workflows/**
 

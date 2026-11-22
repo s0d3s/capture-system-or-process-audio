@@ -209,6 +209,41 @@ class ReleaseTests(unittest.TestCase):
         build_target_src = (SCRIPTS / "build_target.py").read_text(encoding="utf-8")
         self.assertEqual(build_target_src.count("for lic_name in ROOT_LICENSE_FILES:"), 2)
 
+    @unittest.skipIf(os.name == "nt", "The sdist release job runs on Linux")
+    def test_sdist_uses_selected_python_library_path(self):
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        interpreter = bin_dir / "managed-python"
+        lib_dir = self.root / "python libraries"
+        scripts = {
+            "uv": 'case "$1 $2" in "python install") exit 0;; "python find") printf "%s\\n" "$FAKE_PYTHON";; *) exit 91;; esac\n',
+            "managed-python": 'printf "%s\\n" "$FAKE_LIBDIR"\n',
+            "cargo": 'if [ "$1" = build ]; then exit 0; fi\n'
+                     'test "$1" = test && test "$PYO3_PYTHON" = "$FAKE_PYTHON" && '
+                     'test "$LD_LIBRARY_PATH" = "$FAKE_LIBDIR:$ORIGINAL_LIBDIR" || exit 92\n'
+                     'printf "%s\\n" loader-path-ok\nexit 23\n',
+        }
+        for name, body in scripts.items():
+            script = bin_dir / name
+            script.write_text("#!/usr/bin/env bash\nset -eu\n" + body, encoding="utf-8")
+            script.chmod(0o755)
+        environment = os.environ.copy()
+        environment.update({
+            "PATH": f"{bin_dir}{os.pathsep}{environment['PATH']}",
+            "HOST_PYTHON": HOST_PYTHON,
+            "MATURIN_VERSION": "unused",
+            "FAKE_PYTHON": str(interpreter),
+            "FAKE_LIBDIR": str(lib_dir),
+            "ORIGINAL_LIBDIR": str(self.root / "existing libraries"),
+            "LD_LIBRARY_PATH": str(self.root / "existing libraries"),
+        })
+        result = subprocess.run(
+            ["bash", str(SCRIPTS / "build_sdist.sh")], cwd=self.root,
+            env=environment, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
+        self.assertIn("loader-path-ok", result.stdout)
+
     def test_cmake_version_selection(self):
         repository = SCRIPTS.parent.parent
         template = repository / "crates/capture-ffi/cmake/CspaConfigVersion.cmake.in"

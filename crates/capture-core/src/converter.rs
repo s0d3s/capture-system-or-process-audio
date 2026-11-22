@@ -174,7 +174,7 @@ impl OutputConverter {
                 }
             }
             ChannelMappingKind::StereoToMono => {
-                for pair in self.decode_scratch.chunks_exact(2) {
+                for pair in self.decode_scratch.as_chunks::<2>().0 {
                     self.mapped_scratch.push(0.5 * (pair[0] + pair[1]));
                 }
             }
@@ -545,7 +545,7 @@ impl InputNormalizer {
         }
 
         if self.identity_bypass {
-            for chunk in in_bytes.chunks_exact(4) {
+            for chunk in in_bytes.as_chunks::<4>().0 {
                 let val = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 if val.is_finite() {
                     out_f32.push(val);
@@ -586,7 +586,7 @@ impl InputNormalizer {
                     }
                 }
                 ChannelMappingKind::StereoToMono => {
-                    for pair in self.decode_scratch.chunks_exact(2) {
+                    for pair in self.decode_scratch.as_chunks::<2>().0 {
                         out_f32.push(0.5 * (pair[0] + pair[1]));
                     }
                 }
@@ -609,7 +609,7 @@ impl InputNormalizer {
                 }
             }
             ChannelMappingKind::StereoToMono => {
-                for pair in self.decode_scratch.chunks_exact(2) {
+                for pair in self.decode_scratch.as_chunks::<2>().0 {
                     self.mapped_scratch.push(0.5 * (pair[0] + pair[1]));
                 }
             }
@@ -799,7 +799,7 @@ fn decode_samples_sanitized(
             if !in_bytes.len().is_multiple_of(4) {
                 return Err(Reason::IncompleteFrame);
             }
-            for chunk in in_bytes.chunks_exact(4) {
+            for chunk in in_bytes.as_chunks::<4>().0 {
                 let b: [u8; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]];
                 let val = match order {
                     ByteOrder::Little => f32::from_le_bytes(b),
@@ -817,7 +817,7 @@ fn decode_samples_sanitized(
             if !in_bytes.len().is_multiple_of(2) {
                 return Err(Reason::IncompleteFrame);
             }
-            for chunk in in_bytes.chunks_exact(2) {
+            for chunk in in_bytes.as_chunks::<2>().0 {
                 let b: [u8; 2] = [chunk[0], chunk[1]];
                 let val = match order {
                     ByteOrder::Little => i16::from_le_bytes(b),
@@ -830,7 +830,7 @@ fn decode_samples_sanitized(
             if !in_bytes.len().is_multiple_of(3) {
                 return Err(Reason::IncompleteFrame);
             }
-            for chunk in in_bytes.chunks_exact(3) {
+            for chunk in in_bytes.as_chunks::<3>().0 {
                 let signed = match order {
                     ByteOrder::Little => {
                         let raw = u32::from(chunk[0])
@@ -852,7 +852,7 @@ fn decode_samples_sanitized(
             if !in_bytes.len().is_multiple_of(4) {
                 return Err(Reason::IncompleteFrame);
             }
-            for chunk in in_bytes.chunks_exact(4) {
+            for chunk in in_bytes.as_chunks::<4>().0 {
                 let b: [u8; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]];
                 let val = match order {
                     ByteOrder::Little => i32::from_le_bytes(b),

@@ -1382,7 +1382,7 @@ impl PlatformManager {
                     if format_changed {
                         let fallback_fmt = multi.working_format().clone();
                         let mut per_input = Vec::with_capacity(self.request.targets().len());
-                        for t_idx in 0..self.request.targets().len() {
+                        for (t_idx, _) in self.request.targets().iter().enumerate() {
                             let b = self.plan.target_plans[t_idx].resolved_backend;
                             let f = inputs.iter().find(|i| i.target_idx == t_idx).map_or_else(
                                 || fallback_fmt.clone(),

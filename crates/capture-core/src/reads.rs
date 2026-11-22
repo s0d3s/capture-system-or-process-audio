@@ -575,7 +575,7 @@ mod tests {
             let events = trace.snapshot();
             if observed {
                 assert_eq!(events.len(), 600);
-                for (index, packet) in events.chunks_exact(6).enumerate() {
+                for (index, packet) in events.as_chunks::<6>().0.iter().enumerate() {
                     assert!(
                         packet
                             .iter()

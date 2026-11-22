@@ -1979,7 +1979,7 @@ impl PlatformManager {
             let mut waited_on_idle_leader = false;
             let mut pushed_any = false;
 
-            for t_idx in 0..req_ref.targets().len() {
+            for (t_idx, target) in req_ref.targets().iter().enumerate() {
                 let already_queued = multi
                     .input_handles()
                     .get(t_idx)
@@ -1992,10 +1992,7 @@ impl PlatformManager {
 
                 let is_pa_proc_target = plan_ref.target_plans[t_idx].resolved_backend
                     == BackendId::PulseAudio
-                    && matches!(
-                        req_ref.targets()[t_idx].kind(),
-                        TargetKind::Process | TargetKind::Application
-                    );
+                    && matches!(target.kind(), TargetKind::Process | TargetKind::Application);
 
                 if !is_pa_proc_target {
                     let Some(inp) = inputs
@@ -2166,7 +2163,9 @@ impl PlatformManager {
                                     }
                                     let samp_cnt = res.frames * 2;
                                     for (k, b) in in_bytes_scratch[..res.frames * 8]
-                                        .chunks_exact(4)
+                                        .as_chunks::<4>()
+                                        .0
+                                        .iter()
                                         .enumerate()
                                     {
                                         pulse_sub_f32[k] =
@@ -2252,7 +2251,9 @@ impl PlatformManager {
                                         }
                                         let samp_cnt = res.frames * 2;
                                         for (k, b) in in_bytes_scratch[..res.frames * 8]
-                                            .chunks_exact(4)
+                                            .as_chunks::<4>()
+                                            .0
+                                            .iter()
                                             .enumerate()
                                         {
                                             pulse_sub_f32[k] =

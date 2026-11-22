@@ -114,7 +114,7 @@ impl SpectroscopeAnalyzer {
         let mut sum_sq_r = 0.0f64;
         let frames = interleaved_stereo.len() / 2;
 
-        for pair in interleaved_stereo.chunks_exact(2) {
+        for pair in interleaved_stereo.as_chunks::<2>().0 {
             let l = if pair[0].is_finite() { pair[0] } else { 0.0 };
             let r = if pair[1].is_finite() { pair[1] } else { 0.0 };
             peak_l = peak_l.max(l.abs());
@@ -190,8 +190,7 @@ impl SpectroscopeAnalyzer {
             let b0 = ((f_lo / bin_hz).floor() as usize).clamp(1, nyquist_bins - 1);
             let b1 = ((f_hi / bin_hz).ceil() as usize).clamp(b0, nyquist_bins - 1);
             let mut max_mag = 0.0f32;
-            for bin in b0..=b1 {
-                let c = self.fft_scratch[bin];
+            for c in &self.fft_scratch[b0..=b1] {
                 let mag = (c.re * c.re + c.im * c.im).sqrt() * norm;
                 max_mag = max_mag.max(mag);
             }
