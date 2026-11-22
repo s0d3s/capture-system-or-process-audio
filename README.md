@@ -22,18 +22,18 @@
 
 | SDK | Package / Distribution | Quick Start |
 | :--- | :---: | :---: |
-| ![Python](https://img.shields.io/badge/Python-3.11–3.15t-3776AB?style=for-the-badge&logo=python&logoColor=ffdd54) | [![PyPI](https://img.shields.io/pypi/v/capture-system-or-process-audio?label=PyPI&color=3776AB)](https://pypi.org/project/capture-system-or-process-audio/) [![PyPI Downloads](https://img.shields.io/pypi/dm/capture-system-or-process-audio?label=downloads&color=3776ab)](https://pypi.org/project/capture-system-or-process-audio/) | **[⚡ Quick Start ↓](#python-quick-start)** |
-| ![Rust](https://img.shields.io/badge/Rust-1.88%2B-CE422B?style=for-the-badge&logo=rust&logoColor=white) | [![crates.io](https://img.shields.io/crates/v/capture-system-or-process-audio?label=crates.io&color=CE422B)](https://crates.io/crates/capture-system-or-process-audio) [![docs.rs](https://img.shields.io/docsrs/capture-system-or-process-audio?label=docs.rs)](https://docs.rs/capture-system-or-process-audio) | **[⚡ Quick Start ↓](#rust-quick-start)** |
-| ![C++17](https://img.shields.io/badge/C%2B%2B-C%2B%2B17_RAII-00599C?style=for-the-badge&logo=cplusplus&logoColor=white) | [![CMake](https://img.shields.io/badge/CMake-Cspa%3A%3Acspa__ffi-064F8C?logo=cmake&logoColor=white)](https://github.com/s0d3s/capture-system-or-process-audio/releases/latest) | **[⚡ Quick Start ↓](#cpp-quick-start)** |
-| ![C11](https://img.shields.io/badge/C-C11_ABI-555555?style=for-the-badge&logo=c&logoColor=A8B9CC) | [![Prebuilt SDK](https://img.shields.io/github/v/release/s0d3s/capture-system-or-process-audio?include_prereleases&label=cspa--ffi%20SDK&color=555555)](https://github.com/s0d3s/capture-system-or-process-audio/releases/latest) | **[⚡ Quick Start ↓](#c-quick-start)** |
-| ![Node.js](https://img.shields.io/badge/Node.js_%2F_TS-N--API-339933?style=for-the-badge&logo=nodedotjs&logoColor=white) | ![Planned](https://img.shields.io/badge/npm-planned-6e7681?logo=npm&logoColor=white) | **[🚧 Planned ↓](#adapters-and-nodejs-roadmap)** |
+| ![Python](https://img.shields.io/badge/Python-3.11–3.15t-3776AB?style=for-the-badge&logo=python&logoColor=ffdd54) | [![PyPI](https://img.shields.io/pypi/v/capture-system-or-process-audio?label=PyPI&color=3776AB)](https://pypi.org/project/capture-system-or-process-audio/) [![PyPI Downloads](https://img.shields.io/pypi/dm/capture-system-or-process-audio?label=downloads&color=3776ab)](https://pypi.org/project/capture-system-or-process-audio/) | **[⚡ Quick Start ↓](#-python-quick-start)** |
+| ![Rust](https://img.shields.io/badge/Rust-1.88%2B-CE422B?style=for-the-badge&logo=rust&logoColor=white) | [![crates.io](https://img.shields.io/crates/v/capture-system-or-process-audio?label=crates.io&color=CE422B)](https://crates.io/crates/capture-system-or-process-audio) [![docs.rs](https://img.shields.io/docsrs/capture-system-or-process-audio?label=docs.rs)](https://docs.rs/capture-system-or-process-audio) | **[⚡ Quick Start ↓](#-rust-quick-start)** |
+| ![C++17](https://img.shields.io/badge/C%2B%2B-C%2B%2B17_RAII-00599C?style=for-the-badge&logo=cplusplus&logoColor=white) | [![CMake](https://img.shields.io/badge/CMake-Cspa%3A%3Acspa__ffi-064F8C?logo=cmake&logoColor=white)](https://github.com/s0d3s/capture-system-or-process-audio/releases/latest) | **[⚡ Quick Start ↓](#%EF%B8%8F-c17-quick-start-header-only-raii)** |
+| ![C11](https://img.shields.io/badge/C-C11_ABI-555555?style=for-the-badge&logo=c&logoColor=A8B9CC) | [![Prebuilt SDK](https://img.shields.io/github/v/release/s0d3s/capture-system-or-process-audio?include_prereleases&label=cspa--ffi%20SDK&color=555555)](https://github.com/s0d3s/capture-system-or-process-audio/releases/latest) | **[⚡ Quick Start ↓](#-c11-quick-start-stable-ffi-boundary)** |
+| ![Node.js](https://img.shields.io/badge/Node.js_%2F_TS-N--API-339933?style=for-the-badge&logo=nodedotjs&logoColor=white) | ![Planned](https://img.shields.io/badge/npm-planned-6e7681?logo=npm&logoColor=white) | **[🚧 Planned ↓](#drop-in-ecosystem-adapters--nodejs-sdk-planned--next-release)** |
 
   <p>
     <sub>
       <a href="https://s0d3s.github.io/capture-system-or-process-audio/"><b>Full Documentation &amp; API Reference</b></a> •
       <a href="#what-can-you-capture">Overview</a> •
       <a href="#interactive-studio-demo">Live TUI Demo</a> •
-      <a href="#adapters-and-nodejs-roadmap">Drop-In Adapters Roadmap</a> •
+      <a href="#drop-in-ecosystem-adapters--nodejs-sdk-planned--next-release">Drop-In Adapters Roadmap</a> •
       <a href="#why-this-exists--beyond-pyaudiowpatch">Why Not PyAudioWPatch?</a> •
       <a href="#platform--backend-matrix">OS Support</a> •
       <a href="#recording-permissions">Permissions</a> •
@@ -66,7 +66,6 @@
 
 ## Quick Starts by SDK
 
-<a id="python-quick-start"></a>
 ### 🐍 Python Quick Start
 
 Prebuilt binary wheels (`cp311-abi3`, `cp314t`, and PEP 803 `cp315-abi3.abi3t`) support **CPython `3.11`–`3.15`** plus **Free-Threaded Python `3.14t` & `3.15t` (`-Xgil=0`)** across Windows (`x64`/`ARM64`), Linux (`x86_64`/`aarch64` `manylinux_2_28`), and macOS (`arm64`) with zero mandatory runtime dependencies and complete `.pyi` type stubs.
@@ -168,11 +167,10 @@ asyncio.run(main())
 
 📖 **Python Docs:** [Python SDK Handbook](https://s0d3s.github.io/capture-system-or-process-audio/sdks/python/) • [Python API Reference](https://s0d3s.github.io/capture-system-or-process-audio/reference/python/functions/) • [Package README](crates/capture-python/README.md)
 
-<p align="right"><sub><a href="#readme">↑ Back to SDKs</a></sub></p>
+<p align="right"><sub><a href="#capture-system-or-process-audio">↑ Back to SDKs</a></sub></p>
 
 ---
 
-<a id="rust-quick-start"></a>
 ### 🦀 Rust Quick Start
 
 The unified `capture-system-or-process-audio` facade crate enforces **`#![forbid(unsafe_code)]`** and automatically selects the native OS backend (`WASAPI`, `PipeWire`/`PulseAudio`, or `Core Audio`/`ScreenCaptureKit`) behind one single cross-platform API — ideal for **Tauri** desktop apps, native AI meeting assistants, real-time voice agents, and low-latency DSP engines.
@@ -247,11 +245,10 @@ fn main() -> Result<(), CapabilityError> {
 
 📖 **Rust Docs:** [Rust SDK Handbook](https://s0d3s.github.io/capture-system-or-process-audio/sdks/rust/) • [Rust API Reference](https://s0d3s.github.io/capture-system-or-process-audio/reference/rust/overview/) • [docs.rs](https://docs.rs/capture-system-or-process-audio) • [Crate README](crates/capture/README.md)
 
-<p align="right"><sub><a href="#readme">↑ Back to SDKs</a></sub></p>
+<p align="right"><sub><a href="#capture-system-or-process-audio">↑ Back to SDKs</a></sub></p>
 
 ---
 
-<a id="cpp-quick-start"></a>
 ### ⚙️ C++17 Quick Start (Header-Only RAII)
 
 Download the prebuilt `cspa-ffi-<version>-<target>` archive from [GitHub Releases](https://github.com/s0d3s/capture-system-or-process-audio/releases/latest) containing `include/cspa.hpp`, `include/cspa_experimental.h`, shared libraries, and `CspaConfig.cmake` — ready for native desktop recorders, **WebRTC** media clients, game/broadcast overlays, and local `whisper.cpp` / voice-AI pipelines. Supports **both** C++ exceptions (`/EHsc`, `-fexceptions` via `*_or_throw()`) and exception-free builds (`/EHs-c-`, `-fno-exceptions` via `cspa::Result<T>`).
@@ -319,11 +316,10 @@ int main() {
 
 📖 **C++17 Docs:** [C++17 SDK Handbook](https://s0d3s.github.io/capture-system-or-process-audio/sdks/cpp/) • [C++17 API Reference](https://s0d3s.github.io/capture-system-or-process-audio/reference/cpp/classes-and-streams/) • [CMake & FFI SDK README](crates/capture-ffi/README.md)
 
-<p align="right"><sub><a href="#readme">↑ Back to SDKs</a></sub></p>
+<p align="right"><sub><a href="#capture-system-or-process-audio">↑ Back to SDKs</a></sub></p>
 
 ---
 
-<a id="c-quick-start"></a>
 ### 🧩 C11 Quick Start (Stable FFI Boundary)
 
 `cspa_experimental.h` provides a size- and schema-revision-checked C11 ABI (`cspa_abi_check`) with `catch_unwind` panic containment across every exported symbol and **zero compile-time `NEEDED` links** to `libpipewire` or `libpulse` on Linux — ideal for C host applications, audio plugins, game engines, and custom FFI bindings (`Go`, `Zig`, `C#`, `Swift`).
@@ -394,11 +390,10 @@ int main(void) {
 
 📖 **C11 Docs:** [C11 ABI Handbook](https://s0d3s.github.io/capture-system-or-process-audio/sdks/c/) • [C11 Functions & Structs Reference](https://s0d3s.github.io/capture-system-or-process-audio/reference/c/abi-and-functions/) • [FFI SDK README](crates/capture-ffi/README.md)
 
-<p align="right"><sub><a href="#readme">↑ Back to SDKs</a></sub></p>
+<p align="right"><sub><a href="#capture-system-or-process-audio">↑ Back to SDKs</a></sub></p>
 
 ---
 
-<a id="adapters-and-nodejs-roadmap"></a>
 ## Drop-In Ecosystem `Adapters` & Node.js SDK *(Planned — Next Release)*
 
 Today's initial release already connects cleanly to `NumPy` (`block.to_numpy(copy=False)`), `PyAudio` / `wave` (`memoryview(block)` + `OutputConverter`), `faster-whisper` (`16 kHz` mono `f32`), `asyncio`, Rust, and C/C++ pipelines.
@@ -513,7 +508,6 @@ Yes. Call `cspa.request(targets).inspect()` (Python), `request(targets).inspect(
 
 ---
 
-<a id="documentation--guides"></a>
 ## Documentation & Guides
 
 Full user manuals, architecture deep-dives, and 100%-symbol API references are hosted at **[s0d3s.github.io/capture-system-or-process-audio](https://s0d3s.github.io/capture-system-or-process-audio/)**:
