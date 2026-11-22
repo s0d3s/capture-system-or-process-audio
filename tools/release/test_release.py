@@ -12,7 +12,8 @@ from unittest import mock
 
 from cmake_version import generate_cmake_version
 from config import DEFAULT_RETENTION_DAYS, HOST_PYTHON, PUBLISHED_CRATES, PYTHON_SPECS, PYTHON_WHEELS, RELEASE_CARGO_MANIFESTS, ROOT_LICENSE_FILES, TARGETS, WHEEL_TAGS, matrix_json
-from python_wheels import build_wheels, smoke_cases
+from consumer_smoke import run_packaged_consumers
+from python_wheels import build_release_wheels, build_wheels, smoke_cases
 
 SCRIPTS = pathlib.Path(__file__).resolve().parent
 
@@ -71,6 +72,37 @@ class ReleaseTests(unittest.TestCase):
                 self.assertIn(feature, features)
             for spec, free_threaded in wheel["smoke_pythons"]:
                 self.assertEqual("+freethreaded" in spec, free_threaded)
+
+    def test_windows_wheel_build_uses_temporary_target_directory(self):
+        observed = []
+
+        def fake_build(command, wheels_dir, executables):
+            target_dir = pathlib.Path(command[command.index("--target-dir") + 1])
+            self.assertTrue(target_dir.is_dir())
+            self.assertEqual(target_dir.parent, self.root)
+            observed.append(target_dir)
+            return {"result": wheels_dir}
+
+        with mock.patch.dict(os.environ, {"RUNNER_TEMP": str(self.root)}), \
+             mock.patch("python_wheels.build_wheels", side_effect=fake_build):
+            self.assertEqual(build_release_wheels(["maturin"], self.root, {}, "windows"), {"result": self.root})
+        self.assertFalse(observed[0].exists())
+        with mock.patch.dict(os.environ, {"RUNNER_TEMP": str(self.root)}), \
+             mock.patch("python_wheels.build_wheels", side_effect=RuntimeError("failure")) as run:
+            with self.assertRaisesRegex(RuntimeError, "failure"):
+                build_release_wheels(["maturin"], self.root, {}, "windows")
+            failed_target = pathlib.Path(run.call_args.args[0][-1])
+        self.assertFalse(failed_target.exists())
+        with mock.patch("python_wheels.build_wheels", return_value={}) as run:
+            build_release_wheels(["maturin"], self.root, {}, "linux")
+        run.assert_called_once_with(["maturin"], self.root, {})
+
+    def test_linux_release_exposes_zig_wrapper(self):
+        workflow = (SCRIPTS.parent.parent / ".github/workflows/publish-release.yml").read_text(encoding="utf-8")
+        self.assertIn('uv tool install --with-executables-from ziglang "maturin[zig]==$MATURIN_VERSION"', workflow)
+        self.assertIn('ZIG_WRAPPER="$(uv tool dir --bin)/python-zig"', workflow)
+        self.assertIn('"$ZIG_WRAPPER" version', workflow)
+        self.assertIn('CARGO_ZIGBUILD_ZIG_PATH=%s', workflow)
 
     def test_preflight_dry_run_and_tag_mismatch(self):
         version = self.version
@@ -208,6 +240,53 @@ class ReleaseTests(unittest.TestCase):
             self.assertTrue((repository / lic_name).is_file(), f"Missing {lic_name}")
         build_target_src = (SCRIPTS / "build_target.py").read_text(encoding="utf-8")
         self.assertEqual(build_target_src.count("for lic_name in ROOT_LICENSE_FILES:"), 2)
+
+    def test_hosted_facade_excludes_named_live_test(self):
+        repository = SCRIPTS.parent.parent
+        name = "unified_facade_discovery_inspect_stream_manager_zero_alloc_hot_swap_and_drop"
+        test_source = (repository / "crates/capture/tests/cross_platform_api.rs").read_text(encoding="utf-8")
+        workflow = (repository / ".github/workflows/publish-release.yml").read_text(encoding="utf-8")
+        self.assertEqual(test_source.count(f"fn {name}()"), 1)
+        self.assertEqual(workflow.count(f"--skip {name}"), 1)
+
+    def test_hosted_windows_excludes_device_dependent_backend_tests(self):
+        repository = SCRIPTS.parent.parent
+        names = (
+            "platform_discovery_one_shot_leaves_no_watcher_and_supports_pre_audio_process",
+            "sta_thread_compatibility_and_default_endpoint_observer_benchmark",
+        )
+        test_source = (repository / "crates/capture-windows/src/discovery.rs").read_text(encoding="utf-8")
+        workflow = (repository / ".github/workflows/publish-release.yml").read_text(encoding="utf-8")
+        backend_step = workflow.split('cargo clippy --locked --manifest-path "$BACKEND_MANIFEST"', 1)[1]
+        windows_branch, other_branch = backend_step.split('if [ "$MATRIX_PLATFORM" = "windows" ]; then', 1)[1].split("else", 1)
+        other_branch = other_branch.split("fi", 1)[0]
+        for name in names:
+            self.assertEqual(test_source.count(f"fn {name}()"), 1)
+            self.assertEqual(windows_branch.count(f"--skip discovery::tests::{name}"), 1)
+        self.assertIn('cargo test --locked --manifest-path "$BACKEND_MANIFEST"', other_branch)
+        self.assertNotIn("--skip", other_branch)
+
+    def test_packaged_consumer_smoke_is_headless_and_fail_closed(self):
+        build_dir = self.root / "build"
+        package_dir = self.root / "package"
+        for platform in ("windows", "linux", "macos"):
+            with self.subTest(platform=platform):
+                variable = "DYLD_LIBRARY_PATH" if platform == "macos" else "LD_LIBRARY_PATH"
+                with mock.patch.dict(os.environ, {variable: "existing"}), \
+                     mock.patch("consumer_smoke.shutil.copy2") as copy, \
+                     mock.patch("consumer_smoke.subprocess.run") as run:
+                    run_packaged_consumers(platform, build_dir, package_dir)
+                self.assertEqual(len(run.call_args_list), 2)
+                for call, name in zip(run.call_args_list, ("c11_clean_consumer", "cpp17_clean_consumer")):
+                    expected = build_dir / "Release" / (name + ".exe") if platform == "windows" else build_dir / name
+                    self.assertEqual(call.args[0], [str(expected), "--headless"])
+                    self.assertTrue(call.kwargs["check"])
+                    if platform != "windows":
+                        self.assertEqual(call.kwargs["env"][variable], os.pathsep.join((str(package_dir / "lib"), "existing")))
+                self.assertEqual(copy.call_count, int(platform == "windows"))
+        with mock.patch("consumer_smoke.subprocess.run", side_effect=subprocess.CalledProcessError(1, "consumer")):
+            with self.assertRaises(subprocess.CalledProcessError):
+                run_packaged_consumers("linux", build_dir, package_dir)
 
     @unittest.skipIf(os.name == "nt", "The sdist release job runs on Linux")
     def test_sdist_uses_selected_python_library_path(self):

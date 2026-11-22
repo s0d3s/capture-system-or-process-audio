@@ -22,6 +22,9 @@ use std::time::{Duration, Instant};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--synthetic-smoke-test") {
+        return run_synthetic_smoke_test();
+    }
     if args.iter().any(|a| a == "--smoke-test") {
         return run_headless_smoke_test();
     }
@@ -101,6 +104,35 @@ fn run_tui_loop(
         }
     }
 
+    Ok(())
+}
+
+fn run_synthetic_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
+    use crate::backend::PlatformCaptureSession;
+    use capture_system_or_process_audio::{
+        CaptureRequest, CaptureTarget, DefaultDeviceMode, Overflow, Stop,
+    };
+
+    let output = CaptureTarget::default_output(DefaultDeviceMode::Pin);
+    let request = CaptureRequest::single(output.clone());
+    let mut session = PlatformCaptureSession::open_synthetic(&request)?;
+    let chunk = session.read_next(256, Duration::ZERO)?;
+    if chunk.frames != 256 || chunk.pcm_bytes.len() != 256 * chunk.format.bytes_per_frame() {
+        return Err("synthetic capture returned an invalid block".into());
+    }
+    let updated = CaptureRequest::new(vec![
+        output,
+        CaptureTarget::microphone(DefaultDeviceMode::Follow),
+    ]);
+    session.hot_swap(updated, Overflow::DropOldest)?;
+    if session.targets().len() != 2 || session.read_next(256, Duration::ZERO)?.frames != 256 {
+        return Err("synthetic capture target update failed".into());
+    }
+    session.stop_and_cleanup(Stop::Abort);
+    if !session.read_next(256, Duration::ZERO)?.eof {
+        return Err("synthetic capture did not stop".into());
+    }
+    println!("cspa-tui-demo synthetic smoke-test PASS");
     Ok(())
 }
 
@@ -200,6 +232,11 @@ mod tests {
     use crate::hit_test::ClickAction;
     use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn synthetic_smoke_test_runs_without_native_audio() {
+        run_synthetic_smoke_test().expect("synthetic smoke test");
+    }
 
     #[test]
     fn panel_fit_warnings_follow_terminal_resize() {

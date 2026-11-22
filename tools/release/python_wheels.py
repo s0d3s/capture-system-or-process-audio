@@ -1,6 +1,15 @@
+import os
 import subprocess
+import tempfile
 
 from config import PYTHON_WHEELS
+
+
+def build_release_wheels(maturin_common, wheels_dir, python_executables, platform):
+    if platform != "windows":
+        return build_wheels(maturin_common, wheels_dir, python_executables)
+    with tempfile.TemporaryDirectory(prefix="cspa-wheel-", dir=os.environ.get("RUNNER_TEMP")) as target_dir:
+        return build_wheels([*maturin_common, "--target-dir", target_dir], wheels_dir, python_executables)
 
 
 def build_wheels(maturin_common, wheels_dir, python_executables):

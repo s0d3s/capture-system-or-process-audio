@@ -11,7 +11,8 @@
         } \
     } while (0)
 
-int main() {
+int main(int argc, char **argv) {
+    REQUIRE(argc == 1 || (argc == 2 && std::strcmp(argv[1], "--headless") == 0), "unknown argument");
     auto mic_res = cspa::Target::microphone(cspa::DefaultDeviceMode::Follow, 1.0f);
     REQUIRE(mic_res.is_ok(), "Target::microphone failed");
     cspa::Target mic = mic_res.take_value();
@@ -73,6 +74,24 @@ int main() {
         !mac_native_only.is_ok() && mac_native_only.status() == cspa::Status::UnsupportedScope,
         "CombineMode::NativeOnly must reject cross-backend session"
     );
+
+#if CSPA_HAS_EXCEPTIONS
+    bool caught_expected = false;
+    try {
+        (void)cspa::Target::device_or_throw("");
+    } catch (const cspa::Error &err) {
+        caught_expected = (err.status() == cspa::Status::InvalidArgument);
+    }
+    REQUIRE(caught_expected, "device_or_throw did not throw cspa::Error on empty device_id");
+    std::printf("CPP17_CONSUMER_EXCEPTIONS_OK\n");
+#else
+    std::printf("CPP17_CONSUMER_NOEXCEPT_OK\n");
+#endif
+
+    if (argc == 2) {
+        std::printf("CPP17_CONSUMER_HEADLESS_OK\n");
+        return 0;
+    }
 
     auto disc_res = cspa::Discovery::create();
     REQUIRE(disc_res.is_ok(), "Discovery::create failed");
@@ -199,19 +218,6 @@ int main() {
     std::memcpy(&s0_after, retained.data(), sizeof(float));
     REQUIRE(retained.data() == ptr_before && s0_after == s0_before, "retained block invalid after stream reset");
     retained.release();
-
-#if CSPA_HAS_EXCEPTIONS
-    bool caught_expected = false;
-    try {
-        (void)cspa::Target::device_or_throw("");
-    } catch (const cspa::Error &err) {
-        caught_expected = (err.status() == cspa::Status::InvalidArgument);
-    }
-    REQUIRE(caught_expected, "device_or_throw did not throw cspa::Error on empty device_id");
-    std::printf("CPP17_CONSUMER_EXCEPTIONS_OK\n");
-#else
-    std::printf("CPP17_CONSUMER_NOEXCEPT_OK\n");
-#endif
 
     return 0;
 }

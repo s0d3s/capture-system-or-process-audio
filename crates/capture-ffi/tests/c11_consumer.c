@@ -34,7 +34,8 @@ static void init_target(cspa_capture_target_record *t) {
         } \
     } while (0)
 
-int main(void) {
+int main(int argc, char **argv) {
+    REQUIRE(argc == 1 || (argc == 2 && strcmp(argv[1], "--headless") == 0), "unknown argument");
     REQUIRE(
         cspa_abi_check(CSPA_EXPERIMENTAL_ABI_MAJOR, CSPA_EXPERIMENTAL_SCHEMA_REVISION) == CSPA_STATUS_OK,
         "valid ABI must pass"
@@ -285,6 +286,11 @@ int main(void) {
         cspa_request_inspect(&req, &report) == CSPA_STATUS_PRECISE_TIMING_UNQUALIFIED,
         "require_precise_timing must reject"
     );
+
+    if (argc == 2) {
+        printf("C11_CONSUMER_HEADLESS_OK\n");
+        return 0;
+    }
 
     cspa_discovery *disc = NULL;
     REQUIRE(cspa_discovery_create(&disc) == CSPA_STATUS_OK && disc != NULL, "discovery_create failed");
