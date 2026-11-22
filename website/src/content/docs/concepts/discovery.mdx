@@ -237,3 +237,110 @@ On Linux (`PipeWire` + `PulseAudio`) and macOS (`CoreAudio` + `ScreenCaptureKit`
         q.order = CSPA_DISCOVERY_ORDER_BACKEND_THEN_KIND;
         q.active_only = 1u;
 
+        size_t count = 0;
+        if (cspa_discover_query(&q, NULL, 0, &count) == CSPA_STATUS_OK) {
+            printf("Targets: %zu\n", count);
+        }
+        return 0;
+    }
+    ```
+  </TabItem>
+</SdkTabs>
+
+---
+
+## 4. Bounded `256`-Event Cursor Subscriptions & Resnapshot Recovery
+
+Interactive UIs (such as `cspa-tui-demo` or Electron source pickers) can subscribe to live inventory diffs without polling the OS in tight loops:
+
+- **Event Kinds:** `Added`, `Removed`, `StateChanged` (including `PLAYING` $\leftrightarrow$ `IDLE` transitions and friendly device renames), `DefaultDeviceChanged`, `DefaultInputChanged`, `VisibilityChanged`, `WatcherFailed`, and `ResnapshotRequired`.
+- **Bounded Queue (`max_discovery_queue = 256` default, range `32..=4096`):** Prevents unbounded memory growth if a UI thread pauses while hundreds of processes churn. If the queue overflows (`sub.is_overflowed`), calling `sub.resnapshot()` atomically reconciles a fresh baseline snapshot and resets the cursor!
+
+<SdkTabs>
+  <TabItem label="Python">
+    ```python
+    import capture_system_or_process_audio as cspa
+
+    with cspa.subscribe_discovery(max_discovery_queue=256) as sub:
+        for ev in sub.poll_events():
+            print(ev.revision, ev.kind.value, ev.target_id)
+        if sub.is_overflowed:
+            fresh = sub.resnapshot()
+            print("Resnapshotted at revision:", fresh.revision, "count:", len(fresh.targets))
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use capture_system_or_process_audio::{
+        CapabilityError, DiscoveryQuery, subscribe_discovery,
+    };
+
+    fn poll_live_changes() -> Result<(), CapabilityError> {
+        let sub = subscribe_discovery(DiscoveryQuery::default(), 256)?;
+        while let Some(ev) = sub.poll_event() {
+            println!("rev={} kind={:?}", ev.revision, ev.kind);
+        }
+        if sub.is_overflowed() {
+            let snap = sub.resnapshot()?;
+            println!("Resnapshotted {} targets", snap.targets.len());
+        }
+        Ok(())
+    }
+    let _ = poll_live_changes();
+    ```
+  </TabItem>
+  <TabItem label="C++17">
+    ```cpp
+    #include <cspa.hpp>
+
+    int main() {
+        auto disc_res = cspa::Discovery::create();
+        if (!disc_res.is_ok()) return 1;
+        auto disc = disc_res.take_value();
+
+        cspa::DiscoveryQuery q;
+        auto sub_res = disc.subscribe_query(q, 256);
+        if (!sub_res.is_ok()) return 1;
+        auto sub = sub_res.take_value();
+
+        cspa::DiscoveryEvent ev;
+        while (sub.poll(ev).is_ok() && ev.revision > 0) {
+            break;
+        }
+        if (sub.is_overflowed().value()) {
+            uint64_t rev = 0;
+            (void)sub.resnapshot(&rev);
+        }
+        return 0;
+    }
+    ```
+  </TabItem>
+  <TabItem label="C11">
+    ```c
+    #include <cspa_experimental.h>
+
+    int main(void) {
+        cspa_discovery *disc = NULL;
+        if (cspa_discovery_create(&disc) != CSPA_STATUS_OK) return 1;
+
+        cspa_discovery_query_record q = {0};
+        cspa_discovery_query_init(&q);
+
+        cspa_discovery_subscription *sub = NULL;
+        if (cspa_discovery_subscribe_query(disc, &q, 256u, &sub) == CSPA_STATUS_OK) {
+            uint32_t overflowed = 0;
+            (void)cspa_discovery_subscription_is_overflowed(sub, &overflowed);
+            cspa_discovery_subscription_release(sub);
+        }
+        cspa_discovery_release(disc);
+        return 0;
+    }
+    ```
+  </TabItem>
+</SdkTabs>
+
+<Aside type="tip" title="Zero overhead when unused">
+`Discovery` is 100% lazy: opening `capture_single(default_output(Pin))` never starts a process-tree watcher thread unless the plan actually requires dynamic process or follow-mode tracking (`plan.requires_discovery_subscription`).
+</Aside>
+
+Continue to [Execution Planning, CspaMixer & Live Hot-Swap](/capture-system-or-process-audio/concepts/planning-and-mixing/).

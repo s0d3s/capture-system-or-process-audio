@@ -154,3 +154,65 @@ fn main() -> Result<(), CapabilityError> {
         })
         .with_output_converter(Some(OutputConverterConfig::new(mono_16k, DitherMode::Tpdf)));
 
+    // Optional side-effect-free execution plan preview before opening OS streams:
+    let plan = req.inspect()?;
+    println!("Combine resolution: {:?} (streams={})", plan.combine_resolution, plan.estimated_active_streams);
+
+    let mut manager = CaptureManager::open(req)?;
+    let block = manager.read(1600, Duration::from_millis(200)).expect("read 100 ms mixed audio");
+    println!("Mixed {} frames", block.frames);
+
+    manager.stop(Stop::Drain);
+    manager.wait_cleanup(Duration::from_secs(2));
+    Ok(())
+}
+```
+
+### 4. Check & Request OS Recording Permissions
+
+```rust,no_run
+use capture_system_or_process_audio::{
+    CapabilityError, CaptureTarget, DefaultDeviceMode, check_permissions, request_permissions,
+};
+use std::time::Duration;
+
+fn main() -> Result<(), CapabilityError> {
+    let target = CaptureTarget::default_output(DefaultDeviceMode::Follow);
+
+    // Non-prompting preflight across Microphone, SystemAudio, and ScreenRecording:
+    let report = check_permissions(std::slice::from_ref(&target))?;
+    if !report.system_audio().is_granted() {
+        let _updated = request_permissions(std::slice::from_ref(&target), Duration::from_secs(30))?;
+    }
+    Ok(())
+}
+```
+
+---
+
+## Choosing Between `CaptureManager` and `AudioStream`
+
+- **`CaptureManager` (`capture`, `capture_single`, `CaptureManager::open`) — Recommended Default:**
+  Uses a zero-extra-copy `PassThrough` path for single targets while owning multi-target native graph fan-in (`SharedNativeGraphMix`), drift-compensated software mixing (`CspaMixer` + pre-mix `InputNormalizer + FrameReblocker`), post-mix `OutputConverter`, automatic `Follow` default-device switching, `OnRootExit::Wait` relaunch tracking, and live two-tier `update_targets(...)` hot-swap.
+- **`AudioStream` (`open_stream`, `AudioStream::open`) — Lightweight Single Session:**
+  Owns a single native backend capture stream directly when you explicitly want zero discovery subscriptions, process-tree monitoring, or device-switch transitions.
+
+---
+
+## Platform & Native Backend Matrix
+
+Unsupported scopes or OS versions fail explicitly with `CapabilityError` — never silently broadening from single-process capture to full-system loopback:
+
+| Platform | Crate Backend | Supported Targets & Capabilities | Runtime Notes |
+| --- | --- | --- | --- |
+| **Windows 10 / 11** (`x86_64`, `aarch64`) | `capture-system-or-process-audio-windows` (`WASAPI`) | `default_output` & `microphone` (`Follow`/`Pin`), `device` & `input_device` (`>= 19041`); `process` & `application` `ProcessScope::Tree` (`>= 20348`). | `ProcessScope::Exact` rejects explicitly (`CapabilityError::UnsupportedScope`). |
+| **Linux** (`x86_64`, `aarch64`) | `capture-system-or-process-audio-linux` (`PipeWire` `0.3.65+`, `PulseAudio` `15.0+`) | Output endpoints, microphones (`.monitor` sinks excluded), PipeWire `SharedNativeGraphMix` virtual-sink fan-in, PulseAudio per-stream `CspaMixer`, and `[PipeWire + PulseAudio]` cross-backend mixing. | Loads `libpipewire-0.3.so.0` & `libpulse.so.0` via `dlopen` (**`0` compile-time `NEEDED` links**). |
+| **macOS** (`aarch64-apple-darwin`) | `capture-system-or-process-audio-macos` (`Core Audio`, `ScreenCaptureKit`) | Core Audio Process Taps (`macOS 14.2+`), Core Audio HAL microphone input (`macOS 13.0+`), ScreenCaptureKit `application` (`ProcessScope::Exact`, `macOS 13.0+`), and `[SCK + CoreAudio]` cross-backend mixing. | Intel macOS (`x86_64`) and SCK `ProcessScope::Tree` reject explicitly. |
+
+---
+
+## Repository, Other SDKs & License
+
+- **Official Documentation, Manuals & Multi-SDK Reference:** <https://s0d3s.github.io/capture-system-or-process-audio/>
+- **GitHub Repository (Python, C++17, C11 SDKs & `cspa-tui-demo`):** <https://github.com/s0d3s/capture-system-or-process-audio>
+- **License:** Dual-licensed under [MIT](https://github.com/s0d3s/capture-system-or-process-audio/blob/main/LICENSE-MIT) or [Apache-2.0](https://github.com/s0d3s/capture-system-or-process-audio/blob/main/LICENSE-APACHE), at your option.

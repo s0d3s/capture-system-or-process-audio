@@ -144,3 +144,64 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+---
+
+## Migrating From `PyAudioWPatch` & Ecosystem Drop-In `Adapters`
+
+[`PyAudioWPatch`](https://github.com/s0d3s/PyAudioWPatch) (created by `@s0d3s`, **140,000+ monthly PyPI downloads** across **340+ open-source repositories**) brought Windows WASAPI loopback to `PyAudio`, but PortAudio's C architecture made the most-requested user features — single-app isolation, macOS/Linux capture, `[Mic + Speaker]` drift sync, silent-speaker hang protection, and `-Xgil=0` free-threading — impossible to implement there. **`capture-system-or-process-audio` is the result of nearly a year of ground-up safe-Rust development and polish** built specifically to solve them:
+
+| Common Task | `PyAudioWPatch` (Windows Only) | `capture_system_or_process_audio` (Win · Linux · macOS) |
+| --- | --- | --- |
+| Default speaker loopback | `p.get_default_wasapi_loopback()` | `cspa.default_output()` *(auto-follows device changes!)* |
+| Record one specific app | Not supported | `cspa.find_app("Zoom")` or `cspa.process(pid)` |
+| Prevent hang during speaker silence | Blocks forever on `stream.read()` | Pass `silence_on_idle=True` to `cspa.capture(...)` |
+| Resample to `16 kHz` mono `i16`/`f32` | Manual external resampler | `output_converter=cspa.OutputConverter(rate=16000, channels=1, sample_format="i16")` |
+| Zero-copy NumPy array | `np.frombuffer(data, dtype=...)` | `block.to_numpy(copy=False)` -> `(frames, channels)` |
+
+> **Planned for Next Release — Zero-Rewrite Drop-In `Adapters`:** Upcoming compatibility wrappers for **`PyAudio` / `PyAudioWPatch`** (`Stream.read` & `stream_callback`), **`python-sounddevice`** (`InputStream`, `RawInputStream`, `rec`), **`SoundCard`** (`_Recorder`), **`SpeechRecognition`** (`AudioSource`), and **`faster-whisper`** sliding-window streams will let existing Python audio code switch to per-process or cross-platform loopback with a 1-line import swap. Follow progress on [GitHub](https://github.com/s0d3s/capture-system-or-process-audio#adapters-and-nodejs-roadmap).
+
+---
+
+## OS Recording Permissions & Discovery
+
+Inspect or request OS recording consent (`Microphone`, `SystemAudio`, `ScreenRecording`) cleanly across Windows, macOS, and Linux:
+
+```python
+import capture_system_or_process_audio as cspa
+
+# Side-effect-free preflight (never triggers modal OS popups on CI or background workers):
+report = cspa.check_permissions(cspa.default_output())
+print("System audio state:", report.system_audio.state.value, "granted:", report.system_audio.is_granted)
+
+# Enumerate active audio-producing applications, output endpoints, and microphones:
+catalog = cspa.discover(active_only=False)
+for app in catalog.applications:
+    print(f"App: {app.name} (pid={app.pid}, backends={[b.value for b in app.available_backends]})")
+
+# Preview the exact backend & mixer plan without opening hardware streams:
+plan = cspa.request([cspa.microphone(), cspa.default_output()]).inspect()
+print("Resolution:", plan.combine_resolution.value, "software_mix:", plan.uses_software_mixer)
+```
+
+- Streams use `PermissionPolicy.AUTO_REQUEST` by default on interactive runs; pass `request_permissions=False` (`PermissionPolicy.CHECK_ONLY`) to opt out of OS prompts and raise standard Python `PermissionError` (`OSError`) when denied.
+
+---
+
+## Platform Support Matrix
+
+Capabilities differ across operating systems. Unsupported scopes or OS versions raise explicit errors rather than silently falling back to full-system capture:
+
+| Platform | Backends (`Backends`) | Supported Scopes & Capabilities | Explicit Rejections / Notes |
+| --- | --- | --- | --- |
+| **Windows 10 / 11** (`x86_64`, `ARM64`) | `[BackendId.WASAPI]` | `default_output` & `microphone` (`follow`/`pin`), `device(id)` & `input_device(id)` (`>= 19041`); `process`/`application` `scope="tree"` (`>= 20348`) and `cspa_mixer`. | `scope="exact"` and uncalibrated `timing="precise"` reject explicitly. |
+| **Linux** (`x86_64`, `aarch64`) | `[BackendId.PIPEWIRE, BackendId.PULSEAUDIO]` (runtime `dlopen` of `libpipewire-0.3.so.0 >= 0.3.65` & `libpulse.so.0 >= 15.0`, `0` compile-time `NEEDED` links) | PipeWire & PulseAudio output endpoints, microphones (`.monitor` sinks excluded), PipeWire `native_graph_mix` fan-in, PulseAudio per-stream `cspa_mixer`, and cross-backend `[pipewire + pulseaudio]` `cspa_mixer`. | `native_kernel_capture` for `process`/`application` and uncalibrated `timing="precise"` reject explicitly. |
+| **macOS** (`Apple Silicon arm64`) | `[BackendId.COREAUDIO, BackendId.SCREENCAPTUREKIT]` | Core Audio Process Taps (`macOS 14.2+`), Core Audio HAL microphone input (`macOS 13.0+`), ScreenCaptureKit `application` (`scope="exact"`, `macOS 13.0+`), and cross-backend `[screencapturekit + coreaudio]` `cspa_mixer`. | Intel macOS (`x86_64`), SCK `scope="tree"`, and uncalibrated `timing="precise"` reject explicitly. |
+
+---
+
+## Links & License
+
+- **Official Documentation, Python Handbook & `.pyi` API Reference:** <https://s0d3s.github.io/capture-system-or-process-audio/>
+- **Source, Rust / C / C++ SDKs & Live TUI Demo:** <https://github.com/s0d3s/capture-system-or-process-audio>
+- **Prebuilt Binaries & Releases:** <https://github.com/s0d3s/capture-system-or-process-audio/releases>
+- **License:** Dual-licensed under [MIT](https://github.com/s0d3s/capture-system-or-process-audio/blob/main/LICENSE-MIT) or [Apache-2.0](https://github.com/s0d3s/capture-system-or-process-audio/blob/main/LICENSE-APACHE), at your option.

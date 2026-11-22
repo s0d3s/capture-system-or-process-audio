@@ -237,3 +237,97 @@ int main(void) {
         return 1;
     }
 
+    cspa_manager *manager = NULL;
+    if (cspa_manager_open(&req, &manager) != CSPA_STATUS_OK) {
+        return 1;
+    }
+
+    uint8_t buffer[480 * 8];
+    cspa_managed_read_outcome_record out = {0};
+    out.struct_size = (uint32_t)sizeof(out);
+    out.schema_revision = CSPA_EXPERIMENTAL_SCHEMA_REVISION;
+
+    if (cspa_manager_read_into(manager, buffer, sizeof(buffer), 480u, 200u, NULL, &out) == CSPA_STATUS_OK) {
+        printf("Read %llu frames (%llu bytes)\n",
+               (unsigned long long)out.actual_frames,
+               (unsigned long long)out.copy_bytes);
+    }
+
+    /* Note: When using cspa_manager_read() instead of read_into(), call
+       cspa_block_release(&out.block) once finished with the zero-copy view. */
+    cspa_manager_stop(manager, 0u);
+    uint32_t cleaned = 0;
+    cspa_manager_wait_cleanup(manager, 2000u, &cleaned);
+    cspa_manager_release(manager);
+    return 0;
+}
+```
+
+### List & Filter Available `cspa_capture_target_record`s (`cspa_discover_query`)
+
+Use the two-call `cspa_discover_query` pattern (`NULL, 0, &total` or a bounded buffer) to inspect and deterministically select active applications, processes, or specific endpoints before opening `cspa_manager`:
+
+```c
+#include <cspa_experimental.h>
+#include <stdlib.h>
+#include <stdio.h>
+
+int main(void) {
+    if (cspa_abi_check(CSPA_EXPERIMENTAL_ABI_MAJOR, CSPA_EXPERIMENTAL_SCHEMA_REVISION) != CSPA_STATUS_OK) {
+        return 1;
+    }
+
+    cspa_discovery_query_record query = {0};
+    if (cspa_discovery_query_init(&query) != CSPA_STATUS_OK) return 1;
+
+    size_t count = 0;
+    if (cspa_discover_query(&query, NULL, 0u, &count) != CSPA_STATUS_OK) return 1;
+
+    cspa_capture_target_record *items = NULL;
+    size_t cap = count + 8u;
+    items = (cspa_capture_target_record *)calloc(cap, sizeof(*items));
+    if (items == NULL) return 1;
+
+    size_t filled = 0;
+    if (cspa_discover_query(&query, items, cap, &filled) == CSPA_STATUS_OK) {
+        size_t n = filled < cap ? filled : cap;
+        for (size_t i = 0; i < n; ++i) {
+            printf("kind=%u name='%s' pid=%u active=%u\n",
+                   items[i].kind, items[i].name, items[i].pid, items[i].active_audio);
+            if (items[i].kind == CSPA_TARGET_KIND_APPLICATION &&
+                items[i].active_audio == CSPA_ACTIVE_AUDIO_ACTIVE) {
+                cspa_capture_target_record scaled = {0};
+                if (cspa_target_with_gain(&items[i], 0.85f, &scaled) == CSPA_STATUS_OK) {
+                    cspa_capture_request_record req = {0};
+                    cspa_capture_request_init(&req, &scaled, 1u);
+                    cspa_manager *mgr = NULL;
+                    if (cspa_manager_open(&req, &mgr) == CSPA_STATUS_OK) {
+                        cspa_manager_stop(mgr, 1u);
+                        cspa_manager_release(mgr);
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    free(items);
+    return 0;
+}
+```
+
+---
+
+## Runtime & Platform Notes
+
+- **Windows (`x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`):** Ensure `bin/cspa_ffi.dll` is placed in the executable directory or on `PATH` (handled automatically by the `POST_BUILD` CMake rule above).
+- **Linux (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`):** `libcspa_ffi.so` has **`0` compile-time `NEEDED` links** to `libpipewire` or `libpulse`; system `libpipewire-0.3.so.0` (`>= 0.3.65`) and `libpulse.so.0` (`>= 15.0`) are loaded dynamically via `dlopen` at runtime.
+- **macOS (`aarch64-apple-darwin`):** When embedding inside a `.app` bundle, include `NSMicrophoneUsageDescription` (for microphone inputs) and `NSAudioCaptureUsageDescription` (for Core Audio taps on macOS `14.2+`) in your app's `Info.plist`. Missing usage keys are safely detected and reported as `CSPA_STATUS_PERMISSION_DENIED` without triggering TCC `SIGABRT`.
+
+---
+
+## Links & License
+
+- **C++17 & C11 Handbooks + Full API Reference:** <https://s0d3s.github.io/capture-system-or-process-audio/sdks/cpp/> · <https://s0d3s.github.io/capture-system-or-process-audio/sdks/c/>
+- **Repository & Other SDKs (Python, Rust, Live TUI Demo):** <https://github.com/s0d3s/capture-system-or-process-audio>
+- **License:** Dual-licensed under [MIT](https://github.com/s0d3s/capture-system-or-process-audio/blob/main/LICENSE-MIT) or [Apache-2.0](https://github.com/s0d3s/capture-system-or-process-audio/blob/main/LICENSE-APACHE), at your option.
