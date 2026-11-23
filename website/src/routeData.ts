@@ -1,5 +1,17 @@
 import { defineRouteMiddleware } from '@astrojs/starlight/route-data';
 
+function hasMathMarkup(rawBody?: string, renderedHtml?: string): boolean {
+  if (renderedHtml && renderedHtml.includes('class="katex')) {
+    return true;
+  }
+  if (!rawBody || !rawBody.includes('$')) {
+    return false;
+  }
+  const withoutFences = rawBody.replace(/^\s*(`{3,}|~{3,})[\s\S]*?^\s*\1/gm, '');
+  const withoutInlineCode = withoutFences.replace(/`[^`\n]+`/g, '');
+  return /\$\$[\s\S]+?\$\$|\$[^\s$\n][^$\n]*\$/.test(withoutInlineCode);
+}
+
 export const onRequest = defineRouteMiddleware((context) => {
   const { starlightRoute } = context.locals;
   const { entry, id } = starlightRoute;
@@ -114,6 +126,13 @@ export const onRequest = defineRouteMiddleware((context) => {
     '@context': 'https://schema.org',
     '@graph': graphNodes,
   });
+
+  if (hasMathMarkup(entry?.body, entry?.rendered?.html)) {
+    starlightRoute.head.push({
+      tag: 'link',
+      attrs: { rel: 'stylesheet', href: `${basePath}/katex/katex.min.css` },
+    });
+  }
 
   starlightRoute.head.push(
     { tag: 'meta', attrs: { name: 'description', content: pageDescription } },

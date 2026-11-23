@@ -14,9 +14,12 @@ export default defineConfig({
   trailingSlash: 'always',
   prerenderConflictBehavior: 'error',
   compressHTML: true,
+  build: {
+    inlineStylesheets: 'always',
+  },
   prefetch: {
     prefetchAll: true,
-    defaultStrategy: 'viewport',
+    defaultStrategy: 'hover',
   },
   markdown: {
     processor: satteri(mathProcessorOptions),
@@ -27,6 +30,12 @@ export default defineConfig({
       description:
         'Cross-platform system speaker loopback, single application/process, and microphone PCM audio capture & live mixer for Python, Rust, C++17, and C11.',
       favicon: '/favicon.svg',
+      head: [
+        {
+          tag: 'script',
+          content: "if (typeof localStorage !== 'undefined' && localStorage.getItem('starlight-theme') === null) localStorage.setItem('starlight-theme', 'dark');",
+        },
+      ],
       logo: {
         src: './public/favicon.svg',
         alt: 'capture-system-or-process-audio waveform logo',
@@ -41,7 +50,7 @@ export default defineConfig({
       editLink: {
         baseUrl: 'https://github.com/s0d3s/capture-system-or-process-audio/edit/main/website/',
       },
-      customCss: ['katex/dist/katex.min.css', './src/styles/custom.css'],
+      customCss: ['./src/styles/custom.css'],
       disable404Route: true,
       routeMiddleware: './src/routeData.ts',
       markdown: {
@@ -64,6 +73,7 @@ export default defineConfig({
       components: {
         Header: './src/components/Header.astro',
         PageTitle: './src/components/PageTitle.astro',
+        Search: './src/components/Search.astro',
       },
       plugins: [
         starlightLlmsTxt({

@@ -21,6 +21,8 @@ __pycache__/
 /website/dist/
 /website/.astro/
 /website/public/api/
+/website/public/katex/
+/website/src/assets/generated/
 temp_python
 /*.md
 /*.ps1

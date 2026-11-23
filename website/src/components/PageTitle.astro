@@ -1,5 +1,6 @@
 ---
-import { Image } from 'astro:assets';
+import { Picture } from 'astro:assets';
+import bannerPoster from '../assets/generated/repo_banner_poster.png';
 
 const { entry, id } = Astro.locals.starlightRoute;
 const isHome = id === '' || id === 'index';
@@ -9,14 +10,24 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 {
   isHome ? (
     <section class="cspa-hero">
-      <Image
-        src={`${base}/repo_banner.svg`}
-        alt="capture-system-or-process-audio — Cross-platform system speaker loopback, single application/process, and microphone PCM audio capture library for Python, Rust, C++17, and C11"
-        class="cspa-hero-banner"
-        width="1200"
-        height="400"
-        priority
-      />
+      <div class="cspa-hero-banner-shell" data-animated-banner={`${base}/repo_banner.svg`}>
+        <div class="cspa-hero-banner-svg-host" aria-hidden="true" />
+        <Picture
+          src={bannerPoster}
+          formats={['avif']}
+          fallbackFormat="webp"
+          widths={[480, 720, 1080, 1440]}
+          sizes="(max-width: 62rem) 92vw, 928px"
+          quality={62}
+          alt="capture-system-or-process-audio — Cross-platform system speaker loopback, single application/process, and microphone PCM audio capture library for Python, Rust, C++17, and C11"
+          class="cspa-hero-banner"
+          width={1200}
+          height={400}
+          loading="eager"
+          decoding="async"
+          fetchpriority="high"
+        />
+      </div>
       <h1 id="_top" class="cspa-hero-h1">
         {entry.data.title}
       </h1>
@@ -58,6 +69,198 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
     <h1 id="_top" class="cspa-doc-h1">
       {entry.data.title}
     </h1>
+  )
+}
+
+{
+  isHome && (
+    <script>
+      (() => {
+        const shell = document.querySelector<HTMLElement>('.cspa-hero-banner-shell[data-animated-banner]');
+        const posterImg = shell?.querySelector<HTMLImageElement>('img.cspa-hero-banner');
+        const svgUrl = shell?.dataset.animatedBanner;
+        if (!shell || !svgUrl) return;
+
+        if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+        const conn = (
+          navigator as Navigator & {
+            connection?: { saveData?: boolean; effectiveType?: string; downlink?: number };
+          }
+        ).connection;
+        if (conn?.saveData || /(^|-)2g$/i.test(conn?.effectiveType ?? '')) return;
+
+        const isConstrainedNetwork =
+          conn?.effectiveType === '3g' || (typeof conn?.downlink === 'number' && conn.downlink > 0 && conn.downlink < 2.5);
+
+        let started = false;
+        let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
+        let initialPointer: { x: number; y: number } | null = null;
+        const directEvents = ['pointerdown', 'touchstart', 'wheel', 'scroll', 'keydown'] as const;
+
+        const onPointerMove = (e: PointerEvent) => {
+          if (!initialPointer) {
+            initialPointer = { x: e.clientX, y: e.clientY };
+            return;
+          }
+          if (Math.hypot(e.clientX - initialPointer.x, e.clientY - initialPointer.y) >= 4) {
+            upgradeToAnimatedSvg();
+          }
+        };
+
+        const detachListeners = () => {
+          for (const evt of directEvents) {
+            window.removeEventListener(evt, upgradeToAnimatedSvg);
+          }
+          window.removeEventListener('pointermove', onPointerMove);
+          if (fallbackTimer !== undefined) {
+            clearTimeout(fallbackTimer);
+            fallbackTimer = undefined;
+          }
+        };
+
+        function nextFrame(): Promise<void> {
+          if (document.visibilityState === 'hidden') {
+            return new Promise((resolve) => setTimeout(resolve, 32));
+          }
+          return new Promise((resolve) => {
+            let settled = false;
+            const finish = () => {
+              if (!settled) {
+                settled = true;
+                resolve();
+              }
+            };
+            requestAnimationFrame(finish);
+            setTimeout(finish, 100);
+          });
+        }
+
+        function waitUntilTabVisible(): Promise<void> {
+          if (document.visibilityState === 'visible') return Promise.resolve();
+          return new Promise((resolve) => {
+            const onVis = () => {
+              if (document.visibilityState === 'visible') {
+                document.removeEventListener('visibilitychange', onVis);
+                resolve();
+              }
+            };
+            document.addEventListener('visibilitychange', onVis);
+          });
+        }
+
+        async function upgradeToAnimatedSvg() {
+          if (started || !shell || !svgUrl) return;
+          const svgHost = shell.querySelector<HTMLElement>('.cspa-hero-banner-svg-host');
+          if (!svgHost) return;
+          started = true;
+          detachListeners();
+
+          try {
+            const resp = await fetch(svgUrl, { credentials: 'same-origin' });
+            if (!resp.ok) return;
+            const svgMarkup = await resp.text();
+            if (!shell.isConnected) return;
+
+            const parsed = new DOMParser().parseFromString(svgMarkup, 'image/svg+xml');
+            const parsedRoot = parsed.documentElement;
+            if (!parsedRoot || parsedRoot.tagName.toLowerCase() !== 'svg') return;
+
+            const svgEl = document.importNode(parsedRoot, true) as unknown as SVGSVGElement;
+            svgEl.removeAttribute('width');
+            svgEl.removeAttribute('height');
+            svgEl.setAttribute('preserveAspectRatio', 'xMidYMid slice');
+            svgEl.setAttribute('focusable', 'false');
+            svgEl.setAttribute('aria-hidden', 'true');
+
+            // Freeze SMIL animations at exact t = 0 before attaching to the live document
+            if (typeof svgEl.pauseAnimations === 'function') {
+              svgEl.pauseAnimations();
+            }
+            if (typeof svgEl.setCurrentTime === 'function') {
+              svgEl.setCurrentTime(0);
+            }
+
+            // Pre-decode embedded bitmap layers so the SVG paints completely on its first frame
+            const embeddedImages = Array.from(svgEl.querySelectorAll('image'));
+            await Promise.all(
+              embeddedImages.map((imgNode) => {
+                const href = imgNode.getAttribute('href') || imgNode.getAttribute('xlink:href');
+                if (!href) return Promise.resolve();
+                const pre = new Image();
+                pre.decoding = 'async';
+                pre.src = href;
+                return typeof pre.decode === 'function' ? pre.decode().catch(() => {}) : Promise.resolve();
+              })
+            );
+            if (!shell.isConnected) return;
+
+            const shadow = svgHost.shadowRoot ?? svgHost.attachShadow({ mode: 'open' });
+            shadow.textContent = '';
+
+            const baseStyle = document.createElement('style');
+            baseStyle.textContent =
+              ':host{display:block;width:100%;height:100%}svg{display:block;width:100%;height:100%}';
+
+            // Keep all CSS @keyframes frozen at t = 0 until the rasterized poster is hidden
+            const pauseStyle = document.createElement('style');
+            pauseStyle.textContent = 'svg *,svg *::before,svg *::after{animation-play-state:paused!important}';
+
+            shadow.append(baseStyle, pauseStyle, svgEl);
+
+            if (typeof svgEl.pauseAnimations === 'function') {
+              svgEl.pauseAnimations();
+            }
+            if (typeof svgEl.setCurrentTime === 'function') {
+              svgEl.setCurrentTime(0);
+            }
+
+            // Allow two compositor frames for SVG filters and layers to rasterize invisibly behind the poster
+            await nextFrame();
+            await nextFrame();
+            if (!shell.isConnected) return;
+
+            // 1. Hide rasterized poster first while SVG underneath is still frozen at the identical t = 0 frame
+            shell.classList.add('is-svg-ready');
+
+            // 2. Wait until the poster-hide frame commits (and tab is visible), then start CSS + SMIL animations from t = 0
+            await nextFrame();
+            await waitUntilTabVisible();
+            if (!shell.isConnected) return;
+            pauseStyle.remove();
+            if (typeof svgEl.setCurrentTime === 'function') {
+              svgEl.setCurrentTime(0);
+            }
+            if (typeof svgEl.unpauseAnimations === 'function') {
+              svgEl.unpauseAnimations();
+            }
+          } catch {
+            // Keep static high-DPI poster if network fetch fails
+          }
+        }
+
+        const armAfterPosterReady = async () => {
+          if (posterImg && !posterImg.complete) {
+            await new Promise<void>((resolve) => {
+              posterImg.addEventListener('load', () => resolve(), { once: true });
+              posterImg.addEventListener('error', () => resolve(), { once: true });
+            });
+          }
+          for (const evt of directEvents) {
+            window.addEventListener(evt, upgradeToAnimatedSvg, { once: true, passive: true });
+          }
+          window.addEventListener('pointermove', onPointerMove, { passive: true });
+          if (!isConstrainedNetwork) {
+            fallbackTimer = setTimeout(upgradeToAnimatedSvg, 2500);
+          }
+        };
+
+        if (document.readyState === 'complete') {
+          void armAfterPosterReady();
+        } else {
+          window.addEventListener('load', () => void armAfterPosterReady(), { once: true });
+        }
+      })();
+    </script>
   )
 }
 

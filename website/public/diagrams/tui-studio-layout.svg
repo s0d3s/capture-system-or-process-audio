@@ -33,16 +33,16 @@
   <text x="42" y="156" fill="#E879F9" font-family="Consolas, monospace" font-size="12">  [x] [MIC] Default Microphone</text>
   <text x="310" y="156" fill="#FDE047" font-family="Consolas, monospace" font-size="12">[AUTO] [1.5x] [follow]    [+2x] [x]</text>
   <text x="42" y="180" fill="#22D3EE" font-family="Consolas, monospace" font-size="12">  [x] [APP] Zoom Workplace</text>
-  <text x="310" y="180" fill="#A5B4FC" font-family="Consolas, monospace" font-size="12">[WASAPI] [1.0x] [tree] [wait5s] [+2x] [x]</text>
+  <text x="310" y="180" fill="#A5B4FC" font-family="Consolas, monospace" font-size="12" textLength="246" lengthAdjust="spacingAndGlyphs">[WASAPI] [1.0x] [tree] [wait5s] [+2x] [x]</text>
   <text x="42" y="210" fill="#94A3B8" font-family="Consolas, monospace" font-size="11">Alerts: [MIC!] Denied/Restricted · [APP~] Relaunch Needed</text>
-  <text x="42" y="242" fill="#67E8F9" font-family="Consolas, monospace" font-size="12">[+ Add Source]   [All On]   [All Off]   (Space: toggle · D: +2x · Del: remove)</text>
+  <text x="42" y="242" fill="#67E8F9" font-family="Consolas, monospace" font-size="12" textLength="514" lengthAdjust="spacingAndGlyphs">[+ Add Source]   [All On]   [All Off]   (Space: toggle · D: +2x · Del: remove)</text>
 
   <!-- Panel [2] Capture Plan & Config -->
   <rect x="586" y="82" width="548" height="176" rx="10" fill="#0C1424" stroke="#475569" stroke-width="1.5"/>
   <text x="602" y="104" fill="#FACC15" font-family="Consolas, monospace" font-size="13" font-weight="700">[2] Capture Plan &amp; Config (click chips to change)</text>
   <text x="602" y="128" fill="#67E8F9" font-family="Consolas, monospace" font-size="12">[Comb:Auto]   [Tree:Krn..Sw]   [In:AutoResmp]</text>
-  <text x="602" y="148" fill="#FDE047" font-family="Consolas, monospace" font-size="12">Converter:[ON ]  [16000 Hz]  [Mono]  [F32] [Dither:TPDF] [Idle:Silence] [DropOldest]</text>
-  <text x="602" y="172" fill="#4ADE80" font-family="Consolas, monospace" font-size="12">Combine : CspaMixer (48kHz Stereo F32)  |  Targets: #0:WASAPI:Endpt, #1:WASAPI:Kernel</text>
+  <text x="602" y="148" fill="#FDE047" font-family="Consolas, monospace" font-size="12" textLength="516" lengthAdjust="spacingAndGlyphs">Converter:[ON ]  [16000 Hz]  [Mono]  [F32] [Dither:TPDF] [Idle:Silence] [DropOldest]</text>
+  <text x="602" y="172" fill="#4ADE80" font-family="Consolas, monospace" font-size="12" textLength="516" lengthAdjust="spacingAndGlyphs">Combine : CspaMixer (48kHz Stereo F32)  |  Targets: #0:WASAPI:Endpt, #1:WASAPI:Kernel</text>
   <text x="602" y="192" fill="#22D3EE" font-family="Consolas, monospace" font-size="12">Budgets : 3 str, 1152 KiB | SoftwareSummation (dup:0)</text>
   <line x1="602" y1="205" x2="1118" y2="205" stroke="#1E293B" stroke-width="1"/>
   <text x="602" y="224" fill="#E2E8F0" font-family="Consolas, monospace" font-size="12">Perm: Mic:OK* Sys:OK* Scr:--                      [Pol:AutoRq]</text>
