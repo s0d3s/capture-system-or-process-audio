@@ -5,7 +5,7 @@ description: Safe-Rust 1.88+ (#![forbid(unsafe_code)]) handbook for capture-syst
 
 import { Aside } from '@astrojs/starlight/components';
 
-The [`capture-system-or-process-audio`](https://crates.io/crates/capture-system-or-process-audio) crate (`MSRV 1.88+`) is a **`#![forbid(unsafe_code)]`** unified cross-platform facade. It binds the active OS backend (`WASAPI` on Windows, `PipeWire` & `PulseAudio` on Linux, `Core Audio` & `ScreenCaptureKit` on Apple Silicon macOS) via `#[repr(transparent)]` static dispatch in **one single place**, so your Rust crate never needs per-OS `#[cfg]` audio branches or `dyn` vtable overhead.
+The [`capture-system-or-process-audio`](https://crates.io/crates/capture-system-or-process-audio) crate (`MSRV 1.88+`) is a **`#![forbid(unsafe_code)]`** unified cross-platform facade. It binds the active OS backend (`WASAPI` on Windows, `PipeWire` & `PulseAudio` on Linux, `Core Audio` & `ScreenCaptureKit` on Apple Silicon & Intel macOS) via `#[repr(transparent)]` static dispatch in **one single place**, so your Rust crate never needs per-OS `#[cfg]` audio branches or `dyn` vtable overhead.
 
 ---
 

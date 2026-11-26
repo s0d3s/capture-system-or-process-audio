@@ -1,6 +1,6 @@
 ---
 title: Platform Backends & Capability Matrix
-description: Authoritative capability matrix for Windows WASAPI, Linux PipeWire/PulseAudio (dlopen), and Apple Silicon macOS Core Audio & ScreenCaptureKit.
+description: Authoritative capability matrix for Windows WASAPI, Linux PipeWire/PulseAudio (dlopen), and macOS (Apple Silicon & Intel) Core Audio & ScreenCaptureKit.
 ---
 
 import { Aside, TabItem } from '@astrojs/starlight/components';
@@ -16,7 +16,7 @@ import SdkTabs from '../../../components/SdkTabs.astro';
 | --- | --- | --- | --- | --- |
 | **Windows 10 / 11** (`x86_64`, `ARM64`) | `["wasapi"]` | ✅ Build `19041+` (`default_output` `Follow`/`Pin`, `device(id)`) | ✅ Build `20348+` (`ProcessScope::Tree`; `Exact` rejected) | ✅ Build `19041+` (`microphone` `Follow`/`Pin`, `input_device(id)`) |
 | **Linux** (`x86_64`, `aarch64`) | `["pipewire", "pulseaudio"]` | ✅ Sink monitor & live default-sink tracking | ✅ PipeWire virtual-sink fan-in (`Tree` & `Exact`) + PulseAudio per-stream `CspaMixer` | ✅ Physical/virtual sources (`.monitor` sinks excluded) |
-| **macOS** (`Apple Silicon arm64`) | `["coreaudio", "screencapturekit"]` *(SCK-first for `Exact` `Application`)* | ✅ `macOS 14.2+` Core Audio Process Taps | ✅ `macOS 14.2+` Core Audio Taps (`Tree` & `Exact`) + `macOS 13.0+` `ScreenCaptureKit` (`Application` `Exact`) | ✅ `macOS 13.0+` Core Audio HAL input (`AVMediaTypeAudio` TCC) |
+| **macOS** (`Apple Silicon arm64`, `Intel x86_64`) | `["coreaudio", "screencapturekit"]` *(SCK-first for `Exact` `Application`)* | ✅ `macOS 14.2+` Core Audio Process Taps | ✅ `macOS 14.2+` Core Audio Taps (`Tree` & `Exact`) + `macOS 13.0+` `ScreenCaptureKit` (`Application` `Exact`) | ✅ `macOS 13.0+` Core Audio HAL input (`AVMediaTypeAudio` TCC) |
 
 ---
 
@@ -43,9 +43,9 @@ import SdkTabs from '../../../components/SdkTabs.astro';
 
 ---
 
-## 4. macOS (`Apple Silicon arm64`) :badge[macOS 13.0+ / 14.2+]{variant=tip}
+## 4. macOS (`Apple Silicon & Intel`) :badge[macOS 13.0+ / 14.2+]{variant=tip}
 
-- **Architecture Requirement:** Targets Apple Silicon (`aarch64-apple-darwin`) exclusively; Intel `x86_64` macOS is explicitly unsupported.
+- **Supported Architectures:** Native prebuilt wheels, C/C++ FFI SDKs, and Cargo crates support both **Apple Silicon (`aarch64-apple-darwin`)** and **Intel (`x86_64-apple-darwin`)** Macs (prebuilt binary wheels target `macOS 14.0+`; building from source also supports `macOS 13.0+` for `ScreenCaptureKit` and HAL microphone input).
 - **Core Audio Process Taps (`coreaudio`, `macOS 14.2+`):**
   - Uses `CATapDescription` (`AudioHardwareCreateProcessTap`) for both system-output loopback and `Tree`/`Exact` process & application capture (`SharedNativeGraphMix` over `[parent_obj, child_obj]` `AudioObjectID` sets).
   - Validates `(pid, pbi_start_tvsec)` via `proc_pidinfo(PROC_PIDTBSDINFO)` to filter stale post-exit `AudioObjectID`s immediately after process termination.

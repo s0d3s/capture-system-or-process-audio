@@ -505,7 +505,7 @@ def build_rust_ref_pages(workspace_root: pathlib.Path) -> dict[str, str]:
         f'  <LinkCard title="capture_system_or_process_audio_core" description="Platform-agnostic traits, CspaMixer, OutputConverter, DiscoveryService, and SPSC pools." href="{RUSTDOC_BASE}/capture_system_or_process_audio_core/index.html" />',
         f'  <LinkCard title="capture_system_or_process_audio_windows" description="Windows 10/11 WASAPI eRender/eCapture & kernel process-tree loopback backend." href="{RUSTDOC_BASE}/capture_system_or_process_audio_windows/index.html" />',
         f'  <LinkCard title="capture_system_or_process_audio_linux" description="Linux runtime-dlopen PipeWire (0.3.65+) & PulseAudio (15.0+) backend." href="{RUSTDOC_BASE}/capture_system_or_process_audio_linux/index.html" />',
-        f'  <LinkCard title="capture_system_or_process_audio_macos" description="Apple Silicon macOS Core Audio Process Taps (14.2+), HAL input, & ScreenCaptureKit backend." href="{RUSTDOC_BASE}/capture_system_or_process_audio_macos/index.html" />',
+        f'  <LinkCard title="capture_system_or_process_audio_macos" description="macOS (Apple Silicon & Intel) Core Audio Process Taps (14.2+), HAL input, & ScreenCaptureKit backend." href="{RUSTDOC_BASE}/capture_system_or_process_audio_macos/index.html" />',
         "</CardGrid>\n",
         "---\n\n## Static-Dispatch Facade Type Aliases\n",
         "| Type Alias | Underlying Binding | Description |",

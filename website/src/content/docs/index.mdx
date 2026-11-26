@@ -1,6 +1,6 @@
 ---
 title: capture-system-or-process-audio
-description: Cross-platform system speaker loopback, single application/process, and microphone PCM audio capture & live mixer for Python, Rust, C++17, and C11.
+description: Cross-platform system speaker loopback, single app/process, and microphone PCM audio capture & live mixer for Python, Rust, C++17, and C11 on Windows, Linux, and macOS.
 template: splash
 editUrl: false
 ---
@@ -240,7 +240,7 @@ When a requested scope or capability is unsupported on the active OS or OS build
 | --- | --- | --- | --- | --- |
 | **Windows 10 / 11** (`x64`, `ARM64`) | `wasapi` | ✅ Build `19041+` (`Follow`/`Pin`, `device`) | ✅ Build `20348+` (`scope="tree"`; `exact` rejected explicitly) | ✅ Build `19041+` (`Follow`/`Pin`, `input_device`) |
 | **Linux** (`x86_64`, `aarch64`) | `pipewire` (`0.3.65+`), `pulseaudio` (`15.0+`) | ✅ Sink monitor & default sink tracking | ✅ PipeWire virtual-sink fan-in (`tree`/`exact`) & PulseAudio stream mix | ✅ Physical/virtual sources (`0` compile-time `NEEDED` links) |
-| **macOS** (`Apple Silicon arm64`) | `coreaudio`, `screencapturekit` | ✅ `macOS 14.2+` Core Audio Process Taps | ✅ `macOS 14.2+` Core Audio Taps (`tree`/`exact`) & `macOS 13.0+` SCK (`exact`) | ✅ `macOS 13.0+` Core Audio HAL input (`AVMediaTypeAudio`) |
+| **macOS** (`Apple Silicon arm64`, `Intel x86_64`) | `coreaudio`, `screencapturekit` | ✅ `macOS 14.2+` Core Audio Process Taps | ✅ `macOS 14.2+` Core Audio Taps (`tree`/`exact`) & `macOS 13.0+` SCK (`exact`) | ✅ `macOS 13.0+` Core Audio HAL input (`AVMediaTypeAudio`) |
 
 ---
 

@@ -47,7 +47,7 @@
 
 ## What Can You Capture?
 
-`capture-system-or-process-audio` (`pip install capture-system-or-process-audio` / `cargo add capture-system-or-process-audio`) is a cross-platform native audio capture and live-mixing engine for **Windows 10/11** (`WASAPI`), **Linux** (`PipeWire` & `PulseAudio`), and **Apple Silicon macOS** (`Core Audio Process Taps` & `ScreenCaptureKit`). Describe *what* audio you want, and receive decoded PCM frames ready for `NumPy`, `faster-whisper` / `Whisper` STT, `OpenAI Realtime` / `LiveKit` voice agents, `WebRTC`, `Tauri` / desktop apps, DSP, or file encoders — **without installing VB-Cable, BlackHole, or Soundflower**:
+`capture-system-or-process-audio` (`pip install capture-system-or-process-audio` / `cargo add capture-system-or-process-audio`) is a cross-platform native audio capture and live-mixing engine for **Windows 10/11** (`WASAPI`), **Linux** (`PipeWire` & `PulseAudio`), and **macOS** (`Core Audio Process Taps` & `ScreenCaptureKit` on Apple Silicon & Intel). Describe *what* audio you want, and receive decoded PCM frames ready for `NumPy`, `faster-whisper` / `Whisper` STT, `OpenAI Realtime` / `LiveKit` voice agents, `WebRTC`, `Tauri` / desktop apps, DSP, or file encoders — **without installing VB-Cable, BlackHole, or Soundflower**:
 
 - 🔊 **System / Speaker Loopback (`default_output`, `device`):** Capture audio playing on the user's speakers or headphones — automatically following OS default-device switches (`follow` default) or pinning a specific endpoint (`pin`).
 - 🎯 **Single Application or Process Tree (`find_app`, `process`):** Isolate audio from *just* `Zoom`, `Microsoft Teams`, `Google Meet` (browser), `Spotify`, `Firefox`, or a game (including helper child processes where supported) without recording Discord notifications or unrelated apps.
@@ -68,7 +68,7 @@
 
 ### 🐍 Python Quick Start
 
-Prebuilt binary wheels (`cp311-abi3`, `cp314t`, and PEP 803 `cp315-abi3.abi3t`) support **CPython `3.11`–`3.15`** plus **Free-Threaded Python `3.14t` & `3.15t` (`-Xgil=0`)** across Windows (`x64`/`ARM64`), Linux (`x86_64`/`aarch64` `manylinux_2_28`), and macOS (`arm64`) with zero mandatory runtime dependencies and complete `.pyi` type stubs.
+Prebuilt binary wheels (`cp311-abi3`, `cp314t`, and PEP 803 `cp315-abi3.abi3t`) support **CPython `3.11`–`3.15`** plus **Free-Threaded Python `3.14t` & `3.15t` (`-Xgil=0`)** across Windows (`x64`/`ARM64`), Linux (`x86_64`/`aarch64` `manylinux_2_28`), and macOS (`Apple Silicon arm64` & `Intel x86_64`) with zero mandatory runtime dependencies and complete `.pyi` type stubs.
 
 ```bash
 pip install capture-system-or-process-audio
@@ -436,7 +436,7 @@ Rather than piling fragile workarounds onto `PyAudioWPatch`, I spent **nearly a 
 | **First-Class SDKs** | **Python, Rust, C++17, C11** *(+ Node.js next)* | Python (Win) | Python | Rust | OS Driver |
 
 - **What about single-OS process-tap wrappers (`proc-tap`, `catap`, `flexaudio`) or `Electron desktopCapturer`?** Single-platform and prototype wrappers lack unified Windows + PipeWire/PulseAudio + macOS Core Audio/ScreenCaptureKit coverage, cross-clock `[Microphone + App]` drift compensation, live target hot-swap, and free-threaded `3.14t`/`3.15t` zero-allocation `read_into` — while `Electron desktopCapturer` bundles heavyweight video capture pipelines without per-process isolation on Windows/Linux.
-- 📊 **Upcoming Cross-Platform Statistical Benchmarks:** A standalone, reproducible cross-platform latency, tail-jitter (`p50`/`p95`), and zero-allocation benchmark suite comparing `capture-system-or-process-audio` head-to-head against existing audio capture libraries across **Windows 11 (`WASAPI`)**, **Linux (`PipeWire` & standalone `PulseAudio`)**, and **Apple Silicon macOS (`Core Audio Taps` & `ScreenCaptureKit`)** will be published shortly.
+- 📊 **Upcoming Cross-Platform Statistical Benchmarks:** A standalone, reproducible cross-platform latency, tail-jitter (`p50`/`p95`), and zero-allocation benchmark suite comparing `capture-system-or-process-audio` head-to-head against existing audio capture libraries across **Windows 11 (`WASAPI`)**, **Linux (`PipeWire` & standalone `PulseAudio`)**, and **macOS (`Core Audio Taps` & `ScreenCaptureKit`)** will be published shortly.
 
 > 📖 **Migrating from `PyAudioWPatch`?** See the [Side-by-Side `PyAudioWPatch` Migration Guide](https://s0d3s.github.io/capture-system-or-process-audio/sdks/python/#3-migrating-from-pyaudiowpatch) in the Python SDK Handbook.
 
@@ -450,7 +450,7 @@ Capabilities differ across operating systems. **Core invariant:** When a request
 | --- | --- | --- | --- | --- | --- |
 | **Windows 10 / 11** (`x86_64`, `ARM64`) | `wasapi` | ✅ Build `19041+` (`default_output` `Follow`/`Pin`, `device(id)`) | ✅ Build `20348+` (`process` & `application`, `scope="tree"`) | ✅ Build `19041+` (`microphone` `Follow`/`Pin`, `input_device(id)`) | `scope="exact"` rejects explicitly (WASAPI process loopback is kernel tree-scoped). |
 | **Linux** (`x86_64`, `aarch64`) | `pipewire` (`0.3.65+`), `pulseaudio` (`15.0+`) | ✅ Sink monitor & default sink tracking | ✅ PipeWire virtual-sink fan-in (`tree`/`exact`) & PulseAudio per-stream mix | ✅ Physical/virtual sources (`.monitor` sinks excluded) | `libpipewire-0.3.so.0` & `libpulse.so.0` load via runtime `dlopen` (**`0` compile-time `NEEDED` links**). |
-| **macOS** (`Apple Silicon arm64`) | `coreaudio`, `screencapturekit` | ✅ `macOS 14.2+` Core Audio Process Taps | ✅ `macOS 14.2+` Core Audio Taps (`tree`/`exact`) & `macOS 13.0+` ScreenCaptureKit (`application`, `scope="exact"`) | ✅ `macOS 13.0+` Core Audio HAL input (`AVMediaTypeAudio` TCC) | Supports cross-backend `[ScreenCaptureKit + CoreAudio]` mixing. Intel macOS (`x86_64`) is rejected explicitly. |
+| **macOS** (`Apple Silicon arm64`, `Intel x86_64`) | `coreaudio`, `screencapturekit` | ✅ `macOS 14.2+` Core Audio Process Taps | ✅ `macOS 14.2+` Core Audio Taps (`tree`/`exact`) & `macOS 13.0+` ScreenCaptureKit (`application`, `scope="exact"`) | ✅ `macOS 13.0+` Core Audio HAL input (`AVMediaTypeAudio` TCC) | Supports cross-backend `[ScreenCaptureKit + CoreAudio]` mixing. SCK `scope="tree"` rejects explicitly (use `coreaudio` for process trees). |
 
 ---
 

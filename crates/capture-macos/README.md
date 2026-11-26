@@ -5,7 +5,7 @@
 > **Looking to capture system, application, or microphone audio in Rust?**
 > Depend on the unified safe-Rust facade crate **[`capture-system-or-process-audio`](https://crates.io/crates/capture-system-or-process-audio)** instead of importing this internal macOS backend crate directly.
 
-`capture-system-or-process-audio-macos` implements the Apple Silicon (`aarch64-apple-darwin`) backend (`PlatformStream`, `PlatformDiscovery`, `PlatformManager`, `PlatformPermissions`, `PlatformDefaultOutputObserver`, `PlatformDefaultInputObserver`, and `PlatformTopologyController`) for `capture-system-or-process-audio`:
+`capture-system-or-process-audio-macos` implements the macOS (`aarch64-apple-darwin` Apple Silicon and `x86_64-apple-darwin` Intel) backend (`PlatformStream`, `PlatformDiscovery`, `PlatformManager`, `PlatformPermissions`, `PlatformDefaultOutputObserver`, `PlatformDefaultInputObserver`, and `PlatformTopologyController`) for `capture-system-or-process-audio`:
 
 - **Core Audio Process Taps (`"coreaudio"`, macOS `14.2+`):** Supports `SharedNativeGraphMix` (`PlatformTopologyController` + `[parent, child]` explicit `AudioObjectID` set union), `device(id)`, and `default_output()` (`Follow` vs `Pin`).
 - **Core Audio HAL Input (`"coreaudio"`, macOS `13.0+`):** Supports `microphone()` (`Follow` vs `Pin`) and `input_device(id)` with `AVMediaTypeAudio` TCC inspection/prompts, bundled `Info.plist` `SIGABRT` protection, and strict input/output direction isolation.

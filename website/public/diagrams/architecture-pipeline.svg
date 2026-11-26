@@ -37,7 +37,7 @@
   <text x="156" y="286" text-anchor="middle" fill="#34D399" font-family="Consolas, monospace" font-size="10">Virtual Sink Fan-In + Monitor</text>
 
   <rect x="54" y="308" width="204" height="68" rx="8" fill="#13213B" stroke="#1E3A5F"/>
-  <text x="156" y="332" text-anchor="middle" fill="#F1F5F9" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">macOS Apple Silicon</text>
+  <text x="156" y="332" text-anchor="middle" fill="#F1F5F9" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700">macOS (arm64 · x86_64)</text>
   <text x="156" y="352" text-anchor="middle" fill="#94A3B8" font-family="Consolas, monospace" font-size="11">Core Audio Taps · SCK · HAL</text>
   <text x="156" y="368" text-anchor="middle" fill="#38BDF8" font-family="Consolas, monospace" font-size="10">Info.plist SIGABRT Guard</text>
 

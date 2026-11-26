@@ -2,7 +2,7 @@
 
 ![capture-system-or-process-audio](https://raw.githubusercontent.com/s0d3s/capture-system-or-process-audio/main/assets/repo_banner.svg)
 
-First-class **C11 ABI** (`include/cspa_experimental.h`, `CSPA_EXPERIMENTAL_ABI_MAJOR = 0`, `CSPA_EXPERIMENTAL_SCHEMA_REVISION = 1`) and **header-only C++17 RAII wrapper** (`include/cspa.hpp`, namespace `cspa`) built directly on top of the unified cross-platform Rust facade (`capture-system-or-process-audio`) across **Windows (`x64`, `ARM64`)**, **Linux (`x86_64`, `aarch64`)**, and **Apple Silicon macOS (`arm64`)**.
+First-class **C11 ABI** (`include/cspa_experimental.h`, `CSPA_EXPERIMENTAL_ABI_MAJOR = 0`, `CSPA_EXPERIMENTAL_SCHEMA_REVISION = 1`) and **header-only C++17 RAII wrapper** (`include/cspa.hpp`, namespace `cspa`) built directly on top of the unified cross-platform Rust facade (`capture-system-or-process-audio`) across **Windows (`x64`, `ARM64`)**, **Linux (`x86_64`, `aarch64`)**, and **macOS (`Apple Silicon arm64`, `Intel x86_64`)**.
 
 - **Zero Per-OS `#ifdef` Glue:** Identical C11 and C++17 API across WASAPI, PipeWire/PulseAudio, and Core Audio/ScreenCaptureKit.
 - **Panic-Safe & Version-Checked ABI:** Every exported C symbol enforces `catch_unwind` at the FFI boundary and validates `struct_size` + `schema_revision` (`cspa_abi_check`).
@@ -322,7 +322,7 @@ int main(void) {
 
 - **Windows (`x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`):** Ensure `bin/cspa_ffi.dll` is placed in the executable directory or on `PATH` (handled automatically by the `POST_BUILD` CMake rule above).
 - **Linux (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`):** `libcspa_ffi.so` has **`0` compile-time `NEEDED` links** to `libpipewire` or `libpulse`; system `libpipewire-0.3.so.0` (`>= 0.3.65`) and `libpulse.so.0` (`>= 15.0`) are loaded dynamically via `dlopen` at runtime.
-- **macOS (`aarch64-apple-darwin`):** When embedding inside a `.app` bundle, include `NSMicrophoneUsageDescription` (for microphone inputs) and `NSAudioCaptureUsageDescription` (for Core Audio taps on macOS `14.2+`) in your app's `Info.plist`. Missing usage keys are safely detected and reported as `CSPA_STATUS_PERMISSION_DENIED` without triggering TCC `SIGABRT`.
+- **macOS (`aarch64-apple-darwin`, `x86_64-apple-darwin`):** When embedding inside a `.app` bundle, include `NSMicrophoneUsageDescription` (for microphone inputs) and `NSAudioCaptureUsageDescription` (for Core Audio taps on macOS `14.2+`) in your app's `Info.plist`. Missing usage keys are safely detected and reported as `CSPA_STATUS_PERMISSION_DENIED` without triggering TCC `SIGABRT`.
 
 ---
 

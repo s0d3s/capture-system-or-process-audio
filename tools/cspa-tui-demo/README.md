@@ -10,7 +10,7 @@ Interactive terminal audio capture, multi-source live mixer, OS recording-permis
 
 ### 1. Prebuilt Standalone Binary *(No Rust Toolchain Required)*
 
-Download `cspa-tui-demo-<version>-<target>.zip` (Windows `x64`/`ARM64`) or `.tar.gz` (Linux `x86_64`/`aarch64`, macOS `arm64`) from [GitHub Releases](https://github.com/s0d3s/capture-system-or-process-audio/releases/latest) and run it in any truecolor terminal (`100x36` or larger recommended):
+Download `cspa-tui-demo-<version>-<target>.zip` (Windows `x64`/`ARM64`) or `.tar.gz` (Linux `x86_64`/`aarch64`, macOS `arm64`/`x86_64`) from [GitHub Releases](https://github.com/s0d3s/capture-system-or-process-audio/releases/latest) and run it in any truecolor terminal (`100x36` or larger recommended):
 
 ```bash
 # Linux / macOS:

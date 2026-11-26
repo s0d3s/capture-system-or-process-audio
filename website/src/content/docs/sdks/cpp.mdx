@@ -5,7 +5,7 @@ description: Complete C++17 developer handbook for cspa.hpp and Cspa::cspa_ffi C
 
 import { Aside, FileTree, Steps } from '@astrojs/starlight/components';
 
-`include/cspa.hpp` is a **zero-`#ifdef`-per-OS header-only C++17 RAII wrapper** layered over the version-checked C11 ABI (`cspa_ffi`). It delivers move-only RAII handles (`cspa::ManagedStream`, `cspa::AudioStream`, `cspa::Discovery`, `cspa::DiscoverySubscription`, `cspa::PcmBlock`, `cspa::CancelToken`) across **Windows (`x64`, `ARM64`)**, **Linux (`x86_64`, `aarch64`)**, and **Apple Silicon macOS (`arm64`)**.
+`include/cspa.hpp` is a **zero-`#ifdef`-per-OS header-only C++17 RAII wrapper** layered over the version-checked C11 ABI (`cspa_ffi`). It delivers move-only RAII handles (`cspa::ManagedStream`, `cspa::AudioStream`, `cspa::Discovery`, `cspa::DiscoverySubscription`, `cspa::PcmBlock`, `cspa::CancelToken`) across **Windows (`x64`, `ARM64`)**, **Linux (`x86_64`, `aarch64`)**, and **macOS (`Apple Silicon arm64`, `Intel x86_64`)**.
 
 ---
 
@@ -62,7 +62,7 @@ Download `cspa-ffi-<version>-<target>.zip` (Windows) or `.tar.gz` (Linux / macOS
    cmake -S . -B build -A x64 -DCspa_DIR="C:/sdk/cspa-ffi/lib/cmake/Cspa"
    cmake --build build --config Release
 
-   # Linux & Apple Silicon macOS:
+   # Linux & macOS (arm64 or x86_64):
    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCspa_DIR="/opt/cspa-ffi/lib/cmake/Cspa"
    cmake --build build
    ```

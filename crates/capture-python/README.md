@@ -27,7 +27,7 @@
 
 ## Installation
 
-Prebuilt binary wheels (`cp311-abi3`, `cp314-cp314t`, and PEP 803 `cp315-abi3.abi3t`) ship for **Windows (`x64`, `ARM64`)**, **Linux (`x86_64`, `aarch64` `manylinux_2_28`)**, and **Apple Silicon macOS (`arm64`)** — **no Rust or C compiler required**.
+Prebuilt binary wheels (`cp311-abi3`, `cp314-cp314t`, and PEP 803 `cp315-abi3.abi3t`) ship for **Windows (`x64`, `ARM64`)**, **Linux (`x86_64`, `aarch64` `manylinux_2_28`)**, and **macOS (`Apple Silicon arm64`, `Intel x86_64`)** — **no Rust or C compiler required**.
 
 ```bash
 pip install capture-system-or-process-audio
@@ -158,7 +158,7 @@ asyncio.run(main())
 | Resample to `16 kHz` mono `i16`/`f32` | Manual external resampler | `output_converter=cspa.OutputConverter(rate=16000, channels=1, sample_format="i16")` |
 | Zero-copy NumPy array | `np.frombuffer(data, dtype=...)` | `block.to_numpy(copy=False)` -> `(frames, channels)` |
 
-> **Planned for Next Release — Zero-Rewrite Drop-In `Adapters`:** Upcoming compatibility wrappers for **`PyAudio` / `PyAudioWPatch`** (`Stream.read` & `stream_callback`), **`python-sounddevice`** (`InputStream`, `RawInputStream`, `rec`), **`SoundCard`** (`_Recorder`), **`SpeechRecognition`** (`AudioSource`), and **`faster-whisper`** sliding-window streams will let existing Python audio code switch to per-process or cross-platform loopback with a 1-line import swap. Follow progress on [GitHub](https://github.com/s0d3s/capture-system-or-process-audio#adapters-and-nodejs-roadmap).
+> **Planned for Next Release — Zero-Rewrite Drop-In `Adapters`:** Upcoming compatibility wrappers for **`PyAudio` / `PyAudioWPatch`** (`Stream.read` & `stream_callback`), **`python-sounddevice`** (`InputStream`, `RawInputStream`, `rec`), **`SoundCard`** (`_Recorder`), **`SpeechRecognition`** (`AudioSource`), and **`faster-whisper`** sliding-window streams will let existing Python audio code switch to per-process or cross-platform loopback with a 1-line import swap. Follow progress on [GitHub](https://github.com/s0d3s/capture-system-or-process-audio#drop-in-ecosystem-adapters--nodejs-sdk-planned--next-release).
 
 ---
 
@@ -195,7 +195,7 @@ Capabilities differ across operating systems. Unsupported scopes or OS versions 
 | --- | --- | --- | --- |
 | **Windows 10 / 11** (`x86_64`, `ARM64`) | `[BackendId.WASAPI]` | `default_output` & `microphone` (`follow`/`pin`), `device(id)` & `input_device(id)` (`>= 19041`); `process`/`application` `scope="tree"` (`>= 20348`) and `cspa_mixer`. | `scope="exact"` and uncalibrated `timing="precise"` reject explicitly. |
 | **Linux** (`x86_64`, `aarch64`) | `[BackendId.PIPEWIRE, BackendId.PULSEAUDIO]` (runtime `dlopen` of `libpipewire-0.3.so.0 >= 0.3.65` & `libpulse.so.0 >= 15.0`, `0` compile-time `NEEDED` links) | PipeWire & PulseAudio output endpoints, microphones (`.monitor` sinks excluded), PipeWire `native_graph_mix` fan-in, PulseAudio per-stream `cspa_mixer`, and cross-backend `[pipewire + pulseaudio]` `cspa_mixer`. | `native_kernel_capture` for `process`/`application` and uncalibrated `timing="precise"` reject explicitly. |
-| **macOS** (`Apple Silicon arm64`) | `[BackendId.COREAUDIO, BackendId.SCREENCAPTUREKIT]` | Core Audio Process Taps (`macOS 14.2+`), Core Audio HAL microphone input (`macOS 13.0+`), ScreenCaptureKit `application` (`scope="exact"`, `macOS 13.0+`), and cross-backend `[screencapturekit + coreaudio]` `cspa_mixer`. | Intel macOS (`x86_64`), SCK `scope="tree"`, and uncalibrated `timing="precise"` reject explicitly. |
+| **macOS** (`Apple Silicon arm64`, `Intel x86_64`) | `[BackendId.COREAUDIO, BackendId.SCREENCAPTUREKIT]` | Core Audio Process Taps (`macOS 14.2+`), Core Audio HAL microphone input (`macOS 13.0+`), ScreenCaptureKit `application` (`scope="exact"`, `macOS 13.0+`), and cross-backend `[screencapturekit + coreaudio]` `cspa_mixer`. | SCK `scope="tree"` and uncalibrated `timing="precise"` reject explicitly. |
 
 ---
 

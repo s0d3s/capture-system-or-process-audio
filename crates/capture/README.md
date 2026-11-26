@@ -207,7 +207,7 @@ Unsupported scopes or OS versions fail explicitly with `CapabilityError` — nev
 | --- | --- | --- | --- |
 | **Windows 10 / 11** (`x86_64`, `aarch64`) | `capture-system-or-process-audio-windows` (`WASAPI`) | `default_output` & `microphone` (`Follow`/`Pin`), `device` & `input_device` (`>= 19041`); `process` & `application` `ProcessScope::Tree` (`>= 20348`). | `ProcessScope::Exact` rejects explicitly (`CapabilityError::UnsupportedScope`). |
 | **Linux** (`x86_64`, `aarch64`) | `capture-system-or-process-audio-linux` (`PipeWire` `0.3.65+`, `PulseAudio` `15.0+`) | Output endpoints, microphones (`.monitor` sinks excluded), PipeWire `SharedNativeGraphMix` virtual-sink fan-in, PulseAudio per-stream `CspaMixer`, and `[PipeWire + PulseAudio]` cross-backend mixing. | Loads `libpipewire-0.3.so.0` & `libpulse.so.0` via `dlopen` (**`0` compile-time `NEEDED` links**). |
-| **macOS** (`aarch64-apple-darwin`) | `capture-system-or-process-audio-macos` (`Core Audio`, `ScreenCaptureKit`) | Core Audio Process Taps (`macOS 14.2+`), Core Audio HAL microphone input (`macOS 13.0+`), ScreenCaptureKit `application` (`ProcessScope::Exact`, `macOS 13.0+`), and `[SCK + CoreAudio]` cross-backend mixing. | Intel macOS (`x86_64`) and SCK `ProcessScope::Tree` reject explicitly. |
+| **macOS** (`aarch64`, `x86_64`) | `capture-system-or-process-audio-macos` (`Core Audio`, `ScreenCaptureKit`) | Core Audio Process Taps (`macOS 14.2+`), Core Audio HAL microphone input (`macOS 13.0+`), ScreenCaptureKit `application` (`ProcessScope::Exact`, `macOS 13.0+`), and `[SCK + CoreAudio]` cross-backend mixing. | SCK `ProcessScope::Tree` rejects explicitly (`CapabilityError::UnsupportedScope`). |
 
 ---
 

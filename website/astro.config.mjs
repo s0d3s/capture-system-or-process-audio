@@ -79,7 +79,7 @@ export default defineConfig({
         starlightLlmsTxt({
           projectName: 'capture-system-or-process-audio',
           description:
-            'Cross-platform native system speaker loopback, single application/process, and microphone PCM audio capture & live mixer for Python (3.11-3.15t), Rust (1.88+), C++17, and C11 across Windows (WASAPI), Linux (PipeWire & PulseAudio), and Apple Silicon macOS (Core Audio Process Taps & ScreenCaptureKit).',
+            'Cross-platform native system speaker loopback, single application/process, and microphone PCM audio capture & live mixer for Python (3.11-3.15t), Rust (1.88+), C++17, and C11 across Windows (WASAPI), Linux (PipeWire & PulseAudio), and macOS (Apple Silicon & Intel — Core Audio Process Taps & ScreenCaptureKit).',
           details: [
             '- Architecture invariant: Backends capture. Core orders and buffers. Manager plans, monitors, mixes and reopens sessions. Adapters adapt.',
             '- Zero virtual audio cables required (no VB-Cable, BlackHole, or Soundflower).',
