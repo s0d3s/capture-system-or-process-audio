@@ -1228,66 +1228,68 @@ int cspa_mac_create_test_virtual_mic(uint32_t target_pid,
     @autoreleasepool {
         if (!uid_cstr || uid_cstr[0] == '\0' || !out_handle || target_pid == 0) return -1;
         *out_handle = NULL;
-
-        uint32_t proc_obj = 0;
-        if (cspa_mac_translate_pid_to_process_object(target_pid, &proc_obj) != 0 || proc_obj == 0) {
-            return -2;
-        }
-
-        AudioObjectID def_out = 0;
-        UInt32 dsz = sizeof(def_out);
-        NSString *out_uid = nil;
-        if (cspa_get_prop(kAudioObjectSystemObject, kAudioHardwarePropertyDefaultOutputDevice,
-                          kAudioObjectPropertyScopeGlobal, &dsz, &def_out) == noErr && def_out != 0) {
-            CFStringRef uid_ref = NULL;
-            UInt32 usz = sizeof(uid_ref);
-            if (cspa_get_prop(def_out, kAudioDevicePropertyDeviceUID,
-                              kAudioObjectPropertyScopeGlobal, &usz, &uid_ref) == noErr && uid_ref) {
-                out_uid = (__bridge_transfer NSString *)uid_ref;
+        if (@available(macOS 14.2, *)) {
+            uint32_t proc_obj = 0;
+            if (cspa_mac_translate_pid_to_process_object(target_pid, &proc_obj) != 0 || proc_obj == 0) {
+                return -2;
             }
-        }
 
-        CATapDescription *desc = nil;
-        if (mono != 0) {
-            desc = [[CATapDescription alloc] initMonoMixdownOfProcesses:@[@(proc_obj)]];
-        } else if (out_uid && out_uid.length > 0) {
-            desc = [[CATapDescription alloc] initWithProcesses:@[@(proc_obj)] andDeviceUID:out_uid withStream:0];
-        } else {
-            desc = [[CATapDescription alloc] initStereoMixdownOfProcesses:@[@(proc_obj)]];
-        }
-        if (!desc) return -3;
-        desc.exclusive = NO;
-        desc.privateTap = NO;
-        desc.muteBehavior = CATapUnmuted;
-        desc.name = @"CSPA Synthetic Virtual Mic Tap";
+            AudioObjectID def_out = 0;
+            UInt32 dsz = sizeof(def_out);
+            NSString *out_uid = nil;
+            if (cspa_get_prop(kAudioObjectSystemObject, kAudioHardwarePropertyDefaultOutputDevice,
+                              kAudioObjectPropertyScopeGlobal, &dsz, &def_out) == noErr && def_out != 0) {
+                CFStringRef uid_ref = NULL;
+                UInt32 usz = sizeof(uid_ref);
+                if (cspa_get_prop(def_out, kAudioDevicePropertyDeviceUID,
+                                  kAudioObjectPropertyScopeGlobal, &usz, &uid_ref) == noErr && uid_ref) {
+                    out_uid = (__bridge_transfer NSString *)uid_ref;
+                }
+            }
 
-        AudioObjectID tap = 0;
-        if (AudioHardwareCreateProcessTap(desc, &tap) != noErr || tap == 0) {
-            return -4;
-        }
+            CATapDescription *desc = nil;
+            if (mono != 0) {
+                desc = [[CATapDescription alloc] initMonoMixdownOfProcesses:@[@(proc_obj)]];
+            } else if (out_uid && out_uid.length > 0) {
+                desc = [[CATapDescription alloc] initWithProcesses:@[@(proc_obj)] andDeviceUID:out_uid withStream:0];
+            } else {
+                desc = [[CATapDescription alloc] initStereoMixdownOfProcesses:@[@(proc_obj)]];
+            }
+            if (!desc) return -3;
+            desc.exclusive = NO;
+            desc.privateTap = NO;
+            desc.muteBehavior = CATapUnmuted;
+            desc.name = @"CSPA Synthetic Virtual Mic Tap";
 
-        NSString *virt_uid = [NSString stringWithUTF8String:uid_cstr];
-        NSDictionary *agg_props = @{
-            @kAudioAggregateDeviceNameKey: [NSString stringWithFormat:@"CSPA Virtual Mic (%@)", virt_uid],
-            @kAudioAggregateDeviceUIDKey: virt_uid,
-            @kAudioAggregateDeviceIsPrivateKey: @NO,
-            @kAudioAggregateDeviceTapAutoStartKey: @YES,
-            @kAudioAggregateDeviceTapListKey: @[@{
-                @kAudioSubTapUIDKey: [desc.UUID UUIDString],
-                @kAudioSubTapDriftCompensationKey: @NO
-            }]
-        };
-        AudioObjectID agg = 0;
-        if (AudioHardwareCreateAggregateDevice((__bridge CFDictionaryRef)agg_props, &agg) != noErr || agg == 0) {
-            AudioHardwareDestroyProcessTap(tap);
-            return -5;
-        }
+            AudioObjectID tap = 0;
+            if (AudioHardwareCreateProcessTap(desc, &tap) != noErr || tap == 0) {
+                return -4;
+            }
 
-        CspaTestVirtualMic *vm = (CspaTestVirtualMic *)calloc(1, sizeof(CspaTestVirtualMic));
-        vm->tap = tap;
-        vm->aggregate = agg;
-        *out_handle = vm;
-        return 0;
+            NSString *virt_uid = [NSString stringWithUTF8String:uid_cstr];
+            NSDictionary *agg_props = @{
+                @kAudioAggregateDeviceNameKey: [NSString stringWithFormat:@"CSPA Virtual Mic (%@)", virt_uid],
+                @kAudioAggregateDeviceUIDKey: virt_uid,
+                @kAudioAggregateDeviceIsPrivateKey: @NO,
+                @kAudioAggregateDeviceTapAutoStartKey: @YES,
+                @kAudioAggregateDeviceTapListKey: @[@{
+                    @kAudioSubTapUIDKey: [desc.UUID UUIDString],
+                    @kAudioSubTapDriftCompensationKey: @NO
+                }]
+            };
+            AudioObjectID agg = 0;
+            if (AudioHardwareCreateAggregateDevice((__bridge CFDictionaryRef)agg_props, &agg) != noErr || agg == 0) {
+                AudioHardwareDestroyProcessTap(tap);
+                return -5;
+            }
+
+            CspaTestVirtualMic *vm = (CspaTestVirtualMic *)calloc(1, sizeof(CspaTestVirtualMic));
+            vm->tap = tap;
+            vm->aggregate = agg;
+            *out_handle = vm;
+            return 0;
+        }
+        return -12;
     }
 }
 
@@ -1301,7 +1303,9 @@ int cspa_mac_destroy_test_virtual_mic(void *handle) {
             vm->aggregate = 0;
         }
         if (vm->tap) {
-            if (AudioHardwareDestroyProcessTap(vm->tap) != noErr) rc = -2;
+            if (@available(macOS 14.2, *)) {
+                if (AudioHardwareDestroyProcessTap(vm->tap) != noErr) rc = -2;
+            }
             vm->tap = 0;
         }
         free(vm);

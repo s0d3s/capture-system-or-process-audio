@@ -2,7 +2,7 @@ import os, pathlib, shutil, subprocess, tarfile, tempfile, textwrap, zipfile
 
 from cmake_version import generate_cmake_version
 from config import PYTHON_SPECS, ROOT_LICENSE_FILES
-from consumer_smoke import run_packaged_consumers
+from consumer_smoke import cmake_configure_args, run_packaged_consumers
 from python_wheels import build_release_wheels, smoke_cases
 
 root = pathlib.Path(".").resolve()
@@ -215,18 +215,13 @@ with tempfile.TemporaryDirectory(prefix="cspa-ffi-stage-") as tmp_ffi_str:
         encoding="utf-8",
     )
     cmake_build = tmp_ffi / "cmake-build"
-    cfg_cmd = [
-        "cmake",
-        "-S",
-        str(consumer_src),
-        "-B",
-        str(cmake_build),
-        f"-DCspa_DIR={(pkg_stage / 'lib/cmake/Cspa').as_posix()}",
-    ]
-    if platform == "windows" and cmake_arch:
-        cfg_cmd.extend(["-A", cmake_arch])
-    else:
-        cfg_cmd.append("-DCMAKE_BUILD_TYPE=Release")
+    cfg_cmd = cmake_configure_args(
+        consumer_src,
+        cmake_build,
+        pkg_stage / "lib/cmake/Cspa",
+        platform,
+        cmake_arch,
+    )
     subprocess.run(cfg_cmd, check=True)
     subprocess.run(["cmake", "--build", str(cmake_build), "--config", "Release"], check=True)
 

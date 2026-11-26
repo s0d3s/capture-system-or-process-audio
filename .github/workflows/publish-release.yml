@@ -204,6 +204,7 @@ jobs:
           BACKEND_MANIFEST: ${{ matrix.backend_crate }}
           MATRIX_PLATFORM: ${{ matrix.platform }}
           MACOSX_DEPLOYMENT_TARGET: "14.0"
+          CSPA_DISABLE_TCC_PROMPT: "1"
         run: |
           set -euo pipefail
           cargo clippy --locked --manifest-path crates/capture-core/Cargo.toml --target "$RUST_TARGET" --features test-hooks --all-targets -- -D warnings
@@ -233,6 +234,7 @@ jobs:
           MATRIX_PLATFORM: ${{ matrix.platform }}
           CMAKE_ARCH: ${{ matrix.cmake_arch }}
           MACOSX_DEPLOYMENT_TARGET: "14.0"
+          CSPA_DISABLE_TCC_PROMPT: "1"
           HOST_PYTHON: ${{ needs.preflight.outputs.host_python }}
         run: |
           set -euo pipefail

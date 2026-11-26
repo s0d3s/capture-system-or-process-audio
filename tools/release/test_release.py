@@ -12,7 +12,7 @@ from unittest import mock
 
 from cmake_version import generate_cmake_version
 from config import DEFAULT_RETENTION_DAYS, HOST_PYTHON, PUBLISHED_CRATES, PYTHON_SPECS, PYTHON_WHEELS, RELEASE_CARGO_MANIFESTS, ROOT_LICENSE_FILES, TARGETS, WHEEL_TAGS, matrix_json
-from consumer_smoke import run_packaged_consumers
+from consumer_smoke import cmake_configure_args, run_packaged_consumers
 from python_wheels import build_release_wheels, build_wheels, smoke_cases
 
 SCRIPTS = pathlib.Path(__file__).resolve().parent
@@ -57,6 +57,80 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(json.loads(matrix_json())["include"], list(TARGETS))
         self.assertEqual(len({target["target"] for target in TARGETS}), len(TARGETS))
         self.assertEqual(len({target["label"] for target in TARGETS}), len(TARGETS))
+
+    def test_macos_targets_and_docs_rs_parity(self):
+        repository = SCRIPTS.parent.parent
+        by_label = {target["label"]: target for target in TARGETS}
+        self.assertEqual(
+            by_label["macos-aarch64"],
+            {
+                "label": "macos-aarch64",
+                "runner": "macos-15",
+                "target": "aarch64-apple-darwin",
+                "platform": "macos",
+                "backend_crate": "crates/capture-macos/Cargo.toml",
+                "cmake_arch": "arm64",
+            },
+        )
+        self.assertEqual(
+            by_label["macos-x86_64"],
+            {
+                "label": "macos-x86_64",
+                "runner": "macos-15-intel",
+                "target": "x86_64-apple-darwin",
+                "platform": "macos",
+                "backend_crate": "crates/capture-macos/Cargo.toml",
+                "cmake_arch": "x86_64",
+            },
+        )
+
+        facade_docs = tomllib.loads(
+            (repository / "crates/capture/Cargo.toml").read_text(encoding="utf-8")
+        )["package"]["metadata"]["docs"]["rs"]["targets"]
+        self.assertEqual(set(facade_docs), {target["target"] for target in TARGETS})
+
+        for target in TARGETS:
+            backend_docs = tomllib.loads(
+                (repository / target["backend_crate"]).read_text(encoding="utf-8")
+            )["package"]["metadata"]["docs"]["rs"]["targets"]
+            self.assertIn(target["target"], backend_docs)
+
+        build_rs = (repository / "crates/capture-macos/build.rs").read_text(encoding="utf-8")
+        self.assertIn('"aarch64" => "arm64"', build_rs)
+        self.assertIn('"x86_64" => "x86_64"', build_rs)
+        self.assertIn('"-arch"', build_rs)
+        self.assertIn("-mmacosx-version-min=", build_rs)
+        self.assertIn("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET", build_rs)
+
+        workflow = (repository / ".github/workflows/publish-release.yml").read_text(encoding="utf-8")
+        self.assertEqual(workflow.count('MACOSX_DEPLOYMENT_TARGET: "14.0"'), 2)
+        self.assertEqual(workflow.count('CSPA_DISABLE_TCC_PROMPT: "1"'), 2)
+
+    def test_cmake_configure_args_selects_platform_architecture(self):
+        src = self.root / "src"
+        bld = self.root / "build"
+        cspa_dir = self.root / "pkg/lib/cmake/Cspa"
+        self.assertEqual(
+            cmake_configure_args(src, bld, cspa_dir, "windows", "ARM64"),
+            ["cmake", "-S", str(src), "-B", str(bld), f"-DCspa_DIR={cspa_dir.as_posix()}", "-A", "ARM64"],
+        )
+        self.assertEqual(
+            cmake_configure_args(src, bld, cspa_dir, "macos", "x86_64"),
+            [
+                "cmake",
+                "-S",
+                str(src),
+                "-B",
+                str(bld),
+                f"-DCspa_DIR={cspa_dir.as_posix()}",
+                "-DCMAKE_BUILD_TYPE=Release",
+                "-DCMAKE_OSX_ARCHITECTURES=x86_64",
+            ],
+        )
+        self.assertEqual(
+            cmake_configure_args(src, bld, cspa_dir, "linux", ""),
+            ["cmake", "-S", str(src), "-B", str(bld), f"-DCspa_DIR={cspa_dir.as_posix()}", "-DCMAKE_BUILD_TYPE=Release"],
+        )
 
     def test_python_wheel_configuration(self):
         self.assertEqual(len(WHEEL_TAGS), len(set(WHEEL_TAGS)))

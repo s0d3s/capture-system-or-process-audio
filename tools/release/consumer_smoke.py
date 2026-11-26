@@ -3,6 +3,24 @@ import shutil
 import subprocess
 
 
+def cmake_configure_args(consumer_src, cmake_build, cspa_dir, platform, cmake_arch=""):
+    args = [
+        "cmake",
+        "-S",
+        str(consumer_src),
+        "-B",
+        str(cmake_build),
+        f"-DCspa_DIR={cspa_dir.as_posix()}",
+    ]
+    if platform == "windows" and cmake_arch:
+        args.extend(["-A", cmake_arch])
+    else:
+        args.append("-DCMAKE_BUILD_TYPE=Release")
+        if platform == "macos" and cmake_arch:
+            args.append(f"-DCMAKE_OSX_ARCHITECTURES={cmake_arch}")
+    return args
+
+
 def run_packaged_consumers(platform, build_dir, package_dir):
     environment = os.environ.copy()
     if platform == "windows":

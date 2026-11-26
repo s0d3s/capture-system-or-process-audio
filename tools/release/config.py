@@ -49,7 +49,8 @@ RELEASE_CARGO_MANIFESTS = tuple(
 TARGETS = (
     {"label": "linux-x86_64", "runner": "ubuntu-24.04", "target": "x86_64-unknown-linux-gnu", "platform": "linux", "backend_crate": "crates/capture-linux/Cargo.toml", "cmake_arch": ""},
     {"label": "linux-aarch64", "runner": "ubuntu-24.04-arm", "target": "aarch64-unknown-linux-gnu", "platform": "linux", "backend_crate": "crates/capture-linux/Cargo.toml", "cmake_arch": ""},
-    {"label": "macos-aarch64", "runner": "macos-15", "target": "aarch64-apple-darwin", "platform": "macos", "backend_crate": "crates/capture-macos/Cargo.toml", "cmake_arch": ""},
+    {"label": "macos-aarch64", "runner": "macos-15", "target": "aarch64-apple-darwin", "platform": "macos", "backend_crate": "crates/capture-macos/Cargo.toml", "cmake_arch": "arm64"},
+    {"label": "macos-x86_64", "runner": "macos-15-intel", "target": "x86_64-apple-darwin", "platform": "macos", "backend_crate": "crates/capture-macos/Cargo.toml", "cmake_arch": "x86_64"},
     {"label": "windows-x86_64", "runner": "windows-2025", "target": "x86_64-pc-windows-msvc", "platform": "windows", "backend_crate": "crates/capture-windows/Cargo.toml", "cmake_arch": "x64"},
     {"label": "windows-aarch64", "runner": "windows-11-arm", "target": "aarch64-pc-windows-msvc", "platform": "windows", "backend_crate": "crates/capture-windows/Cargo.toml", "cmake_arch": "ARM64"},
 )
